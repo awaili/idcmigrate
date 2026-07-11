@@ -1,0 +1,692 @@
+{
+  "status": "success",
+  "data": {
+    "result": {
+      "cpu_usage_pct": [
+        {
+          "metric": {
+            "instance": "app-orders-01"
+          },
+          "value": [
+            1719000000,
+            "30"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-orders-02"
+          },
+          "value": [
+            1719000000,
+            "33"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-users-01"
+          },
+          "value": [
+            1719000000,
+            "41"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "web-portal-01"
+          },
+          "value": [
+            1719000000,
+            "52"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-01"
+          },
+          "value": [
+            1719000000,
+            "61"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-02"
+          },
+          "value": [
+            1719000000,
+            "68"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-oracle-01"
+          },
+          "value": [
+            1719000000,
+            "39"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "cache-redis-01"
+          },
+          "value": [
+            1719000000,
+            "25"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-master-01"
+          },
+          "value": [
+            1719000000,
+            "69"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-01"
+          },
+          "value": [
+            1719000000,
+            "43"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-02"
+          },
+          "value": [
+            1719000000,
+            "78"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-nn-01"
+          },
+          "value": [
+            1719000000,
+            "48"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-01"
+          },
+          "value": [
+            1719000000,
+            "40"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-02"
+          },
+          "value": [
+            1719000000,
+            "31"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "mon-grafana-01"
+          },
+          "value": [
+            1719000000,
+            "49"
+          ]
+        }
+      ],
+      "mem_usage_pct": [
+        {
+          "metric": {
+            "instance": "app-orders-01"
+          },
+          "value": [
+            1719000000,
+            "53"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-orders-02"
+          },
+          "value": [
+            1719000000,
+            "69"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-users-01"
+          },
+          "value": [
+            1719000000,
+            "30"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "web-portal-01"
+          },
+          "value": [
+            1719000000,
+            "56"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-01"
+          },
+          "value": [
+            1719000000,
+            "83"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-02"
+          },
+          "value": [
+            1719000000,
+            "56"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-oracle-01"
+          },
+          "value": [
+            1719000000,
+            "75"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "cache-redis-01"
+          },
+          "value": [
+            1719000000,
+            "78"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-master-01"
+          },
+          "value": [
+            1719000000,
+            "43"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-01"
+          },
+          "value": [
+            1719000000,
+            "75"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-02"
+          },
+          "value": [
+            1719000000,
+            "57"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-nn-01"
+          },
+          "value": [
+            1719000000,
+            "63"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-01"
+          },
+          "value": [
+            1719000000,
+            "50"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-02"
+          },
+          "value": [
+            1719000000,
+            "73"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "mon-grafana-01"
+          },
+          "value": [
+            1719000000,
+            "71"
+          ]
+        }
+      ],
+      "disk_used_pct": [
+        {
+          "metric": {
+            "instance": "app-orders-01"
+          },
+          "value": [
+            1719000000,
+            "52"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-orders-02"
+          },
+          "value": [
+            1719000000,
+            "73"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-users-01"
+          },
+          "value": [
+            1719000000,
+            "71"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "web-portal-01"
+          },
+          "value": [
+            1719000000,
+            "39"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-01"
+          },
+          "value": [
+            1719000000,
+            "66"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-02"
+          },
+          "value": [
+            1719000000,
+            "60"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-oracle-01"
+          },
+          "value": [
+            1719000000,
+            "51"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "cache-redis-01"
+          },
+          "value": [
+            1719000000,
+            "59"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-master-01"
+          },
+          "value": [
+            1719000000,
+            "73"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-01"
+          },
+          "value": [
+            1719000000,
+            "45"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-02"
+          },
+          "value": [
+            1719000000,
+            "57"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-nn-01"
+          },
+          "value": [
+            1719000000,
+            "87"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-01"
+          },
+          "value": [
+            1719000000,
+            "45"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-02"
+          },
+          "value": [
+            1719000000,
+            "94"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "mon-grafana-01"
+          },
+          "value": [
+            1719000000,
+            "84"
+          ]
+        }
+      ],
+      "net_rx_mbps": [
+        {
+          "metric": {
+            "instance": "app-orders-01"
+          },
+          "value": [
+            1719000000,
+            "160"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-orders-02"
+          },
+          "value": [
+            1719000000,
+            "43"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-users-01"
+          },
+          "value": [
+            1719000000,
+            "171"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "web-portal-01"
+          },
+          "value": [
+            1719000000,
+            "102"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-01"
+          },
+          "value": [
+            1719000000,
+            "76"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-02"
+          },
+          "value": [
+            1719000000,
+            "23"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-oracle-01"
+          },
+          "value": [
+            1719000000,
+            "14"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "cache-redis-01"
+          },
+          "value": [
+            1719000000,
+            "35"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-master-01"
+          },
+          "value": [
+            1719000000,
+            "119"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-01"
+          },
+          "value": [
+            1719000000,
+            "53"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-02"
+          },
+          "value": [
+            1719000000,
+            "28"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-nn-01"
+          },
+          "value": [
+            1719000000,
+            "198"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-01"
+          },
+          "value": [
+            1719000000,
+            "10"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-02"
+          },
+          "value": [
+            1719000000,
+            "161"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "mon-grafana-01"
+          },
+          "value": [
+            1719000000,
+            "99"
+          ]
+        }
+      ],
+      "net_tx_mbps": [
+        {
+          "metric": {
+            "instance": "app-orders-01"
+          },
+          "value": [
+            1719000000,
+            "105"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-orders-02"
+          },
+          "value": [
+            1719000000,
+            "138"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "app-users-01"
+          },
+          "value": [
+            1719000000,
+            "116"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "web-portal-01"
+          },
+          "value": [
+            1719000000,
+            "97"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-01"
+          },
+          "value": [
+            1719000000,
+            "121"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-mysql-02"
+          },
+          "value": [
+            1719000000,
+            "68"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "db-oracle-01"
+          },
+          "value": [
+            1719000000,
+            "9"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "cache-redis-01"
+          },
+          "value": [
+            1719000000,
+            "130"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-master-01"
+          },
+          "value": [
+            1719000000,
+            "114"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-01"
+          },
+          "value": [
+            1719000000,
+            "148"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "k8s-worker-02"
+          },
+          "value": [
+            1719000000,
+            "123"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-nn-01"
+          },
+          "value": [
+            1719000000,
+            "93"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-01"
+          },
+          "value": [
+            1719000000,
+            "55"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "hdop-dn-02"
+          },
+          "value": [
+            1719000000,
+            "106"
+          ]
+        },
+        {
+          "metric": {
+            "instance": "mon-grafana-01"
+          },
+          "value": [
+            1719000000,
+            "94"
+          ]
+        }
+      ]
+    }
+  }
+}

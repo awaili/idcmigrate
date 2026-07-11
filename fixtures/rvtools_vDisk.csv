@@ -1,0 +1,17 @@
+VM,Disk,Capacity (GB),Disk Mode,Disk Type,Path
+app-orders-01,Hard disk 1,50,persistent,THIN,/
+app-orders-01,Hard disk 2,100,persistent,THIN,/data
+app-orders-02,Hard disk 1,50,persistent,THIN,/
+app-orders-02,Hard disk 2,100,persistent,THIN,/data
+app-users-01,Hard disk 1,50,persistent,THIN,/
+app-users-01,Hard disk 2,50,persistent,THIN,/data
+web-portal-01,Hard disk 1,40,persistent,THIN,/
+db-mysql-01,Hard disk 1,50,persistent,THIN,/
+db-mysql-01,Hard disk 2,500,persistent,THIN,/var/lib/mysql
+db-mysql-02,Hard disk 1,50,persistent,THIN,/
+db-mysql-02,Hard disk 2,500,persistent,THIN,/var/lib/mysql
+db-oracle-01,Hard disk 1,50,persistent,THIN,/
+db-oracle-01,Hard disk 2,1000,persistent,THIN,/u01
+db-oracle-01,Hard disk 3,2000,persistent,SAN,/u02
+cache-redis-01,Hard disk 1,40,persistent,THIN,/
+mon-grafana-01,Hard disk 1,40,persistent,THIN,/

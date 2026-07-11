@@ -1,0 +1,16 @@
+sys_id,name,hostname,fqdn,ip_address,os,os_version,ram_gb,cpus,company,environment,business_criticality,location,virtual,subnet,serial_number
+SYS0000,app-orders-01,app-orders-01,app-orders-01.dc1.corp,10.10.1.11,centos,7.9,16,4,Corp,prod,high,dc1,true,10.10.1.0/24,SN700000
+SYS0001,app-orders-02,app-orders-02,app-orders-02.dc1.corp,10.10.1.12,centos,7.9,16,4,Corp,prod,high,dc1,true,10.10.1.0/24,SN700001
+SYS0002,app-users-01,app-users-01,app-users-01.dc1.corp,10.10.1.21,centos,7.9,8,4,Corp,prod,high,dc1,true,10.10.1.0/24,SN700002
+SYS0003,web-portal-01,web-portal-01,web-portal-01.dc1.corp,10.10.2.11,centos,8.4,4,2,Corp,prod,medium,dc1,true,10.10.2.0/24,SN700003
+SYS0004,db-mysql-01,db-mysql-01,db-mysql-01.dc1.corp,10.10.3.11,centos,7.9,32,8,Corp,prod,high,dc1,true,10.10.3.0/24,SN700004
+SYS0005,db-mysql-02,db-mysql-02,db-mysql-02.dc1.corp,10.10.3.12,centos,7.9,32,8,Corp,prod,high,dc1,true,10.10.3.0/24,SN700005
+SYS0006,db-oracle-01,db-oracle-01,db-oracle-01.dc1.corp,10.10.3.21,oracle linux,8.6,64,16,Corp,prod,high,dc1,true,10.10.3.0/24,SN700006
+SYS0007,cache-redis-01,cache-redis-01,cache-redis-01.dc1.corp,10.10.4.11,centos,7.9,16,4,Corp,prod,medium,dc1,true,10.10.4.0/24,SN700007
+SYS0008,k8s-master-01,k8s-master-01,k8s-master-01.dc1.corp,10.10.5.10,ubuntu,22.04,16,8,Corp,prod,high,dc1,false,10.10.5.0/24,SN700008
+SYS0009,k8s-worker-01,k8s-worker-01,k8s-worker-01.dc1.corp,10.10.5.21,ubuntu,22.04,64,16,Corp,prod,high,dc1,false,10.10.5.0/24,SN700009
+SYS0010,k8s-worker-02,k8s-worker-02,k8s-worker-02.dc1.corp,10.10.5.22,ubuntu,22.04,64,16,Corp,prod,high,dc1,false,10.10.5.0/24,SN700010
+SYS0011,hdop-nn-01,hdop-nn-01,hdop-nn-01.dc2.corp,10.20.1.10,centos,7.9,64,16,Corp,prod,high,dc2,false,10.20.1.0/24,SN700011
+SYS0012,hdop-dn-01,hdop-dn-01,hdop-dn-01.dc2.corp,10.20.1.21,centos,7.9,64,16,Corp,prod,medium,dc2,false,10.20.1.0/24,SN700012
+SYS0013,hdop-dn-02,hdop-dn-02,hdop-dn-02.dc2.corp,10.20.1.22,centos,7.9,64,16,Corp,prod,medium,dc2,false,10.20.1.0/24,SN700013
+SYS0014,mon-grafana-01,mon-grafana-01,mon-grafana-01.dc1.corp,10.10.9.11,ubuntu,22.04,4,2,Corp,staging,low,dc1,true,10.10.9.0/24,SN700014

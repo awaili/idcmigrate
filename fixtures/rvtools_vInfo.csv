@@ -1,0 +1,10 @@
+VM,PowerState,OS according to the configuration file,CPUs,Memory,Provisioned (GB),Used (GB),Datacenter,Cluster,Host,Network #1,IP Address #1,Folder
+app-orders-01,poweredOn,centos 7.9,4,16384,150,75.0,dc1,cl-app,cl-app-esx01,dvPG-vlan10,10.10.1.11,/prod/app
+app-orders-02,poweredOn,centos 7.9,4,16384,150,75.0,dc1,cl-app,cl-app-esx01,dvPG-vlan10,10.10.1.12,/prod/app
+app-users-01,poweredOn,centos 7.9,4,8192,100,50.0,dc1,cl-app,cl-app-esx01,dvPG-vlan10,10.10.1.21,/prod/app
+web-portal-01,poweredOn,centos 8.4,2,4096,40,20.0,dc1,cl-web,cl-web-esx01,dvPG-vlan20,10.10.2.11,/prod/web
+db-mysql-01,poweredOn,centos 7.9,8,32768,550,275.0,dc1,cl-db,cl-db-esx01,dvPG-vlan30,10.10.3.11,/prod/db
+db-mysql-02,poweredOn,centos 7.9,8,32768,550,275.0,dc1,cl-db,cl-db-esx01,dvPG-vlan30,10.10.3.12,/prod/db
+db-oracle-01,poweredOn,oracle linux 8.6,16,65536,3050,1525.0,dc1,cl-db,cl-db-esx01,dvPG-vlan30,10.10.3.21,/prod/db
+cache-redis-01,poweredOn,centos 7.9,4,16384,40,20.0,dc1,cl-cache,cl-cache-esx01,dvPG-vlan40,10.10.4.11,/prod/cache
+mon-grafana-01,poweredOn,ubuntu 22.04,2,4096,40,20.0,dc1,cl-mon,cl-mon-esx01,dvPG-vlan90,10.10.9.11,/staging/monitoring

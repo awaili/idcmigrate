@@ -1,0 +1,1 @@
+"""``idc`` CLI. Run via ``python -m idc.cli.main`` or the ``idc`` entry point."""

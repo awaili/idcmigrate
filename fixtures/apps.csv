@@ -1,0 +1,8 @@
+app_id,name,tier,env,server_hostnames,depends_on,notes
+app-orders,Orders Service,backend,prod,app-orders-01;app-orders-02,app-users,order processing; depends on users svc + mysql
+app-users,Users Service,backend,prod,app-users-01,,user/auth svc; depends on mysql
+app-portal,Customer Portal,frontend,prod,web-portal-01,app-users;app-orders,public web; depends on users+orders
+app-billing,Billing,backend,prod,db-oracle-01,,oracle-backed billing
+app-k8s-platform,K8s Platform,infra,prod,k8s-master-01;k8s-worker-01;k8s-worker-02,,containerized workloads
+app-hadoop,Hadoop Cluster,data,prod,hdop-nn-01;hdop-dn-01;hdop-dn-02,,big data platform
+app-observability,Observability,infra,staging,mon-grafana-01,,grafana dashboards

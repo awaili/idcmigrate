@@ -1,0 +1,10 @@
+VM,Network,IP Address,Connected,MAC Address
+app-orders-01,dvPG-vlan10,10.10.1.11,TRUE,00:50:56:58:58:58
+app-orders-02,dvPG-vlan10,10.10.1.12,TRUE,00:50:56:4e:4e:4e
+app-users-01,dvPG-vlan10,10.10.1.21,TRUE,00:50:56:74:74:74
+web-portal-01,dvPG-vlan20,10.10.2.11,TRUE,00:50:56:89:89:89
+db-mysql-01,dvPG-vlan30,10.10.3.11,TRUE,00:50:56:55:55:55
+db-mysql-02,dvPG-vlan30,10.10.3.12,TRUE,00:50:56:33:33:33
+db-oracle-01,dvPG-vlan30,10.10.3.21,TRUE,00:50:56:9b:9b:9b
+cache-redis-01,dvPG-vlan40,10.10.4.11,TRUE,00:50:56:fe:fe:fe
+mon-grafana-01,dvPG-vlan90,10.10.9.11,TRUE,00:50:56:a1:a1:a1

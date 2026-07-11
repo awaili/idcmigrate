@@ -1,0 +1,10 @@
+# idc-migrate runtime dependencies (Python 3.9+)
+# Core stdlib (sqlite3, argparse/typer, json, subprocess) covers most needs.
+fastapi>=0.104
+uvicorn[standard]>=0.24
+httpx>=0.25
+pydantic>=2.5
+typer>=0.9
+rich>=13
+# Optional: openpyxl for reading RVTools .xlsx exports (CSV needs nothing)
+# openpyxl>=3.1

@@ -1,0 +1,514 @@
+{
+  "hosts": [
+    {
+      "hostid": "10000",
+      "host": "app-orders-01",
+      "name": "app-orders-01",
+      "interfaces": [
+        {
+          "ip": "10.10.1.11",
+          "dns": "app-orders-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/app"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "app"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 30,
+        "mem_p95": 53,
+        "disk_used_pct": 52,
+        "net_rx_mbps": 160,
+        "net_tx_mbps": 105
+      }
+    },
+    {
+      "hostid": "10001",
+      "host": "app-orders-02",
+      "name": "app-orders-02",
+      "interfaces": [
+        {
+          "ip": "10.10.1.12",
+          "dns": "app-orders-02.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/app"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "app"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 33,
+        "mem_p95": 69,
+        "disk_used_pct": 73,
+        "net_rx_mbps": 43,
+        "net_tx_mbps": 138
+      }
+    },
+    {
+      "hostid": "10002",
+      "host": "app-users-01",
+      "name": "app-users-01",
+      "interfaces": [
+        {
+          "ip": "10.10.1.21",
+          "dns": "app-users-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/app"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "app"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 41,
+        "mem_p95": 30,
+        "disk_used_pct": 71,
+        "net_rx_mbps": 171,
+        "net_tx_mbps": 116
+      }
+    },
+    {
+      "hostid": "10003",
+      "host": "web-portal-01",
+      "name": "web-portal-01",
+      "interfaces": [
+        {
+          "ip": "10.10.2.11",
+          "dns": "web-portal-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/web"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "web"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 52,
+        "mem_p95": 56,
+        "disk_used_pct": 39,
+        "net_rx_mbps": 102,
+        "net_tx_mbps": 97
+      }
+    },
+    {
+      "hostid": "10004",
+      "host": "db-mysql-01",
+      "name": "db-mysql-01",
+      "interfaces": [
+        {
+          "ip": "10.10.3.11",
+          "dns": "db-mysql-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/db"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "db"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 61,
+        "mem_p95": 83,
+        "disk_used_pct": 66,
+        "net_rx_mbps": 76,
+        "net_tx_mbps": 121
+      }
+    },
+    {
+      "hostid": "10005",
+      "host": "db-mysql-02",
+      "name": "db-mysql-02",
+      "interfaces": [
+        {
+          "ip": "10.10.3.12",
+          "dns": "db-mysql-02.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/db"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "db"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 68,
+        "mem_p95": 56,
+        "disk_used_pct": 60,
+        "net_rx_mbps": 23,
+        "net_tx_mbps": 68
+      }
+    },
+    {
+      "hostid": "10006",
+      "host": "db-oracle-01",
+      "name": "db-oracle-01",
+      "interfaces": [
+        {
+          "ip": "10.10.3.21",
+          "dns": "db-oracle-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/db"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "db"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 39,
+        "mem_p95": 75,
+        "disk_used_pct": 51,
+        "net_rx_mbps": 14,
+        "net_tx_mbps": 9
+      }
+    },
+    {
+      "hostid": "10007",
+      "host": "cache-redis-01",
+      "name": "cache-redis-01",
+      "interfaces": [
+        {
+          "ip": "10.10.4.11",
+          "dns": "cache-redis-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/cache"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "cache"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 25,
+        "mem_p95": 78,
+        "disk_used_pct": 59,
+        "net_rx_mbps": 35,
+        "net_tx_mbps": 130
+      }
+    },
+    {
+      "hostid": "10008",
+      "host": "k8s-master-01",
+      "name": "k8s-master-01",
+      "interfaces": [
+        {
+          "ip": "10.10.5.10",
+          "dns": "k8s-master-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/k8s"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "k8s"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 69,
+        "mem_p95": 43,
+        "disk_used_pct": 73,
+        "net_rx_mbps": 119,
+        "net_tx_mbps": 114
+      }
+    },
+    {
+      "hostid": "10009",
+      "host": "k8s-worker-01",
+      "name": "k8s-worker-01",
+      "interfaces": [
+        {
+          "ip": "10.10.5.21",
+          "dns": "k8s-worker-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/k8s"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "k8s"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 43,
+        "mem_p95": 75,
+        "disk_used_pct": 45,
+        "net_rx_mbps": 53,
+        "net_tx_mbps": 148
+      }
+    },
+    {
+      "hostid": "10010",
+      "host": "k8s-worker-02",
+      "name": "k8s-worker-02",
+      "interfaces": [
+        {
+          "ip": "10.10.5.22",
+          "dns": "k8s-worker-02.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/k8s"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "k8s"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 78,
+        "mem_p95": 57,
+        "disk_used_pct": 57,
+        "net_rx_mbps": 28,
+        "net_tx_mbps": 123
+      }
+    },
+    {
+      "hostid": "10011",
+      "host": "hdop-nn-01",
+      "name": "hdop-nn-01",
+      "interfaces": [
+        {
+          "ip": "10.20.1.10",
+          "dns": "hdop-nn-01.dc2.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/hadoop"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "hadoop"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 48,
+        "mem_p95": 63,
+        "disk_used_pct": 87,
+        "net_rx_mbps": 198,
+        "net_tx_mbps": 93
+      }
+    },
+    {
+      "hostid": "10012",
+      "host": "hdop-dn-01",
+      "name": "hdop-dn-01",
+      "interfaces": [
+        {
+          "ip": "10.20.1.21",
+          "dns": "hdop-dn-01.dc2.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/hadoop"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "hadoop"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 40,
+        "mem_p95": 50,
+        "disk_used_pct": 45,
+        "net_rx_mbps": 10,
+        "net_tx_mbps": 55
+      }
+    },
+    {
+      "hostid": "10013",
+      "host": "hdop-dn-02",
+      "name": "hdop-dn-02",
+      "interfaces": [
+        {
+          "ip": "10.20.1.22",
+          "dns": "hdop-dn-02.dc2.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "prod/hadoop"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "prod"
+        },
+        {
+          "tag": "role",
+          "value": "hadoop"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 31,
+        "mem_p95": 73,
+        "disk_used_pct": 94,
+        "net_rx_mbps": 161,
+        "net_tx_mbps": 106
+      }
+    },
+    {
+      "hostid": "10014",
+      "host": "mon-grafana-01",
+      "name": "mon-grafana-01",
+      "interfaces": [
+        {
+          "ip": "10.10.9.11",
+          "dns": "mon-grafana-01.dc1.corp",
+          "type": "agent"
+        }
+      ],
+      "groups": [
+        {
+          "name": "staging/monitoring"
+        }
+      ],
+      "tags": [
+        {
+          "tag": "env",
+          "value": "staging"
+        },
+        {
+          "tag": "role",
+          "value": "monitoring"
+        }
+      ],
+      "utilization": {
+        "cpu_p95": 49,
+        "mem_p95": 71,
+        "disk_used_pct": 84,
+        "net_rx_mbps": 99,
+        "net_tx_mbps": 94
+      }
+    }
+  ]
+}
