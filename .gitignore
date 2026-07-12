@@ -1,6 +1,68 @@
-.venv/
+# ---- Python ----
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg
+*.egg-info/
+wheels/
+pip-wheel-metadata/
+.installed.cfg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Testing / lint / type caches ----
 .pytest_cache/
-*.log
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# ---- Local secrets / env (keep .env.example tracked) ----
 .env
+.env.local
+.env.*.local
+
+# ---- Local data stores ----
+# MariaDB is the default backend, but SQLite is still supported — ignore any
+# local SQLite DB + its WAL/SHM sidecars so a local test run never leaks in.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+# Immutable business-case / job snapshots live in the DB; ignore local dumps.
+*.snap.json
+
+# ---- Backend upload staging (file ingest) ----
+uploads/
+
+# ---- Logs ----
+*.log
+logs/
+
+# ---- Editor / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
