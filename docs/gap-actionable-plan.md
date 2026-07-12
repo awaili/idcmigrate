@@ -30,8 +30,8 @@ report shows 5591 expired-OS hosts.
   "EOL OS expired" / "脱保 (out of warranty)". Acceptance: clicking the facet
   or quick-filter narrows the list to that cohort; backend test for the filter.
   Commit: B2 below.
-- [ ] **B3 combine** — full `pytest`; update this doc's Result; wrap commit.
-  Acceptance: 321+ green, no regressions. Commit: <sha>.
+- [x] **B3 combine** — full `pytest`; update this doc's Result; wrap commit.
+  Acceptance: 321+ green, no regressions. Commit: B3 below.
 
 ## Per-block think (filled as we go)
 
@@ -57,4 +57,18 @@ report shows 5591 expired-OS hosts.
 
 ## Result
 
-<filled at combine time>
+- Shipped in 3 block-commits: B1 `b7fd4c6` (persist derived buckets), B2
+  `cc99ab0` (inventory facets + quick filters), B3 this commit (combine).
+- Suite: 323 passed, 2 skipped, 0 regressions (was 321; +2 B2 tests).
+- Live smoke (15-server fixture after the suite shrank the shared DB):
+  `os_eol_bucket` facet `{expired:10, unknown:5}`, `warranty_bucket`
+  `{unknown:15}`, `os_eol_bucket=expired` filter narrows to the 10-host cohort.
+  On the 15K scale estate the expired-OS cohort was 5591 (data-gaps report) —
+  same filter/facet, same behavior.
+- Operator UX: one click on "⌖ EOL OS (expired)" or the `OS EOL → expired`
+  facet chip lands on the replatform cohort; "⌖ 脱保" lands on out-of-warranty.
+- Staleness handled: PUT /api/servers/{sid}/warranty recomputes warranty_bucket;
+  os_eol_bucket recomputes on rebuild (re-ingest). _server_out falls back to
+  computing for rows that predate the column.
+- Follow-on (not done, low value): the buckets could also drive a wave-plan
+  bias (expired-OS hosts replatform-first) — left for a later effort.
