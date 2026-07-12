@@ -22,8 +22,39 @@ async function reviewPlan(){
       + rows + (r.summary?`<div class="muted" style="margin-top:4px">${esc(r.summary)}</div>`:'');
   }catch(e){ out.innerHTML='<span class="ev-err">Error: '+esc(e)+'</span>'; }
 }
+/* Sort waves into DAG/timeline order (the order they execute), not alphabetical.
+   The backend returns waves sorted by (stage, name) — correct across stages
+   (1_landing_zone < 2_data < 3_application < 4_cutover) but within a stage the
+   name tiebreak is arbitrary and can violate the DAG (e.g. "BatchApps" sorts
+   before "PilotApp" even though BatchApps depends on PilotApp). The real
+   timeline is encoded in `depends_on`, so we topologically sort by those edges,
+   using stage-rank then name only as a stable tiebreak for truly parallel waves. */
+const _STAGE_RANK = {'1_landing_zone':0,'2_data':1,'3_application':2,'4_cutover':3,
+                     'retain':4,'retire':5};
+function _sortedWavesDAG(waves){
+  const byId = {}; waves.forEach(w=>byId[w.id]=w);
+  const rank = w => _STAGE_RANK[w.stage] ?? 9;
+  const byRankName = (a,b)=>rank(a)-rank(b)||(a.name||'').localeCompare(b.name||'');
+  const indeg = {}; waves.forEach(w=>indeg[w.id]=0);
+  waves.forEach(w=>(w.depends_on||[]).forEach(d=>{ if(byId[d]) indeg[w.id]++; }));
+  const dependents = {}; waves.forEach(w=>(w.depends_on||[]).forEach(d=>{
+    if(byId[d]){ (dependents[d]=dependents[d]||[]).push(w.id); } }));
+  const avail = waves.filter(w=>indeg[w.id]===0).sort(byRankName);
+  const out = [];
+  while(avail.length){
+    const w = avail.shift(); out.push(w);
+    for(const dep of (dependents[w.id]||[])){
+      if(--indeg[dep]===0) avail.push(byId[dep]);
+    }
+    avail.sort(byRankName);
+  }
+  if(out.length < waves.length){  // cycle fallback — append the rest in stage/name order
+    waves.filter(w=>!out.includes(w)).sort(byRankName).forEach(w=>out.push(w));
+  }
+  return out;
+}
 function renderWaves(){
-  $('waveList').innerHTML = WAVES.map(w=>`<div class="wave" onclick="openWave('${w.id}')">
+  $('waveList').innerHTML = _sortedWavesDAG(WAVES).map(w=>`<div class="wave" onclick="openWave('${w.id}')">
     <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${w.stage.startsWith('1')?'high':w.stage.startsWith('4')?'medium':'low'}">${w.stage}</span><span style="margin-left:auto" class="meta">${w.members.length} servers</span></div>
     <div class="deps">depends_on: ${w.depends_on.join(', ')||'(none)'}</div>
     <div class="meta">${esc(w.rationale||'')}</div></div>`).join('');
