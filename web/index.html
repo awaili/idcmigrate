@@ -238,9 +238,10 @@
         <input id="rtPort" placeholder="port (e.g. 8080)" style="flex:0 1 90px;min-width:70px"/>
         <input id="rtSoft" placeholder="software (e.g. openjdk-8)" style="flex:0 1 140px;min-width:100px"/>
         <select id="rtMode" style="flex:0 1 auto"><option value="plan">plan (dry-run)</option><option value="execute">execute (writes)</option></select>
+        <button class="sm" onclick="prefillRuntimeInventory()">Pre-fill from server</button>
         <button class="sm primary" onclick="doRuntimeContainerize()">Infer scaffold</button>
       </div>
-      <div class="muted" style="font-size:12px;margin-top:6px">The executor infers a Dockerfile + pushes a <code>source=runtime-derived</code> CodeProfile (confidence capped at 0.5). <b>execute</b> mode requires operator confirmation (a Question is raised) before the scaffold is written.</div>
+      <div class="muted" style="font-size:12px;margin-top:6px">The executor infers a Dockerfile + pushes a <code>source=runtime-derived</code> CodeProfile (confidence capped at 0.5). <b>Pre-fill from server</b> assembles process/port/software from the match + role/OS + Zabbix/Prometheus telemetry; empty fields are auto-gathered on submit. <b>execute</b> mode requires operator confirmation (a Question is raised) before the scaffold is written.</div>
     </div>
     <div class="card"><h2>Executor jobs</h2>
       <div class="xscroll"><table class="tbl mcard" id="jobTbl"><thead><tr>

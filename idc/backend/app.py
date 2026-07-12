@@ -757,6 +757,22 @@ class RuntimeContainerizeReq(BaseModel):
     mode: str = "plan"             # plan (dry-run scaffold) | execute (write)
 
 
+@app.get("/api/runtime-inventory/{server_id}")
+def runtime_inventory(server_id: str):
+    """Best-effort runtime inventory for a host (F9) — assembles process/port/
+    software from the match port + server role/os + (stale) code profile +
+    Zabbix/Prometheus listening-port telemetry when configured. The web form
+    pre-fills from this; the operator overrides before triggering."""
+    from ..core.runtime_inventory import gather_runtime_inventory
+    s = next((x for x in STORE.list_all_servers() if x.id == server_id), None)
+    if not s:
+        raise HTTPException(404, f"no such server: {server_id}")
+    matches = STORE.list_matches()
+    m = next((x for x in matches if x.server_id == server_id), None)
+    profile = STORE.get_code_profile((s.app_ids or [""])[0]) if s.app_ids else None
+    return gather_runtime_inventory(s, m, profile=profile, settings=settings)
+
+
 @app.post("/api/runtime-containerize")
 def runtime_containerize_trigger(req: RuntimeContainerizeReq):
     """Ask the external executor to containerize a source-less legacy app (F9).
@@ -766,15 +782,36 @@ def runtime_containerize_trigger(req: RuntimeContainerizeReq):
     a ``CodeProfile`` tagged ``source=runtime-derived`` back to
     ``PUT /api/code-profiles/{app_id}``. That profile's confidence is capped and
     a confirm-gate fires before ``modify`` writes the scaffold.
-    """
+
+    When ``inventory`` is empty/partial, idc-migrate auto-gathers it from the
+    server's match port + role/os + telemetry (see ``GET /api/runtime-inventory``)
+    and merges the operator-provided fields on top (operator wins)."""
     if not settings.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
     ec = get_executor_client(settings)
     if not ec.configured:
         raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    # auto-gather + merge when the operator didn't supply a full inventory
+    from ..core.runtime_inventory import gather_runtime_inventory, merge_inventory
+    inventory = dict(req.inventory or {})
+    # always normalize operator input (software string -> list) so the executor
+    # gets a consistent shape regardless of how the form sent it
+    sw = inventory.get("software")
+    if isinstance(sw, str):
+        inventory["software"] = [s.strip() for s in sw.split(",") if s.strip()]
+    # only hit telemetry (Zabbix/Prometheus round-trips) when the operator didn't
+    # supply ports — the main runtime signal. Other gaps are filled from match/role.
+    if not inventory.get("ports"):
+        s = next((x for x in STORE.list_all_servers() if x.id == req.server_id), None)
+        if s:
+            matches = STORE.list_matches()
+            m = next((x for x in matches if x.server_id == req.server_id), None)
+            profile = STORE.get_code_profile((s.app_ids or [""])[0]) if s.app_ids else None
+            gathered = gather_runtime_inventory(s, m, profile=profile, settings=settings)
+            inventory = merge_inventory(gathered, inventory)
     try:
         return ec.runtime_containerize(req.app_id, req.server_id,
-                                        inventory=req.inventory, mode=req.mode)
+                                        inventory=inventory, mode=req.mode)
     except ExecutorError as e:
         raise HTTPException(502, f"executor error: {e}")
 

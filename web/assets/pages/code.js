@@ -222,13 +222,28 @@ async function doDbScan(){
 }
 
 /* ---------- F9 — runtime containerization (no-source path) ---------- */
+async function prefillRuntimeInventory(){
+  const sid = $('rtServer').value.trim();
+  if(!sid){ toast('enter server_id first','warn'); return; }
+  try{
+    const inv = await api(`/runtime-inventory/${encodeURIComponent(sid)}`);
+    $('rtProc').value = inv.process || '';
+    $('rtPort').value = (inv.ports||[]).join(',');
+    $('rtSoft').value = (inv.software||[]).join(',');
+    const b = inv.basis || {};
+    toast(`pre-filled from server (ports: ${b.ports||'none'}, software: ${b.software||'none'}, process: ${b.process||'none'})`, 'ok');
+  }catch(e){ toast('pre-fill failed: '+e, 'err'); }
+}
 async function doRuntimeContainerize(){
   const app_id = $('rtApp').value.trim();
   const server_id = $('rtServer').value.trim();
   if(!app_id || !server_id){ toast('enter app_id + server_id','warn'); return; }
-  const body = { app_id, server_id,
-    inventory: { process:$('rtProc').value, port:$('rtPort').value, software:$('rtSoft').value },
-    mode:$('rtMode').value };
+  // send only what the operator typed; the backend auto-gathers the gaps + merges
+  const inv = {};
+  if($('rtProc').value.trim()) inv.process = $('rtProc').value.trim();
+  if($('rtPort').value.trim()) inv.ports = $('rtPort').value.split(',').map(s=>parseInt(s.trim())).filter(n=>n);
+  if($('rtSoft').value.trim()) inv.software = $('rtSoft').value.split(',').map(s=>s.trim()).filter(s=>s);
+  const body = { app_id, server_id, inventory: inv, mode:$('rtMode').value };
   try{
     await api('/runtime-containerize', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
     toast('Runtime containerize requested — profile arrives via callback (source=runtime-derived).', 'ok');
