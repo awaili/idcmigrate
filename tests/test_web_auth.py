@@ -64,19 +64,25 @@ def test_login_then_session_authes_api(_web_auth_on):
 
 def test_executor_bearer_bypasses_session_gate(_web_auth_on):
     # a fresh client with no session cookie but a valid executor bearer gets in
+    # ONLY on the executor-contract surface (not operator endpoints like /api/stats)
     c = TestClient(m.app)
-    r = c.get("/api/stats", headers={"Authorization": "Bearer " + _web_auth_on["bearer"]})
+    r = c.get("/api/change-jobs", headers={"Authorization": "Bearer " + _web_auth_on["bearer"]})
     assert r.status_code == 200
-    # wrong bearer is rejected
-    assert c.get("/api/stats", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    # bearer is NOT honored on operator-only endpoints
+    assert c.get("/api/stats", headers={"Authorization": "Bearer " + _web_auth_on["bearer"]}).status_code == 401
+    # wrong bearer is rejected even on the contract surface
+    assert c.get("/api/change-jobs", headers={"Authorization": "Bearer wrong"}).status_code == 401
 
 
-def test_change_password_requires_session_and_persists(_web_auth_on):
+def test_change_password_requires_current_and_session(_web_auth_on):
     # unauthed -> 401
-    assert client.post("/api/auth/password", data={"password": "newpass"}).status_code == 401
-    # log in, then change it
+    assert client.post("/api/auth/password",
+                       data={"password": "newpass", "current": _web_auth_on["password"]}).status_code == 401
+    # log in, then change it (with the current password)
     client.post("/login", data={"password": _web_auth_on["password"]}, follow_redirects=False)
-    r = client.post("/api/auth/password", data={"password": "newpass123"})
+    # wrong current -> 401
+    assert client.post("/api/auth/password", data={"password": "newpass123", "current": "wrong"}).status_code == 401
+    r = client.post("/api/auth/password", data={"password": "newpass123", "current": _web_auth_on["password"]})
     assert r.status_code == 200 and r.json()["updated"] is True
     # the new password now logs in (on a fresh client)
     c = TestClient(m.app)

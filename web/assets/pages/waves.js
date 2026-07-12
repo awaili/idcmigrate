@@ -55,8 +55,8 @@ function _sortedWavesDAG(waves){
 }
 function renderWaves(){
   $('waveList').innerHTML = _sortedWavesDAG(WAVES).map(w=>`<div class="wave" onclick="openWave('${w.id}')">
-    <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${w.stage.startsWith('1')?'high':w.stage.startsWith('4')?'medium':'low'}">${w.stage}</span><span style="margin-left:auto" class="meta">${w.members.length} servers</span></div>
-    <div class="deps">depends_on: ${w.depends_on.join(', ')||'(none)'}</div>
+    <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${esc(w.stage||'').startsWith('1')?'high':esc(w.stage||'').startsWith('4')?'medium':'low'}">${esc(w.stage)}</span><span style="margin-left:auto" class="meta">${w.members.length} servers</span></div>
+    <div class="deps">depends_on: ${(w.depends_on||[]).join(', ')||'(none)'}</div>
     <div class="meta">${esc(w.rationale||'')}</div></div>`).join('');
 }
 let waveState={id:null,page:1,page_size:25};
@@ -75,10 +75,10 @@ async function fetchWaveMembers(){
   const r = await api('/servers?'+p.toString());
   const rows = (r.items||[]).map(s=>{const m=s.match||{};return `<tr onclick="openServer('${s.id}')">
       <td data-label="Hostname"><b>${esc(s.hostname)}</b></td>
-      <td data-label="Role"><span class="tag ${s.role}">${s.role}</span></td>
+      <td data-label="Role"><span class="tag ${esc(s.role||'')}">${esc(s.role||'-')}</span></td>
       <td data-label="CPU/Mem">${s.cpu_cores}/${s.mem_gb}G</td>
-      <td data-label="Env">${s.env||'-'}</td>
-      <td data-label="Target"><b>${m.target?m.target.product:'-'}</b></td>
+      <td data-label="Env">${esc(s.env||'-')}</td>
+      <td data-label="Target"><b>${m.target?esc(m.target.product):'-'}</b></td>
       <td data-label="Conf" class="conf">${m.confidence?'_'+m.confidence.toFixed(1):'-'}</td>
     </tr>`;}).join('');
   const pages=Math.max(1,Math.ceil(r.total/waveState.page_size));

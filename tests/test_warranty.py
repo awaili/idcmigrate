@@ -156,7 +156,8 @@ def test_hw_support_levels():
     assert _sig_hw_support(wave_expired, servers)["level"] == RED
     assert _sig_hw_support(wave_expiring, servers)["level"] == YELLOW
     assert _sig_hw_support(wave_active, servers)["level"] == GREEN
-    assert _sig_hw_support(wave_unknown, servers)["level"] == NA
+    # unknown -> YELLOW (conservative): an unassessed wave must not read green
+    assert _sig_hw_support(wave_unknown, servers)["level"] == YELLOW
 
 
 def test_hw_support_worst_across_mixed_members():
@@ -226,13 +227,14 @@ def test_wave_readiness_hw_support_expired_red():
         _cleanup(wid, sid)
 
 
-def test_wave_readiness_hw_support_unknown_is_na_and_rollup_unchanged():
-    # no warranty data -> hw_support n/a -> rollup driven by other signals only
+def test_wave_readiness_hw_support_unknown_is_yellow():
+    # no warranty data -> hw_support YELLOW (conservative: unassessed must not
+    # read green/ready on the cutover gate)
     wid, sid, host = _seed_server()
     try:
         st = _store()
         r = wave_readiness(st, wid)
-        assert r["signals"]["hw_support"]["level"] == NA
+        assert r["signals"]["hw_support"]["level"] == YELLOW
         st.close()
     finally:
         _cleanup(wid, sid)

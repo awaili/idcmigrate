@@ -121,7 +121,7 @@ def portfolio_data_gaps(store, today_iso: str = "", top: int = 12) -> Dict[str, 
     characterized = sum(1 for s in servers if (s.assessment_confidence or 0) >= 0.5)
     pct = round(100.0 * characterized / total, 1) if total else 0.0
     total_gaps = (sum(missing.values()) + missing_util + missing_profile
-                  + warranty.get("unknown", 0))
+                  + warranty.get("unknown", 0) + os_eol.get("unknown", 0))
     summary = (f"{total} hosts · {pct}% characterized (conf≥0.5) · "
                f"{warranty.get('unknown',0)} unknown warranty · "
                f"{os_eol.get('expired',0)} OS EOL · "

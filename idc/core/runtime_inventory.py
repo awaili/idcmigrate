@@ -77,13 +77,14 @@ def _zabbix_ports(settings, host: str) -> List[int]:
     import httpx
     url = settings.zbx_url
     rid = 0
+    auth_token = settings.zbx_token
 
     def call(method, params):
         nonlocal rid
         rid += 1
         payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": rid}
-        if settings.zbx_token:
-            payload["auth"] = settings.zbx_token
+        if auth_token:
+            payload["auth"] = auth_token
         r = httpx.post(url, json=payload, timeout=20)
         r.raise_for_status()
         j = r.json()
@@ -92,8 +93,9 @@ def _zabbix_ports(settings, host: str) -> List[int]:
         return j.get("result")
 
     try:
-        if not settings.zbx_token:
-            call  # noqa — token-login omitted for brevity; token path is the default
+        if not auth_token and settings.zbx_user and settings.zbx_password:
+            auth_token = call("user.login", {"user": settings.zbx_user,
+                                             "password": settings.zbx_password})
         # find the hostid by host name
         hosts = call("host.get", {"output": ["hostid"], "filter": {"host": [host]}})
         if not hosts:
@@ -101,7 +103,7 @@ def _zabbix_ports(settings, host: str) -> List[int]:
         hostid = hosts[0]["hostid"]
         items = call("item.get", {
             "hostids": hostid, "output": ["itemid", "key_"],
-            "search": {"key_": "net.tcp.listen,net.tcp.port"},
+            "search": {"key_": ["net.tcp.listen", "net.tcp.port"]},
             "searchByAny": True, "limit": 50,
         })
         ports: List[int] = []

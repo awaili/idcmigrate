@@ -29,23 +29,32 @@ OS_EOL_TABLE = {
     ("centos", "7"): "2024-06-30",
     ("centos", "8"): "2021-12-31",
     ("centos", "stream8"): "2024-05-31",
+    ("centos", "stream9"): "2027-05-31",
     ("oracle linux", "6"): "2021-10-01",
     ("oracle linux", "7"): "2024-07-01",
+    ("oracle linux", "8"): "2029-07-01",
+    ("oracle linux", "9"): "2032-07-01",
     ("rhel", "6"): "2020-11-30",
     ("rhel", "7"): "2024-06-28",
+    ("rhel", "8"): "2029-05-31",   # ELS end (full support ended 2024-05)
+    ("rhel", "9"): "2032-05-31",
     ("windows", "2008"): "2020-01-14",
     ("windows", "2008r2"): "2020-01-14",
     ("windows", "2012"): "2023-10-10",
     ("windows", "2012r2"): "2023-10-10",
     ("windows", "2016"): "2027-01-12",
     ("windows", "2019"): "2029-01-09",
+    ("windows", "2022"): "2031-10-13",
     ("ubuntu", "14"): "2019-04-01",
     ("ubuntu", "16"): "2021-04-01",
     ("ubuntu", "18"): "2023-05-31",
     ("ubuntu", "20"): "2025-04-01",
+    ("ubuntu", "22"): "2027-04-01",
+    ("ubuntu", "24"): "2029-04-01",
     ("debian", "9"): "2022-06-30",
     ("debian", "10"): "2024-06-30",
     ("debian", "11"): "2026-08-15",
+    ("debian", "12"): "2028-06-10",
 }
 
 # runtime (from CodeProfile.runtime / language) -> EOL date. JDK LTS dates are
@@ -145,9 +154,7 @@ def runtime_eol_bucket(runtime: str, language: str = "",
             break
     if not fam:
         return UNKNOWN
-    # collapse "3.6" -> "3.6" for python (we key 3.6/3.7), "8" -> "8" for jdk
-    if fam == "python" and ver:
-        ver = ver if "." in ver else ver
+    # python keys on the full minor ("3.6"/"3.7"); jdk/node key on the major
     if not ver:
         return UNKNOWN
     for key in ((fam, ver), (fam, ver.split(".")[0])):

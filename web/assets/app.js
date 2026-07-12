@@ -8,6 +8,13 @@ const $ = id => document.getElementById(id);
 async function api(path, opts){ const r = await fetch(API+path, opts); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 function fmtUtil(u){ if(!u||(!u.cpu_p95&&!u.mem_p95&&!u.disk_used_pct)) return '-'; return `${u.cpu_p95??'-'}/${u.mem_p95??'-'}/${u.disk_used_pct??'-'}`; }
 function esc(s){ return (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+/* attr() — safe to inline a value into a double-quoted HTML attribute that
+   wraps a single-quoted JS string, e.g. onclick="fn('${attr(x)}')".
+   esc() alone is NOT enough there: HTML-decoding &#39; -> ' happens before JS
+   runs, so a ' in x breaks out of the JS string. attr JS-escapes \ and ' first,
+   then HTML-escapes & < > " for the attribute. Use esc() for text content,
+   attr() for onclick/attribute+JS-string positions. */
+function attr(s){ s=String(s??''); return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 /* shared support-bucket badge (data-gap) — warranty + OS-EOL both use the
    active/expiring/expired/unknown bucket the backend precomputes on every
@@ -116,5 +123,6 @@ async function doRebuild(){
   _rebuildAbort = null; btn.disabled = false;
   if(lastErr) toast('Rebuild failed: '+lastErr, 'err');
   else if(aborted) st.textContent='';   // user cancelled the watch; rebuild still finishes server-side
-  else setTimeout(()=>{ if(st.textContent.startsWith('✓')) st.textContent=''; }, 4000);
+  else if(st.textContent.startsWith('✓')) setTimeout(()=>{ if(st.textContent.startsWith('✓')) st.textContent=''; }, 4000);
+  else st.innerHTML='<span class="ev-err">connection lost — rebuild may still be running</span>';
 }

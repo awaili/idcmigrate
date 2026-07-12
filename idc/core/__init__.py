@@ -122,6 +122,12 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
             srv = srv_by_id.get(sid)
             if srv and w.app_id not in srv.app_ids:
                 srv.app_ids.append(w.app_id)
+    # data-gap — fold hardware warranty / end-of-support onto matching servers
+    # (off by default; IDC_WARRANTY_PATH empty -> no-op). Runs BEFORE the
+    # warranty_bucket computation so the persisted bucket reflects the merged
+    # warranty_status/hardware_eol (otherwise the facet is stale "unknown" for
+    # every merged host).
+    warranty_report = merge_warranty(servers, settings.warranty_path)
     # F4 — set sizing basis (measured/estimated) + data-coverage confidence on
     # each server, so the persisted row carries the signals the UI renders and
     # enrich_match can scale the base rule confidence by coverage.
@@ -130,14 +136,9 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
         s.assessment_confidence = assessment_confidence_of(
             s, has_code_profile=any(a in pidx for a in s.app_ids))
         # data-gap — persist the derived support buckets so the inventory can
-        # facet/filter on them (warranty merge above has filled the raw fields).
+        # facet/filter on them (merge_warranty above filled the raw fields).
         s.warranty_bucket = warranty_bucket(s)
         s.os_eol_bucket = os_eol_bucket(s)
-    # data-gap — fold hardware warranty / end-of-support onto matching servers
-    # (off by default; IDC_WARRANTY_PATH empty -> no-op). Runs before upsert so
-    # the merged warranty_status/hardware_eol persist on the first pass and the
-    # F2 eol premium / F10 hw_support signal / data-gaps count see them.
-    warranty_report = merge_warranty(servers, settings.warranty_path)
     # F1 — fold runtime network-dependency edges into Workload.depends_on +
     # src-server provenance. Runs after app_ids back-population so edges can
     # resolve to app level. Done BEFORE the (single) server write so the netdep

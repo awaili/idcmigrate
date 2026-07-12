@@ -483,7 +483,7 @@ def enrich_match_db(match: Match, db_profile: Optional[DBConversionProfile]) -> 
         # host lands in a later, code-touching wave instead of the data wave.
         match.method = "hybrid"
         notes.append("hard DB conversion → replatform (not a direct rehost)")
-    if db_profile.est_man_days > 0:
+    if (db_profile.est_man_days or 0) > 0:
         notes.append(f"est. {db_profile.est_man_days:.0f} man-day conversion")
     if db_profile.review_objects:
         notes.append(f"{len(db_profile.review_objects)} object(s) need manual review")

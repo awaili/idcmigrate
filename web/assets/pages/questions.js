@@ -22,9 +22,9 @@ async function loadQuestions(){
     if(ctx.old) oldNew.push(`old: <code>${esc(ctx.old)}</code>`);
     if(ctx.new) oldNew.push(`new: <code>${esc(ctx.new)}</code>`);
     // escape for a JS single-quoted string literal inside an onclick attribute
-    // (esc() does HTML-escaping for display; this prevents ' / \ breaking the attr)
-    const jsStr = x => String(x ?? '').replace(/\\/g,'\\\\').replace(/'/g,"\\'");
-    const opts = (q.options||[]).map(o=>`<button class="sm" onclick="answerQuestion('${q.id}','${jsStr(o)}')">${esc(o)}</button>`).join(' ');
+    // attr() = JS-string + HTML-attribute safe (escapes \ ' then & < > ") —
+    // correct for inlining an option into onclick="answerQuestion('...','...')".
+    const opts = (q.options||[]).map(o=>`<button class="sm" onclick="answerQuestion('${q.id}','${attr(o)}')">${esc(o)}</button>`).join(' ');
     return `<div class="card qcard">
       <div class="row" style="justify-content:space-between">
         <b>${esc(q.app_id)}</b>

@@ -151,7 +151,7 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
 
     # --- stage 1: landing zone / platform -------------------------------
     lz_servers = [s.id for s in servers
-                  if (s.role or "") in ("k8s", "monitoring") and s.id not in excluded]
+                  if (s.role or "").lower() in ("k8s", "monitoring") and s.id not in excluded]
     lz_wave = Wave(name="W1 Landing Zone + Platform", stage=STAGE_LZ,
                    server_ids=lz_servers,
                    rationale="Stand up TKE, VPC/COS bootstrap, and observability first.")
@@ -159,7 +159,7 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
 
     # --- stage 2: data services -----------------------------------------
     data_servers = [s.id for s in servers
-                    if (s.role or "") in ("db", "cache") and s.id not in excluded]
+                    if (s.role or "").lower() in ("db", "cache") and s.id not in excluded]
     data_wave = Wave(name="W2 Data Services", stage=STAGE_DB,
                      server_ids=data_servers, depends_on=[lz_wave.id],
                      rationale="Migrate DBs (CDB) and cache (Redis) before apps depend on them.")

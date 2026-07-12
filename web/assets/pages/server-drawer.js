@@ -65,7 +65,7 @@ function _codeSection(code){
       <div class="muted" style="font-size:11px;margin-bottom:2px">code deps (other apps)</div><div style="margin-bottom:4px">${deps}</div>
       ${blockers}
       ${c.summary?`<div class="muted" style="font-size:11px;margin-top:3px">${esc(c.summary)}</div>`:''}
-      <div class="row" style="margin-top:4px;gap:6px"><button class="sm primary" onclick="drawerSevenR('${esc(c.app_id)}')">7R strategy</button><span class="muted" style="font-size:11px">scanned ${esc(c.scanned_at||'-')}</span></div>
+      <div class="row" style="margin-top:4px;gap:6px"><button class="sm primary" onclick="drawerSevenR('${attr(c.app_id)}')">7R strategy</button><span class="muted" style="font-size:11px">scanned ${esc(c.scanned_at||'-')}</span></div>
     </div>`;
   }).join('');
   return `<div style="margin-top:8px"><div class="muted" style="font-size:12px;margin-bottom:2px">Code scan (executor feedback — migration-strategy reference)</div>${cards}</div>`;
@@ -77,21 +77,21 @@ function openServer(id){
     $('dTitle').textContent=s.hostname;
     const kv = (label, val) => `<div class="kv-row"><span class="kv-label">${label}</span><span class="kv-val">${val}</span></div>`;
     $('dBody').innerHTML=`
-      <div class="muted">${s.fqdn||''} · ${s.source_type} · ${s.role}</div>
+      <div class="muted">${esc(s.fqdn||'')} · ${esc(s.source_type||'')} · ${esc(s.role||'')}</div>
       <div class="kv">
-        ${kv('OS', `${s.os||'-'} ${s.os_version||''}`)}
+        ${kv('OS', `${esc(s.os||'-')} ${esc(s.os_version||'')}`)}
         ${kv('CPU / RAM', `${s.cpu_cores||'-'} vCPU / ${s.mem_gb||'-'} GB`)}
-        ${kv('Disks', (s.disks||[]).map(d=>`${d.name} ${d.size_gb}GB ${d.kind} (${d.fs})`).join('<br>')||'-')}
-        ${kv('Network', `${(s.ips||[]).join(', ')||'-'} · ${s.subnet||'-'} · ${s.vlan||'-'}`)}
-        ${kv('Env / Crit', `${s.env||'-'} <span class="pill ${s.business_criticality||''}">${s.business_criticality||'-'}</span>`)}
-        ${kv('Apps', (s.app_ids||[]).join(', ')||'-')}
+        ${kv('Disks', (s.disks||[]).map(d=>`${esc(d.name)} ${d.size_gb}GB ${esc(d.kind)} (${esc(d.fs)})`).join('<br>')||'-')}
+        ${kv('Network', `${esc((s.ips||[]).join(', ')||'-')} · ${esc(s.subnet||'-')} · ${esc(s.vlan||'-')}`)}
+        ${kv('Env / Crit', `${esc(s.env||'-')} <span class="pill ${esc(s.business_criticality||'')}">${esc(s.business_criticality||'-')}</span>`)}
+        ${kv('Apps', esc((s.app_ids||[]).join(', ')||'-'))}
         ${kv('Tags', (s.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join(' ')||'-')}
-        ${kv('Utilization', `cpu ${u.cpu_p95??'-'}% · mem ${u.mem_p95??'-'}% · disk ${u.disk_used_pct??'-'}% <span class="muted">(${u.source||'-'})</span>`)}
+        ${kv('Utilization', `cpu ${u.cpu_p95??'-'}% · mem ${u.mem_p95??'-'}% · disk ${u.disk_used_pct??'-'}% <span class="muted">(${esc(u.source||'-')})</span>`)}
         ${kv('Provenance', (s.source_refs||[]).map(r=>`<span class="tag">${esc(r.source)}:${esc(r.source_id)}</span>`).join(' ')||'-')}
         ${kv('Coverage', _coverageBadge(s, m))}
         ${kv('Warranty', _warrantyBadge(s))}
         ${kv('OS support', _osEolBadge(s))}
-        ${kv('Target', `<b>${m.target?m.target.product:'-'}</b> ${m.target?esc(m.target.spec):''} <span class="muted">@ ${m.target?m.target.region:''}</span>`)}
+        ${kv('Target', `<b>${m.target?esc(m.target.product):'-'}</b> ${m.target?esc(m.target.spec):''} <span class="muted">@ ${m.target?esc(m.target.region):''}</span>`)}
         ${kv('Rule', m.rationale?esc(m.rationale):'-')}
       </div>
       ${_codeSection(s.code)}

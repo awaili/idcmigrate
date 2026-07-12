@@ -26,8 +26,8 @@ async function loadDashboard(){
   $('barOs').innerHTML = bars(a.by_os);
   $('barConf').innerHTML = bars(a.confidence, {'high(>=0.85)':'g','medium(0.7-0.85)':'a','low(<0.7)':'r'});
   $('barRegion').innerHTML = bars(a.by_region);
-  $('dashWaves').innerHTML = a.waves.map(w=>`<div class="wave" onclick="document.querySelector('.tab[data-tab=waves]').click(); openWave('${w.id}','${esc(w.name)}')">
-    <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${w.stage.startsWith('1')?'high':w.stage.startsWith('4')?'medium':'low'}">${w.stage}</span><span style="margin-left:auto" class="meta">${w.n} servers</span></div></div>`).join('');
+  $('dashWaves').innerHTML = a.waves.map(w=>`<div class="wave" onclick="document.querySelector('.tab[data-tab=waves]').click(); openWave('${w.id}')">
+    <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${w.stage.startsWith('1')?'high':w.stage.startsWith('4')?'medium':'low'}">${esc(w.stage)}</span><span style="margin-left:auto" class="meta">${w.n} servers</span></div></div>`).join('');
   // data-gap headline (best-effort — the Data Quality tab has the full report)
   loadDashDataGap();
 }

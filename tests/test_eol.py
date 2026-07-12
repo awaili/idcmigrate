@@ -105,4 +105,6 @@ def test_os_support_signal_levels():
     assert _sig_os_support(we, servers)["level"] == RED
     assert _sig_os_support(wx, servers)["level"] == YELLOW
     assert _sig_os_support(wa, servers)["level"] == GREEN
-    assert _sig_os_support(wu, servers)["level"] == NA
+    # unknown -> YELLOW (conservative): an OS not in the EOL table is an
+    # unassessed blind spot, not "safe to cut"
+    assert _sig_os_support(wu, servers)["level"] == YELLOW

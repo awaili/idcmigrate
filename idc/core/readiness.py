@@ -191,8 +191,12 @@ def _sig_hw_support(wave_or_members, servers: Optional[List[Server]] = None
         members = wave_or_members
     if not members:
         return {"level": NA, "detail": "empty wave"}
+    # UNKNOWN -> YELLOW (conservative): an unassessed estate must NOT read as
+    # green/ready on the cutover gate — that hides exactly the blind spot most
+    # dangerous on a messy IDC. (The confidence score treats unknown as neutral;
+    # the readiness GATE is a different consumer and must be conservative.)
     _bucket_to_level = {WARRANTY_EXPIRED: RED, WARRANTY_EXPIRING: YELLOW,
-                        WARRANTY_ACTIVE: GREEN}
+                        WARRANTY_ACTIVE: GREEN, WARRANTY_UNKNOWN: YELLOW}
     buckets = [warranty_bucket(s) for s in members]
     levels = [_bucket_to_level.get(b, NA) for b in buckets]
     rank = {RED: 0, YELLOW: 1, GREEN: 2}
@@ -203,9 +207,13 @@ def _sig_hw_support(wave_or_members, servers: Optional[List[Server]] = None
     n_exp = buckets.count(WARRANTY_EXPIRED)
     n_exp2 = buckets.count(WARRANTY_EXPIRING)
     n_act = buckets.count(WARRANTY_ACTIVE)
+    n_unk = buckets.count(WARRANTY_UNKNOWN)
     if worst == RED:
         return {"level": RED,
                 "detail": f"{n_exp} host(s) out of warranty — cutover + refresh risk"}
+    if n_unk and not n_exp2:
+        return {"level": YELLOW,
+                "detail": f"{n_unk} host(s) warranty status unassessed — verify before cutover"}
     if worst == YELLOW:
         return {"level": YELLOW,
                 "detail": f"{n_exp2} host(s) warranty expiring <{WARRANTY_EXPIRING_DAYS}d"}
@@ -219,7 +227,8 @@ def _sig_os_support(wave_or_members, servers: Optional[List[Server]] = None
     Backward-compatible: accepts either a ``Wave`` + ``servers`` list (legacy
     tests) or a pre-computed list of member servers (portfolio fast path).
     """
-    from .eol import os_eol_bucket, EXPIRED as OS_EXPIRED, EXPIRING as OS_EXPIRING, ACTIVE as OS_ACTIVE
+    from .eol import (os_eol_bucket, EXPIRED as OS_EXPIRED, EXPIRING as OS_EXPIRING,
+                      ACTIVE as OS_ACTIVE, UNKNOWN as OS_UNKNOWN)
     if servers is not None:
         sids = set(wave_or_members.server_ids or [])
         members = [s for s in servers if s.id in sids]
@@ -227,7 +236,10 @@ def _sig_os_support(wave_or_members, servers: Optional[List[Server]] = None
         members = wave_or_members
     if not members:
         return {"level": NA, "detail": "empty wave"}
-    _bucket_to_level = {OS_EXPIRED: RED, OS_EXPIRING: YELLOW, OS_ACTIVE: GREEN}
+    # UNKNOWN -> YELLOW (conservative): an OS not in the EOL table is an
+    # unassessed blind spot, not "safe to cut". See _sig_hw_support for rationale.
+    _bucket_to_level = {OS_EXPIRED: RED, OS_EXPIRING: YELLOW, OS_ACTIVE: GREEN,
+                        OS_UNKNOWN: YELLOW}
     buckets = [os_eol_bucket(s) for s in members]
     levels = [_bucket_to_level.get(b, NA) for b in buckets]
     rank = {RED: 0, YELLOW: 1, GREEN: 2}
@@ -237,9 +249,13 @@ def _sig_os_support(wave_or_members, servers: Optional[List[Server]] = None
     worst = min(present, key=lambda lv: rank[lv])
     n_exp = buckets.count(OS_EXPIRED)
     n_exp2 = buckets.count(OS_EXPIRING)
+    n_unk = buckets.count(OS_UNKNOWN)
     if worst == RED:
         return {"level": RED,
                 "detail": f"{n_exp} host(s) on an out-of-support OS — replatform, do not rehost"}
+    if n_unk and not n_exp2:
+        return {"level": YELLOW,
+                "detail": f"{n_unk} host(s) OS not assessed against the EOL table — verify before cutover"}
     if worst == YELLOW:
         return {"level": YELLOW,
                 "detail": f"{n_exp2} host(s) OS nearing end-of-support"}

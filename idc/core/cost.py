@@ -280,27 +280,30 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
         if not m:
             continue
         est = estimate_server(s, m, book)
-        cloud_monthly += est.monthly_usd
-        cloud_yearly += est.yearly_usd
-        if book.onprem_rate > 0:
-            onprem_monthly += book.onprem_rate
-            onprem_yearly += book.onprem_rate * 12
-            # F2 + data-gap — extended-support premium for out-of-warranty hosts
-            prem = eol_onprem_premium_monthly(s, book)
-            if prem:
-                onprem_monthly += prem
-                onprem_yearly += prem * 12
-                eol_premium_yearly += prem * 12
         strat = _strategy_for(s, strategies)
-        # non-migrating strategies contribute 0 cloud cost (host stays/retires)
-        if strat in (PATTERN_RETAIN, PATTERN_RETIRE):
-            cloud_monthly -= est.monthly_usd
-            cloud_yearly -= est.yearly_usd
-        per_product[est.target_product] = per_product.get(est.target_product, 0.0) + est.yearly_usd
-        per_region[est.region] = per_region.get(est.region, 0.0) + est.yearly_usd
+        migrating = strat not in (PATTERN_RETAIN, PATTERN_RETIRE)
+        # non-migrating strategies (retain/retire) contribute 0 cloud cost AND
+        # are excluded from the on-prem baseline: a retain host stays on-prem
+        # (no saving), a retire host is decommissioned regardless of migration
+        # (the saving isn't a *cloud-migration* saving). Counting either would
+        # inflate annual_savings + the per_product/per_region rollups.
+        if migrating:
+            cloud_monthly += est.monthly_usd
+            cloud_yearly += est.yearly_usd
+            if book.onprem_rate > 0:
+                onprem_monthly += book.onprem_rate
+                onprem_yearly += book.onprem_rate * 12
+                # F2 + data-gap — extended-support premium for out-of-warranty hosts
+                prem = eol_onprem_premium_monthly(s, book)
+                if prem:
+                    onprem_monthly += prem
+                    onprem_yearly += prem * 12
+                    eol_premium_yearly += prem * 12
+            per_product[est.target_product] = per_product.get(est.target_product, 0.0) + est.yearly_usd
+            per_region[est.region] = per_region.get(est.region, 0.0) + est.yearly_usd
         bucket = per_strategy.setdefault(strat, {"servers": 0, "yearly": 0.0})
         bucket["servers"] += 1
-        bucket["yearly"] += est.yearly_usd if strat not in (PATTERN_RETAIN, PATTERN_RETIRE) else 0.0
+        bucket["yearly"] += est.yearly_usd if migrating else 0.0
         per_server.append({
             "server_id": s.id, "hostname": s.hostname, "app_ids": list(s.app_ids),
             "product": est.target_product, "spec": est.spec, "region": est.region,

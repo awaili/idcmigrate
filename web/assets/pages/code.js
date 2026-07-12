@@ -15,7 +15,7 @@ async function loadCode(){
         <td data-label="code_deps">${esc((p.code_deps||[]).join(', ')||'-')}</td>
         <td data-label="blockers">${(p.blockers||[]).length}</td><td data-label="findings">${(p.findings||[]).length}</td>
         <td data-label="scanned">${esc(p.scanned_at||'-')}</td>
-        <td data-label="7R"><button class="sm" onclick="assignStrategy('${esc(p.app_id)}')">7R</button></td></tr>`);
+        <td data-label="7R"><button class="sm" onclick="assignStrategy('${attr(p.app_id)}')">7R</button></td></tr>`);
     });
     if(!profiles.length) tb.insertAdjacentHTML('beforeend', `<tr><td colspan="9" class="muted">no profiles yet — trigger a scan, or wait for executor callback.</td></tr>`);
   }catch(e){ $('codeTbl').querySelector('tbody').innerHTML = `<tr><td colspan="9" class="ev-err">${esc(e)}</td></tr>`; }

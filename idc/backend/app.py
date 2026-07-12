@@ -11,8 +11,9 @@ import asyncio
 import json
 import os
 import secrets
+import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -55,14 +56,19 @@ app = FastAPI(title="idc-migrate", version="0.1.0")
 # executor's callbacks + context pulls still work). Public: /login, /logout,
 # /executor (the contract page), /assets/*.
 _SESSION_SECRET = settings.web_session_secret or secrets.token_hex(32)
+# Sentinel returned by _web_auth_password on DB error: non-empty so auth stays
+# ON (fail closed — never silently open the app on a DB outage), but no form
+# password ever equals it, so every login is rejected until the DB recovers.
+_DB_ERR_PW = "\x00\x01db-error"
 
 
 def _web_auth_password() -> str:
-    """The active login password: DB override if set, else env. '' = auth off."""
+    """The active login password: DB override if set, else env. '' = auth off.
+    On DB error returns a fail-closed sentinel (auth stays on, login denied)."""
     try:
         db = STORE.get_config("web_password")
     except Exception:
-        db = None
+        return _DB_ERR_PW
     return db or settings.web_password
 
 
@@ -70,12 +76,55 @@ def _executor_bearer_ok(authorization: str) -> bool:
     tok = _executor_settings().executor_token
     if not tok or not authorization or not authorization.lower().startswith("bearer "):
         return False
-    return authorization.split(" ", 1)[1].strip() == tok
+    return secrets.compare_digest(authorization.split(" ", 1)[1].strip(), tok)
+
+
+# crude in-memory login throttle: >10 failures per IP in 60s -> 429. Process-
+# local (single backend); resets on restart. Guards the shared-password gate
+# against brute force on the internet-facing box.
+_LOGIN_FAILS: Dict[str, list] = {}
+_LOGIN_FAIL_WINDOW = 60.0
+_LOGIN_FAIL_MAX = 10
+
+
+def _login_throttled(ip: str) -> bool:
+    now = time.time()
+    recent = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_FAIL_WINDOW]
+    _LOGIN_FAILS[ip] = recent
+    return len(recent) >= _LOGIN_FAIL_MAX
+
+
+def _record_login_fail(ip: str) -> None:
+    _LOGIN_FAILS.setdefault(ip, []).append(time.time())
+
+
+def _ws_session_authed(ws: WebSocket) -> bool:
+    """The HTTP auth middleware doesn't run for WebSocket scopes, so check the
+    session cookie manually here (same signing as SessionMiddleware). Auth-off
+    when no password is configured."""
+    if not _web_auth_password():
+        return True
+    cookie = ws.cookies.get("idc_sess")
+    if not cookie:
+        return False
+    try:
+        from itsdangerous import URLSafeTimedSerializer, BadSignature
+        signer = URLSafeTimedSerializer(_SESSION_SECRET, salt="cookie-session")
+        data = signer.loads(cookie, max_age=60 * 60 * 24 * 30)
+        return bool((data.get("session") or {}).get("authed"))
+    except Exception:  # BadSignature / expired / malformed -> deny
+        return False
 
 
 # paths that stay open when auth is on
 _PUBLIC_PREFIXES = ("/assets/",)
 _PUBLIC_PATHS = {"/login", "/logout", "/executor", "/favicon.ico"}
+# Paths where the executor bearer token is honored (the executor contract
+# surface: push callbacks + read-only context pulls). Everywhere else under
+# /api/ requires a browser session — so a leaked bearer can't change the
+# password, rewrite executor config, trigger scans, or drive migration jobs.
+_BEARER_PREFIXES = ("/api/code-profiles", "/api/db-profiles", "/api/change-jobs",
+                    "/api/workloads/", "/api/apps/", "/api/questions")
 
 
 async def _auth_dispatch(request: Request, call_next):
@@ -87,7 +136,8 @@ async def _auth_dispatch(request: Request, call_next):
         return await call_next(request)
     if request.session.get("authed"):
         return await call_next(request)
-    if _executor_bearer_ok(request.headers.get("authorization", "")):
+    if _executor_bearer_ok(request.headers.get("authorization", "")) \
+       and any(path.startswith(p) for p in _BEARER_PREFIXES):
         return await call_next(request)
     # denied: JSON for API/WS, redirect for pages
     if path.startswith("/api/") or path.startswith("/ws/"):
@@ -97,7 +147,10 @@ async def _auth_dispatch(request: Request, call_next):
 
 # Order matters: Session must be OUTERMOST so request.session is populated
 # before _auth_dispatch reads it. add_middleware prepends, so add Auth first,
-# Session second (Session ends up outermost).
+# Session second (Session ends up outermost). https_only is left False so the
+# cookie also works for direct localhost admin + the test transport; HTTPS is
+# enforced at the nginx edge (port 80 -> 443 redirect) so the browser only
+# ever sends it over TLS.
 app.add_middleware(BaseHTTPMiddleware, dispatch=_auth_dispatch)
 app.add_middleware(SessionMiddleware, secret_key=_SESSION_SECRET,
                    session_cookie="idc_sess", same_site="lax", https_only=False,
@@ -534,7 +587,7 @@ def _check_executor_auth(authorization: Optional[str]):
                                   "set it to accept executor push callbacks")
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing bearer token")
-    if authorization.split(" ", 1)[1].strip() != token:
+    if not secrets.compare_digest(authorization.split(" ", 1)[1].strip(), token):
         raise HTTPException(401, "invalid executor token")
 
 
@@ -795,8 +848,8 @@ class ExecutorScanReq(BaseModel):
     app_id: str
     repo_url: str
     branch: str = ""
-    action: str = "scan"       # scan | comb | modify
-    mode: str = "plan"         # for modify: plan | execute
+    action: Literal["scan", "comb", "modify"] = "scan"
+    mode: Literal["plan", "execute"] = "plan"   # for modify
     scope: Optional[List[str]] = None
     # for modify: operator-supplied old→new value map (e.g.
     # {"10.0.4.20": "${DB_HOST}", "hunter2": "${DB_PASSWORD}"}). idc-migrate
@@ -852,6 +905,8 @@ def executor_put_config(req: ExecutorConfigReq):
     restart; _executor_settings() reads the DB live, so it takes effect
     immediately. Returns the new config + a probe."""
     if req.url is not None:
+        if req.url and not (req.url.startswith("http://") or req.url.startswith("https://")):
+            raise HTTPException(400, "url must be http(s)://...")
         STORE.set_config("executor_url", req.url)
     if req.token is not None and req.token != "":
         # empty token in the body means "leave unchanged" (the field was masked)
@@ -859,6 +914,8 @@ def executor_put_config(req: ExecutorConfigReq):
     if req.enabled is not None:
         STORE.set_config("executor_enabled", "true" if req.enabled else "false")
     if req.timeout is not None:
+        if not (1 <= req.timeout <= 3600):
+            raise HTTPException(400, "timeout must be between 1 and 3600 seconds")
         STORE.set_config("executor_timeout", str(int(req.timeout)))
     return _executor_config_out()
 
@@ -963,7 +1020,7 @@ class RuntimeContainerizeReq(BaseModel):
     app_id: str
     server_id: str                 # host whose runtime inventory we infer from
     inventory: Dict[str, Any] = {}  # process / port / software (Zabbix/Prometheus)
-    mode: str = "plan"             # plan (dry-run scaffold) | execute (write)
+    mode: Literal["plan", "execute"] = "plan"   # plan (dry-run) | execute (write)
 
 
 @app.get("/api/runtime-inventory/{server_id}")
@@ -1789,6 +1846,11 @@ def get_task(task_id: str):
 
 @app.websocket("/ws/agent/{task_id}")
 async def ws_agent(ws: WebSocket, task_id: str):
+    # WS scopes bypass the HTTP auth middleware — verify the session cookie
+    # before accepting (the browser sends it on the same-origin upgrade).
+    if not _ws_session_authed(ws):
+        await ws.close(code=1008, reason="authentication required")
+        return
     await ws.accept()
     t = STORE.get_task(task_id)
     if not t:
@@ -1898,9 +1960,15 @@ def login_post(request: Request, password: str = Form(...)):
     pw = _web_auth_password()
     if not pw:  # auth off
         return RedirectResponse("/", status_code=303)
-    if password == pw:
+    ip = (request.client.host if request.client else "") or "?"
+    if _login_throttled(ip):
+        return HTMLResponse(_login_page("Too many attempts — wait a minute."),
+                            status_code=429)
+    if secrets.compare_digest(password, pw):
         request.session["authed"] = True
+        _LOGIN_FAILS.pop(ip, None)
         return RedirectResponse("/", status_code=303)
+    _record_login_fail(ip)
     return HTMLResponse(_login_page("Wrong password."), status_code=401)
 
 
@@ -1911,10 +1979,15 @@ def logout(request: Request):
 
 
 @app.post("/api/auth/password")
-def change_password(request: Request, password: str = Form(...)):
-    """Change the login password (requires a logged-in session, which the
-    middleware enforces on /api/*). Persists to system_config so it survives a
-    restart and overrides the env IDC_WEB_PASSWORD."""
+def change_password(request: Request, password: str = Form(...),
+                    current: str = Form(...)):
+    """Change the login password. Requires a logged-in session (middleware) AND
+    the current password (re-verified) — so a hijacked session alone can't lock
+    out the operator. Persists to system_config so it survives a restart and
+    overrides the env IDC_WEB_PASSWORD."""
+    pw = _web_auth_password()
+    if not pw or not secrets.compare_digest(current, pw):
+        raise HTTPException(401, "current password incorrect")
     if not password or len(password) < 4:
         raise HTTPException(400, "password must be at least 4 characters")
     STORE.set_config("web_password", password)

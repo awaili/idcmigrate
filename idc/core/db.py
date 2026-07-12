@@ -383,9 +383,21 @@ class Store:
                 for _ in range(2):
                     self._pool.put(self._new_mysql())
         try:
-            return self._pool.get_nowait()
+            conn = self._pool.get_nowait()
         except Empty:
             return self._new_mysql()
+        # a pooled conn may have sat idle past MariaDB's wait_timeout (server
+        # closed it). ping with reconnect=True re-establishes it; on failure,
+        # drop it and make a fresh one instead of returning a dead conn.
+        try:
+            conn.ping(reconnect=True)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return self._new_mysql()
+        return conn
 
     def _pool_put(self, conn) -> None:
         try:
@@ -461,22 +473,36 @@ class Store:
     # -- transaction / read helpers ---------------------------------------
     @contextmanager
     def tx(self):
-        """Write transaction. Holds a pooled mariadb conn."""
+        """Write transaction. Holds a pooled mariadb conn.
+
+        On failure: rollback, and if the connection is dead (rollback itself
+        raised, e.g. ``MySQL server has gone away``) close it instead of
+        returning a poisoned conn to the pool."""
         conn = self._pool_get()
         cur = conn.cursor()
+        conn_dead = False
         try:
             conn.begin()
             yield cur
             conn.commit()
         except Exception:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                conn_dead = True   # rollback failed -> conn is poisoned; drop it
             raise
         finally:
             try:
                 cur.close()
             except Exception:
                 pass
-            self._pool_put(conn)
+            if conn_dead:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            else:
+                self._pool_put(conn)
 
     @contextmanager
     def _read_cursor(self):

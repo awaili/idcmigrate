@@ -42,7 +42,7 @@ function renderInv(r){
     if(!data || !Object.keys(data).length) return '';
     const rows = Object.entries(data).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{
       const active = state.filters[dim]===k ? 'active' : '';
-      return `<div class="facet ${active}" onclick="toggleFacet('${dim}','${esc(k)}')"><span>${esc(k)}</span><span class="n">${v}</span></div>`;
+      return `<div class="facet ${active}" onclick="toggleFacet('${dim}','${attr(k)}')"><span>${esc(k)}</span><span class="n">${v}</span></div>`;
     }).join('');
     return `<div class="facet-group"><div class="ft">${label}</div>${rows}</div>`;
   }).join('') || '<span class="muted">no facets</span>';
@@ -63,14 +63,14 @@ function renderInv(r){
     const m=s.match||{};
     return `<tr onclick="openServer('${s.id}')">
       <td data-label="Hostname"><input type="checkbox" onclick="event.stopPropagation();toggleSel('${s.id}',this.checked)" ${state.selected.has(s.id)?'checked':''} style="vertical-align:middle;margin-right:4px"/><b>${esc(s.hostname)}</b></td>
-      <td data-label="Role"><span class="tag ${s.role}">${s.role||'-'}</span></td>
-      <td data-label="Type">${s.source_type||'-'}</td>
-      <td data-label="OS">${s.os||'-'}</td>
+      <td data-label="Role"><span class="tag ${esc(s.role||'')}">${esc(s.role||'-')}</span></td>
+      <td data-label="Type">${esc(s.source_type||'-')}</td>
+      <td data-label="OS">${esc(s.os||'-')}</td>
       <td data-label="CPU">${s.cpu_cores}</td>
       <td data-label="Mem">${s.mem_gb}G</td>
-      <td data-label="Env">${s.env||'-'}</td>
-      <td data-label="Crit"><span class="pill ${s.business_criticality}">${s.business_criticality||'-'}</span></td>
-      <td data-label="Target"><b>${m.target?m.target.product:'-'}</b> <span class="muted">${m.target?esc(m.target.spec).slice(0,18):''}</span></td>
+      <td data-label="Env">${esc(s.env||'-')}</td>
+      <td data-label="Crit"><span class="pill ${esc(s.business_criticality||'')}">${esc(s.business_criticality||'-')}</span></td>
+      <td data-label="Target"><b>${m.target?esc(m.target.product):'-'}</b> <span class="muted">${m.target?esc(m.target.spec).slice(0,18):''}</span></td>
       <td data-label="Util%" class="conf">${fmtUtil(s.utilization)}</td>
       <td data-label="Support" class="conf">${bucketBadge(s.warranty_bucket,'warranty')} ${bucketBadge(s.os_eol_bucket,'OS EOL')}</td>
       <td data-label="Conf" class="conf">${m.confidence?'_'+m.confidence.toFixed(1):'-'}</td>

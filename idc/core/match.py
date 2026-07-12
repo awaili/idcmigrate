@@ -242,14 +242,14 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
     az = _az(region)
     cpu, mem = _sizing_cpu_mem(s, sizing_strategy)
     role = (s.role or "app").lower()
-    stype = s.source_type or "vm"
+    stype = (s.source_type or "vm").lower()
     disk_gb = _largest_data_disk_gb(s)
-    high = s.business_criticality.lower() == "high"
+    high = (s.business_criticality or "").lower() == "high"
 
     # --- container platform ---------------------------------------------
     if stype in ("k8s-master", "k8s-node") or role == "k8s":
-        tags_lc = [t.lower() for t in s.tags]
-        is_master = (stype == "k8s-master" or "master" in s.hostname.lower()
+        tags_lc = [t.lower() for t in (s.tags or [])]
+        is_master = (stype == "k8s-master" or "master" in (s.hostname or "").lower()
                      or "control-plane" in tags_lc or "controlplane" in tags_lc)
         if is_master:
             tgt = Target(product="TKE", spec="托管集群(Managed Control Plane)",
@@ -285,7 +285,7 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
         # Detect the Oracle *DB engine* from tags/hostname only — NOT from OS,
         # because Oracle Linux normalizes to "oracle linux" and would misroute
         # a MySQL server running on it to the CVM lift-and-shift path.
-        tags_lc = [t.lower() for t in s.tags]
+        tags_lc = [t.lower() for t in (s.tags or [])]
         hints = " ".join(tags_lc) + " " + (s.hostname or "").lower()
         if "oracle" in hints:
             sku, sz = _size_cvm(cpu, mem)
@@ -300,7 +300,7 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
         # default mysql/mariadb/postgres
         spec, cap = _size_by_mem(mem, CDB_MYSQL_SPECS)
         edition = "高可用版(HA)" if high else "基础版"
-        is_replica = "replica" in " ".join(s.tags).lower()
+        is_replica = "replica" in " ".join(s.tags or []).lower()
         if is_replica:
             edition = "只读实例(RO)"
         tgt = Target(product="CDB", spec=f"MySQL 8.0 {spec} {edition}",
