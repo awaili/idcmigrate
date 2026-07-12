@@ -868,8 +868,55 @@ def executor_job(job_id: str):
 
 @app.post("/api/rebuild")
 def rebuild_derived(req: RebuildReq):
-    return rebuild(STORE, settings, do_match=req.do_match, do_plan=req.do_plan,
-                   max_waves=req.max_waves)
+    """Rebuild derived tables (servers/matches/waves) as an NDJSON stream.
+
+    Streams ``{type:"progress", phase, ...}`` as each stage finishes (normalize
+    → persist servers/workloads → match N → persist matches+costs → plan →
+    persist waves), then ``{type:"done", ...stats}`` (or ``{type:"error"}``).
+    The browser reads the stream for a live stage indicator and can cancel the
+    watch via AbortController — the server-side rebuild still runs to completion.
+
+    Why stream instead of a plain JSON response: rebuild is a full-estate write.
+    For a 15K estate it previously took ~2 min with no bytes on the wire, so
+    proxies/the browser could time out and the UI had no progress. The write
+    path is now batched (one tx per table, see Store.replace_*), so it is
+    seconds — but streaming keeps the connection alive for any estate size and
+    gives the user a live stage indicator + cancel."""
+    import queue as _queue
+    import threading as _threading
+
+    out_q: "_queue.Queue" = _queue.Queue()
+    _SENTINEL = object()
+
+    def _emit(frame: dict) -> None:
+        out_q.put(json.dumps(frame, ensure_ascii=False) + "\n")
+
+    def _on_progress(phase: str, payload: dict) -> None:
+        frame = {"type": "progress", "phase": phase}
+        frame.update(payload)
+        _emit(frame)
+
+    def _worker() -> None:
+        try:
+            stats = rebuild(STORE, settings, do_match=req.do_match,
+                            do_plan=req.do_plan, max_waves=req.max_waves,
+                            on_progress=_on_progress)
+            _emit({"type": "done", **stats})
+        except Exception as e:   # never leave the stream hanging
+            _emit({"type": "error", "error": f"{e!r}"})
+        finally:
+            out_q.put(_SENTINEL)
+
+    _threading.Thread(target=_worker, daemon=True).start()
+
+    def stream():
+        while True:
+            item = out_q.get()
+            if item is _SENTINEL:
+                break
+            yield item
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 # ---------------------------------------------------------------------------

@@ -417,6 +417,17 @@ class Store:
         return (f"INSERT INTO {table}({cols_csv}) VALUES({placeholders}) "
                 f"ON DUPLICATE KEY UPDATE {set_clause}")
 
+    # Rows per executemany batch. Bounds the assembled INSERT packet so a
+    # 15K-server rebuild never trips max_allowed_packet; all chunks still share
+    # the caller's single transaction (the win is collapsing N transactions,
+    # not N statements — pymysql also rewrites each chunk to one multi-row INSERT).
+    _BULK_BATCH = 1000
+
+    def _bulk_upsert(self, cur, sql: str, rows: List[tuple]) -> None:
+        """Chunked executemany inside the caller's open transaction."""
+        for i in range(0, len(rows), self._BULK_BATCH):
+            cur.executemany(sql, rows[i:i + self._BULK_BATCH])
+
     def _exec_schema(self, conn, schema: str) -> None:
         cur = conn.cursor()
         try:
@@ -545,6 +556,29 @@ class Store:
                          s.warranty_status, s.hardware_eol,
                          s.warranty_bucket, s.os_eol_bucket,
                          s.created_at, s.updated_at))
+
+    def replace_servers(self, servers: Iterable[Server]) -> int:
+        """Atomically replace every server row: DELETE + batched insert in one tx.
+
+        The rebuild write hotspot. ``rebuild`` previously did one ``upsert_server``
+        per server (15K own transactions for a 15K estate, each a full pool
+        checkout/BEGIN/COMMIT round trip to the remote DB). This collapses that
+        to a single transaction with chunked multi-row inserts."""
+        sql = self._x(self._upsert_sql("servers", self._SERVER_COLS, "id"))
+        rows = [(
+            s.id, s.hostname, s.fqdn, dumps(s.ips), s.source_type, s.role, s.os,
+            s.os_version, s.cpu_cores, s.cpu_model, s.mem_gb,
+            dumps([d.to_dict() for d in s.disks]), s.subnet, s.vlan, s.datacenter,
+            s.cluster, s.env, dumps(s.app_ids), dumps(s.tags),
+            s.business_criticality, s.migration_tier, dumps(s.utilization.to_dict()),
+            dumps(s.source_refs), s.status, s.sizing_basis, s.assessment_confidence,
+            s.warranty_status, s.hardware_eol, s.warranty_bucket, s.os_eol_bucket,
+            s.created_at, s.updated_at,
+        ) for s in servers]
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM servers"))
+            self._bulk_upsert(cur, sql, rows)
+        return len(rows)
 
     def _row_to_server(self, r) -> Server:
         d = dict(r)
@@ -819,6 +853,18 @@ class Store:
                         (w.app_id, w.name, w.tier, w.env, dumps(w.server_ids),
                          dumps(w.depends_on), w.notes))
 
+    def replace_workloads(self, workloads: Iterable[Workload]) -> int:
+        """Atomically replace every workload row: DELETE + batched insert in one tx."""
+        sql = self._x(self._upsert_sql("workloads",
+                         ["app_id", "name", "tier", "env", "server_ids",
+                          "depends_on", "notes"], "app_id"))
+        rows = [(w.app_id, w.name, w.tier, w.env, dumps(w.server_ids),
+                 dumps(w.depends_on), w.notes) for w in workloads]
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM workloads"))
+            self._bulk_upsert(cur, sql, rows)
+        return len(rows)
+
     def list_workloads(self) -> List[Workload]:
         out = []
         for r in self._fetchall("SELECT * FROM workloads"):
@@ -837,6 +883,30 @@ class Store:
             cur.execute(self._x(sql),
                         (m.server_id, dumps(m.target.to_dict()), m.confidence,
                          m.method, m.rationale, dumps(m.alternatives), m.created_at))
+
+    def replace_matches_and_costs(self, matches: Iterable[Match],
+                                  costs: Iterable[CostEstimate]) -> int:
+        """Atomically replace all matches + cost_estimates in one tx.
+
+        Both tables are derived together from the match pass (one row per
+        server) and share the rebuild lifecycle, so they are wiped and
+        rewritten together. ``rebuild`` previously issued two per-server
+        transactions here (``upsert_cost`` + ``upsert_match`` × 15K)."""
+        msql = self._x(self._upsert_sql("matches",
+                          ["server_id", "target", "confidence", "method",
+                           "rationale", "alternatives", "created_at"], "server_id"))
+        csql = self._x(self._upsert_sql("cost_estimates", self._COST_COLS, "server_id"))
+        mrows = [(m.server_id, dumps(m.target.to_dict()), m.confidence, m.method,
+                  m.rationale, dumps(m.alternatives), m.created_at) for m in matches]
+        crows = [(c.server_id, c.target_product, c.spec, c.region, c.monthly_usd,
+                  c.yearly_usd, c.basis, c.pricing_source, c.computed_at)
+                 for c in costs]
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM matches"))
+            cur.execute(self._x("DELETE FROM cost_estimates"))
+            self._bulk_upsert(cur, msql, mrows)
+            self._bulk_upsert(cur, csql, crows)
+        return len(mrows)
 
     def get_match(self, server_id: str) -> Optional[Match]:
         r = self._fetchone("SELECT * FROM matches WHERE server_id=?", (server_id,))

@@ -24,7 +24,8 @@
   <div class="stats" id="stats"></div>
   <div class="row">
     <button class="sm" onclick="doIngest()">Ingest</button>
-    <button class="sm primary" onclick="doRebuild()">Rebuild</button>
+    <button class="sm primary" id="rebuildBtn" onclick="doRebuild()">Rebuild</button>
+    <span id="rebuildStatus" class="muted" style="font-size:12px"></span>
     <label class="muted" style="white-space:nowrap;font-size:12px">max waves
       <input id="rebuildMaxWaves" type="number" min="0" step="1" value="0" style="width:64px" title="Hard cap on total waves when rebuilding (0 = no cap). The same guarantee as plan-llm's --max-waves.">
     </label>

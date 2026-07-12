@@ -54,14 +54,67 @@ async function loadStats(){
 
 /* ---------- pipeline ops ---------- */
 async function doIngest(){ await api('/ingest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source:'all'})}); await loadStats(); if(!$('tab-dashboard').classList.contains('hidden'))loadDashboard(); if(!$('tab-inventory').classList.contains('hidden'))fetchInv(); loadRail(); }
+let _rebuildAbort = null;
+const _REBUILD_PHASE = {
+  normalize: 'normalize', 'persist:servers': 'write servers',
+  'persist:workloads': 'write workloads', match: 'match targets',
+  'persist:matches': 'write matches', plan: 'plan waves', 'persist:waves': 'write waves',
+};
 async function doRebuild(){
+  const btn = $('rebuildBtn'), st = $('rebuildStatus');
+  // a running rebuild -> this click cancels it (server-side work still finishes;
+  // we just stop watching the stream and re-enable the button)
+  if(_rebuildAbort){ _rebuildAbort.abort(); return; }
+  _rebuildAbort = new AbortController();
+  const sig = _rebuildAbort.signal;
   const mw = parseInt($('rebuildMaxWaves').value, 10);
   const body = {};
   if(mw && mw > 0) body.max_waves = mw;
-  await api('/rebuild',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-  await loadStats();
-  if(!$('tab-dashboard').classList.contains('hidden'))loadDashboard();
-  if(!$('tab-inventory').classList.contains('hidden'))fetchInv();
-  if(!$('tab-waves').classList.contains('hidden'))loadWaves();
-  loadRail();
+  btn.disabled = true;
+  st.innerHTML = '<span class="spinner"></span> rebuilding… <button class="sm" onclick="doRebuild()">cancel</button>';
+  let resp;
+  try{
+    resp = await fetch(API+'/rebuild', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body:JSON.stringify(body), signal:_rebuildAbort.signal
+    });
+  }catch(e){ _rebuildAbort=null; btn.disabled=false;
+    st.textContent=''; if(e.name!=='AbortError') toast('Rebuild failed: '+e, 'err'); return; }
+  if(!resp.ok){ _rebuildAbort=null; btn.disabled=false;
+    st.innerHTML='<span class="ev-err">error</span>'; toast('Rebuild failed: '+await resp.text(), 'err'); return; }
+  // NDJSON stream: one {type:progress|done|error} frame per line, like /strategy/batch.
+  const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf='';
+  let lastErr = null, t0 = Date.now();
+  try{
+    while(true){
+      const {value, done:rd} = await reader.read();
+      if(rd) break;
+      buf += dec.decode(value, {stream:true});
+      const lines = buf.split('\n'); buf = lines.pop();
+      for(const line of lines){
+        if(!line) continue;
+        let j; try{ j = JSON.parse(line); }catch(e){ continue; }
+        if(j.type === 'progress'){
+          const label = _REBUILD_PHASE[j.phase] || j.phase;
+          const extra = j.total!=null ? ` (${j.total})` : (j.servers!=null ? ` (${j.servers} servers)` : '');
+          st.innerHTML = `<span class="spinner"></span> ${esc(label)}${extra} <button class="sm" onclick="doRebuild()">cancel</button>`;
+        } else if(j.type === 'done'){
+          const secs = ((Date.now()-t0)/1000).toFixed(1);
+          st.innerHTML = `<span style="color:var(--green)">✓ rebuilt in ${secs}s</span>`;
+          await loadStats();
+          if(!$('tab-dashboard').classList.contains('hidden'))loadDashboard();
+          if(!$('tab-inventory').classList.contains('hidden'))fetchInv();
+          if(!$('tab-waves').classList.contains('hidden'))loadWaves();
+          loadRail();
+        } else if(j.type === 'error'){
+          lastErr = j.error; st.innerHTML = '<span class="ev-err">error</span>';
+        }
+      }
+    }
+  }catch(e){ /* abort / network drop — handled below */ }
+  const aborted = sig.aborted;
+  _rebuildAbort = null; btn.disabled = false;
+  if(lastErr) toast('Rebuild failed: '+lastErr, 'err');
+  else if(aborted) st.textContent='';   // user cancelled the watch; rebuild still finishes server-side
+  else setTimeout(()=>{ if(st.textContent.startsWith('✓')) st.textContent=''; }, 4000);
 }

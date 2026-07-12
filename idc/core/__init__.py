@@ -8,7 +8,7 @@ entrypoint used by both CLI and backend to refresh derived data.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from ..config import Settings, get_settings
 from .codeintel import enrich_match, enrich_match_db, index_profiles
@@ -80,12 +80,25 @@ def run_ingest(store: Store, settings: Settings, source: str = "all",
 
 def rebuild(store: Store, settings: Optional[Settings] = None,
             do_match: bool = True, do_plan: bool = True,
-            max_waves: int = 0) -> dict:
+            max_waves: int = 0,
+            on_progress: Optional[Callable[[str, dict], None]] = None) -> dict:
     """Rebuild servers/matches/waves from stored raw assets. Returns stats.
 
     ``max_waves`` — when >0, a hard cap on the total wave count (see
-    ``plan_waves``); unifies the cap guarantee with the LLM planner path."""
+    ``plan_waves``); unifies the cap guarantee with the LLM planner path.
+
+    ``on_progress`` — optional ``on_progress(phase, payload)`` hook called at
+    each stage so the HTTP layer can stream live progress (the UI's /api/rebuild
+    consumes it as NDJSON). CLI/tests pass None. The work itself is unchanged."""
     settings = settings or get_settings()
+
+    def _prog(stage: str, **payload) -> None:
+        if on_progress is not None:
+            try:
+                on_progress(stage, payload)
+            except Exception:
+                pass   # progress reporting must never break the rebuild
+
     rows = store.list_raw()
     assets = [RawAsset(source=r["source"], source_id=r["source_id"],
                        hostname=r["hostname"] or "", fqdn=r["fqdn"] or "",
@@ -125,36 +138,43 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
     # the merged warranty_status/hardware_eol persist on the first pass and the
     # F2 eol premium / F10 hw_support signal / data-gaps count see them.
     warranty_report = merge_warranty(servers, settings.warranty_path)
-    # clear+rewrite servers: simplest is upsert (ids are fresh each rebuild).
-    # To avoid dup growth we wipe the servers table first.
-    _wipe_derived(store)
-    for s in servers:
-        store.upsert_server(s)
     # F1 — fold runtime network-dependency edges into Workload.depends_on +
     # src-server provenance. Runs after app_ids back-population so edges can
-    # resolve to app level.
+    # resolve to app level. Done BEFORE the (single) server write so the netdep
+    # source_refs land in that write — no second pass over the estate.
     netdep_report: Dict = {}
     if settings.netdep_enabled():
         netdeps = discover_network_deps(settings, servers)
         wls, netdep_report = merge_network_deps(servers, wls, netdeps)
-        # netdep appended source_refs to servers — re-upsert so provenance lands
-        for s in servers:
-            store.upsert_server(s)
-    for w in wls:
-        store.upsert_workload(w)
+    _prog("normalize", servers=len(servers), workloads=len(wls),
+          netdep=bool(netdep_report), warranty=bool(warranty_report.get("matched")))
+
+    # --- persistence ----------------------------------------------------------
+    # All enrichment above is in-memory; the writes below are the only DB cost.
+    # Each replace_* is one transaction (DELETE + chunked multi-row INSERT) —
+    # previously this section did ~3×N per-row transactions (the 2-min hotspot
+    # for a 15K estate). servers/workloads/matches+costs/waves = 4 transactions.
+    _prog("persist:servers")
+    store.replace_servers(servers)
+    _prog("persist:workloads")
+    store.replace_workloads(wls)
+
     # matches — enriched with code-intel (readiness/blockers/pattern) AND scaled
     # by data-coverage confidence (F4). F2 — per-server run cost estimated from
     # the matched target + price book and persisted to the cost_estimates side
     # table; the hydrated Match.cost is not persisted (side table is the truth).
     # F5 — DB-host matches are further enriched with the heterogeneous DB
     # conversion profile (difficulty grade → confidence dip + replatform force).
+    matches: List = []
+    costs: List = []
     if do_match:
         book = load_pricebook(settings)
         # F5 — db_profiles are keyed by the DB host's STABLE identity (hostname),
         # not the transient Server.id (ids are fresh each rebuild). Index by the
         # stored db_server_id and resolve via the server's hostname/identity.
         dbidx = {d.db_server_id: d for d in store.list_db_profiles()}
-        for m in match_servers(servers):
+        matched = match_servers(servers)
+        for m in matched:
             profile = _profile_for_server(m.server_id, servers, pidx)
             srv = srv_by_id.get(m.server_id)
             # data-gap — flag an out-of-support OS before enrichment so the EOL
@@ -173,12 +193,17 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
             enrich_match_db(m, dbp)
             if srv:
                 m.cost = estimate_server(srv, m, book)
-                store.upsert_cost(m.cost)
-            store.upsert_match(m)
+                costs.append(m.cost)
+            matches.append(m)
+        _prog("match", total=len(matched))
+    _prog("persist:matches", matches=len(matches), costs=len(costs))
+    store.replace_matches_and_costs(matches, costs)
+
     # waves — code deps merged in + effort/pattern ordering + rationale.
     # strategies = AI-assigned 7R overlay (app_strategies); retain/retire apps
     # are excluded from migration waves. Loaded here so a Rebuild honors 7R
     # assignments the operator persisted via the 7R UI / CLI.
+    waves: List = []
     if do_plan:
         strategies = {s.app_id: s for s in store.list_app_strategies()}
         # F2 — operator tag-driven retain/retire overrides win over AI strategy
@@ -187,8 +212,12 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
         waves = plan_waves(servers, wls, code_profiles=profiles,
                           max_waves=max_waves, strategies=strategies,
                           min_assessment_confidence=settings.min_assessment_confidence)
-        for w in waves:
-            store.upsert_wave(w)
+        _prog("plan", waves=len(waves))
+    # replace_waves always runs (also when do_plan=False) so the waves table is
+    # wiped along with the other derived tables — matches the old _wipe_derived
+    # contract that no stale wave rows survive a rebuild.
+    _prog("persist:waves", waves=len(waves))
+    store.replace_waves(waves)
     out = store.stats()
     if netdep_report:
         out["netdep"] = netdep_report
@@ -206,14 +235,6 @@ def _profile_for_server(server_id, servers, pidx):
         if a in pidx:
             return pidx[a]
     return None
-
-
-def _wipe_derived(store: Store) -> None:
-    with store.tx() as cur:
-        cur.execute("DELETE FROM servers")
-        cur.execute("DELETE FROM matches")
-        cur.execute("DELETE FROM waves")
-        cur.execute("DELETE FROM workloads")
 
 
 __all__ = [
