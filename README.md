@@ -92,8 +92,9 @@ Rule engine maps each server by role/source-type/OS/sizing:
 | web / app / monitoring | **CVM** (SA5, right-sized) + CBS data disk |
 
 CVM sizing picks the smallest SA5 type that fits CPU+RAM (right-size, not
-over-provision). Region is mapped from datacenter (`dc1→ap-shanghai`,
-`dc2→ap-beijing`). Edit `idc/core/match.py` tables to fit the real env.
+over-provision). The target landing zone is Thailand, so every datacenter
+maps to Tencent Cloud's Bangkok region (`ap-bangkok`). Edit
+`idc/core/match.py` (`REGION_MAP`) to fit the real env.
 
 ## Wave planning
 
