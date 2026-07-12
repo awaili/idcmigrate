@@ -25,7 +25,7 @@ from ..agent import build_context, run_agent
 
 load_dotenv()
 settings = get_settings()
-STORE = open_store(settings.sqlite_path)
+STORE = open_store(settings.db_url)
 LLM = get_client(settings)
 
 # task_id -> asyncio.Queue of agent events (in-memory event bus)

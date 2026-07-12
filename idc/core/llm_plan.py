@@ -25,7 +25,6 @@ from .models import (
     Wave,
     Workload,
     _new_id,
-    dumps,
 )
 
 
@@ -369,19 +368,8 @@ def _is_dag(waves: List[Wave]) -> bool:
 def apply_plan(store, waves: List[Wave]) -> None:
     """Persist a plan: wipe existing waves and write the new ones, atomically.
 
-    The DELETE and all inserts run in one transaction so a failure mid-write
-    can't leave the estate with an empty waves table plus a partial new plan.
+    Delegates to ``Store.replace_waves`` so the DELETE + inserts run in one
+    transaction (can't leave an empty waves table plus a partial plan) and the
+    SQL is dialect-correct for both sqlite and mariadb.
     """
-    with store.tx() as cur:
-        cur.execute("DELETE FROM waves")
-        for w in waves:
-            cur.execute(
-                """INSERT INTO waves(id,name,stage,server_ids,depends_on,rationale,status)
-                   VALUES(?,?,?,?,?,?,?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     name=excluded.name, stage=excluded.stage, server_ids=excluded.server_ids,
-                     depends_on=excluded.depends_on, rationale=excluded.rationale,
-                     status=excluded.status""",
-                (w.id, w.name, w.stage,
-                 dumps(w.server_ids), dumps(w.depends_on), w.rationale, w.status),
-            )
+    store.replace_waves(waves)

@@ -33,7 +33,7 @@ app_cli = typer.Typer(add_completion=False, help="idc-migrate: IDC→Tencent Clo
 
 
 def _store():
-    return open_store(get_settings().sqlite_path)
+    return open_store(get_settings().db_url)
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +65,23 @@ def rebuild_cmd(do_match: bool = True, do_plan: bool = True):
 
 @app_cli.command()
 def reset():
-    """Wipe the local DB (raw + derived). Confirm with --yes."""
+    """Wipe the DB (raw + derived). SQLite: remove the file; MariaDB: drop & recreate the database."""
     s = get_settings()
+    url = s.db_url
+    if url.startswith(("mysql://", "mariadb://")):
+        from urllib.parse import urlparse, unquote
+        import pymysql
+        p = urlparse(url)
+        db = p.path.lstrip("/")
+        root = pymysql.connect(host=p.hostname, port=p.port or 3306,
+                               user=p.username, password=unquote(p.password or ""),
+                               charset="utf8mb4", autocommit=True)
+        with root.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS `{db}`")
+            cur.execute(f"CREATE DATABASE `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        root.close()
+        console.print(f"[yellow]Dropped & recreated MariaDB database `{db}` on {p.hostname}[/yellow]")
+        return
     p = s.sqlite_path
     for suffix in ("", "-wal", "-shm"):
         f = str(p) + suffix
@@ -368,7 +383,7 @@ def doctor():
     """Check config, DB, LLM gateway, and claude CLI availability."""
     s = get_settings()
     console.print(f"[bold]config[/bold]")
-    console.print(f"  db           {s.sqlite_path}")
+    console.print(f"  db           {s.db_url}")
     console.print(f"  servicenow   {'online' if s.has_servicenow() else 'fixture'}")
     console.print(f"  zabbix       {'online' if s.has_zabbix() else 'fixture'}")
     console.print(f"  prometheus   {'online' if s.has_prometheus() else 'fixture'}")
