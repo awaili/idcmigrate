@@ -1,0 +1,8 @@
+[
+  {"hostname": "app-orders-01", "ips": ["10.0.1.11"], "source": "vcenter", "role": "app", "os": "centos"},
+  {"hostname": "db-mysql-01", "ips": ["10.0.2.21"], "source": "vcenter", "role": "cache", "os": "centos"},
+  {"hostname": "web-portal-01", "ips": ["10.0.1.31"], "source": "subnet-sweep", "role": "web", "os": "ubuntu"},
+  {"hostname": "shadow-app-99", "ips": ["10.0.7.99"], "source": "subnet-sweep", "role": "app", "os": "centos"},
+  {"hostname": "ghost-rack-07", "ips": ["10.0.7.107"], "source": "subnet-sweep", "role": "db", "os": "oracle linux"},
+  {"hostname": "k8s-worker-03", "ips": ["10.0.3.13"], "source": "vcenter", "role": "k8s", "os": "centos"}
+]

@@ -208,6 +208,38 @@ def estimate_server(server: Server, match: Match, book: PriceBook) -> CostEstima
 
 
 # ---------------------------------------------------------------------------
+# F2 + data-gap — on-prem extended-support premium for out-of-warranty hardware
+# ---------------------------------------------------------------------------
+# Traditional-IDC reality: a 脱保 / out-of-warranty host still running on-prem
+# often carries an extended-support or refresh-risk cost (vendor premium, parts
+# scarcity, security-patch gap) that the flat ``onprem_rate`` doesn't capture.
+# This adds a per-host premium on the IDC current-cost side of the TCO so the
+# business case reflects the real cost of *not* migrating EOL hardware. The
+# premium is a fraction of ``onprem_rate`` by warranty bucket; it is 0 when
+# ``onprem_rate`` is 0 (savings unknown) so the out-of-the-box fixture path and
+# the F2 tests (which set no onprem_rate) are unaffected.
+EOL_ONPREM_PREMIUM = {
+    "expired": 0.50,   # out of warranty — extended support / refresh risk
+    "expiring": 0.20,  # within 90d of end-of-support
+    "active": 0.0,
+    "unknown": 0.0,    # unmodeled support status is neutral on cost (data-gaps surfaces it)
+}
+
+
+def eol_onprem_premium_monthly(server: Server, book: PriceBook,
+                                today_iso: Optional[str] = None) -> float:
+    """Extra USD/month on the on-prem side for an out-of-warranty host.
+
+    0 when ``book.onprem_rate`` is 0 (savings can't be computed) or the host is
+    under warranty / unassessed. Uses ``match.warranty_bucket`` to classify."""
+    if not book.onprem_rate:
+        return 0.0
+    from .match import warranty_bucket
+    bucket = warranty_bucket(server, today_iso)
+    return book.onprem_rate * EOL_ONPREM_PREMIUM.get(bucket, 0.0)
+
+
+# ---------------------------------------------------------------------------
 # portfolio business case
 # ---------------------------------------------------------------------------
 def _strategy_for(server: Server, strategies: Dict[str, AppStrategy],
@@ -234,6 +266,7 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
     per_server: List[Dict[str, Any]] = []
     cloud_monthly = cloud_yearly = 0.0
     onprem_monthly = onprem_yearly = 0.0
+    eol_premium_yearly = 0.0
     per_product: Dict[str, float] = {}
     per_region: Dict[str, float] = {}
     per_strategy: Dict[str, Dict[str, float]] = {}
@@ -249,6 +282,12 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
         if book.onprem_rate > 0:
             onprem_monthly += book.onprem_rate
             onprem_yearly += book.onprem_rate * 12
+            # F2 + data-gap — extended-support premium for out-of-warranty hosts
+            prem = eol_onprem_premium_monthly(s, book)
+            if prem:
+                onprem_monthly += prem
+                onprem_yearly += prem * 12
+                eol_premium_yearly += prem * 12
         strat = _strategy_for(s, strategies)
         # non-migrating strategies contribute 0 cloud cost (host stays/retires)
         if strat in (PATTERN_RETAIN, PATTERN_RETIRE):
@@ -264,6 +303,7 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
             "product": est.target_product, "spec": est.spec, "region": est.region,
             "monthly": round(est.monthly_usd, 2), "yearly": round(est.yearly_usd, 2),
             "basis": est.basis, "strategy": strat,
+            "eol_premium_yearly": round(eol_onprem_premium_monthly(s, book) * 12, 2),
         })
         if est.monthly_usd > 0:
             priced += 1
@@ -279,6 +319,7 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
         "cloud_yearly": round(cloud_yearly, 2),
         "onprem_monthly": round(onprem_monthly, 2) if book.onprem_rate > 0 else 0.0,
         "onprem_yearly": round(onprem_yearly, 2) if book.onprem_rate > 0 else 0.0,
+        "eol_premium_yearly": round(eol_premium_yearly, 2),
         "annual_savings": round(annual_savings, 2) if annual_savings is not None else None,
         "priced_servers": priced,
         "unpriced_servers": unpriced,

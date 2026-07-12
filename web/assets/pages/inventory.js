@@ -48,7 +48,7 @@ function renderInv(r){
   for(const[k,v]of Object.entries(state.filters)) chips.push(`${k}=${v}`);
   $('activeChips').innerHTML = chips.map(c=>`<span class="chip">${esc(c)}<span class="x" onclick="resetFilters()">×</span></span>`).join('');
   // table
-  const cols = [['hostname','Hostname'],['role','Role'],['source_type','Type'],['os','OS'],['cpu_cores','CPU'],['mem_gb','Mem'],['env','Env'],['business_criticality','Crit'],['','Target'],['','Util%'],['confidence','Conf']];
+  const cols = [['hostname','Hostname'],['role','Role'],['source_type','Type'],['os','OS'],['cpu_cores','CPU'],['mem_gb','Mem'],['env','Env'],['business_criticality','Crit'],['','Target'],['','Util%'],['','Support'],['confidence','Conf']];
   const thead = '<tr>'+cols.map(([k,l])=>{
     if(!k) return `<th>${l}</th>`;
     const s = state.order_by===k ? 'sorted' : '';
@@ -68,6 +68,7 @@ function renderInv(r){
       <td data-label="Crit"><span class="pill ${s.business_criticality}">${s.business_criticality||'-'}</span></td>
       <td data-label="Target"><b>${m.target?m.target.product:'-'}</b> <span class="muted">${m.target?esc(m.target.spec).slice(0,18):''}</span></td>
       <td data-label="Util%" class="conf">${fmtUtil(s.utilization)}</td>
+      <td data-label="Support" class="conf">${bucketBadge(s.warranty_bucket,'warranty')} ${bucketBadge(s.os_eol_bucket,'OS EOL')}</td>
       <td data-label="Conf" class="conf">${m.confidence?'_'+m.confidence.toFixed(1):'-'}</td>
     </tr>`;}).join('');
   $('inv').innerHTML = `<thead>${thead}</thead><tbody>${tbody}</tbody>`;

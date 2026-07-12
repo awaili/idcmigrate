@@ -83,7 +83,8 @@ def _has_dependents(app_id: str, workloads: List[Workload]) -> bool:
 def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None,
                code_profiles: Optional[List[CodeProfile]] = None,
                max_waves: int = 0,
-               strategies: Optional[Dict[str, "AppStrategy"]] = None) -> List[Wave]:
+               strategies: Optional[Dict[str, "AppStrategy"]] = None,
+               min_assessment_confidence: float = 0.0) -> List[Wave]:
     """Group servers into migration waves with a dependency DAG.
 
     ``code_profiles`` (from the external agent executor) enrich the plan:
@@ -106,6 +107,15 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
     7R). retain/retire apps are pulled from this overlay first, then from
     ``code_profiles.migration_pattern`` (legacy). Lets a 7R result drive wave
     exclusion WITHOUT first persisting to the DB.
+
+    ``min_assessment_confidence`` — data-gap soft gate (default 0.0 = off).
+    When >0, servers whose ``assessment_confidence`` is below the threshold
+    are pulled out of the migration sequence into a trailing "Needs Discovery"
+    wave (not in the DAG) so thinly-known hosts (traditional-IDC reality: no
+    role / no util / no profile) don't get a cutover slot before they've been
+    characterized. None-confidence hosts (not yet rebuilt) are NOT gated — only
+    a measured-low confidence triggers the gate. The cap (``max_waves``) is
+    applied after the discovery wave is appended.
     """
     workloads = workloads or []
     pidx: ProfileIndex = index_profiles(code_profiles or [])
@@ -127,6 +137,17 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
     retain_ids, retire_ids = non_migrating_servers(servers, workloads,
                                                    code_profiles or [], strategies)
     excluded = retain_ids | retire_ids
+
+    # --- data-gap soft confidence gate: pull thinly-known hosts OUT of the
+    # migration sequence into a trailing "Needs Discovery" wave. Only fires
+    # when min_assessment_confidence > 0; a None confidence (not rebuilt) is
+    # left alone so the gate never drops a host that simply hasn't been scored.
+    discovery_ids: Set[str] = set()
+    if min_assessment_confidence > 0:
+        discovery_ids = {s.id for s in servers
+                         if s.assessment_confidence is not None
+                         and s.assessment_confidence < min_assessment_confidence}
+        excluded = excluded | discovery_ids
 
     # --- stage 1: landing zone / platform -------------------------------
     lz_servers = [s.id for s in servers
@@ -203,6 +224,18 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
     for w in disposition_waves(retain_ids, retire_ids):
         w.name = f"W{len(waves)+1} {w.name}"
         waves.append(w)
+
+    # --- data-gap: trailing "Needs Discovery" wave for thinly-known hosts.
+    # Like the disposition waves it's NOT in the migration DAG (no depends_on):
+    # these hosts don't get a cutover slot until the operator improves their
+    # data quality (run discovery / ingest telemetry / profile the app) and
+    # re-plans. Surfaced explicitly so the gap is visible, not silently dropped.
+    if discovery_ids:
+        waves.append(Wave(
+            name=f"W{len(waves)+1} Needs Discovery", stage=STAGE_APP,
+            server_ids=sorted(discovery_ids),
+            rationale=f"{len(discovery_ids)} host(s) below min_assessment_confidence "
+                      f"— characterize (role/util/profile) before cutover."))
 
     # hard cap on total wave count (unifies the guarantee with the LLM path).
     # Applied AFTER retain/retire disposition waves are appended, so the cap

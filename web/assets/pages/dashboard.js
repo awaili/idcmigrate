@@ -28,4 +28,23 @@ async function loadDashboard(){
   $('barRegion').innerHTML = bars(a.by_region);
   $('dashWaves').innerHTML = a.waves.map(w=>`<div class="wave" onclick="document.querySelector('.tab[data-tab=waves]').click(); openWave('${w.id}','${esc(w.name)}')">
     <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${w.stage.startsWith('1')?'high':w.stage.startsWith('4')?'medium':'low'}">${w.stage}</span><span style="margin-left:auto" class="meta">${w.n} servers</span></div></div>`).join('');
+  // data-gap headline (best-effort — the Data Quality tab has the full report)
+  loadDashDataGap();
+}
+
+async function loadDashDataGap(){
+  const out=$('dashDataGapBody');
+  try{
+    const g = await api('/data-gaps');
+    const oe=g.os_eol||{}, wa=g.warranty||{};
+    const tile=(label,n,color)=>`<div class="tile ${n?'warn':''}" style="min-width:150px;cursor:pointer" onclick="document.querySelector('.tab[data-tab=data-quality]').click()">
+      <div class="k">${esc(label)}</div><div class="v" style="color:${color}">${n}</div></div>`;
+    out.innerHTML =
+      tile('OS EOL (expired)', oe.expired||0, 'var(--red)') +
+      tile('OS EOL (expiring)', oe.expiring||0, 'var(--amber)') +
+      tile('warranty unknown', wa.unknown||0, 'var(--amber)') +
+      tile('warranty expired', wa.expired||0, 'var(--red)') +
+      tile('no util telemetry', g.missing_utilization||0, 'var(--amber)') +
+      tile('no code profile', g.missing_code_profile||0, 'var(--amber)');
+  }catch(e){ out.innerHTML='<span class="muted">data gaps unavailable</span>'; }
 }

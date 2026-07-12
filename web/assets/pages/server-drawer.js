@@ -12,6 +12,33 @@ function _coverageBadge(s, m){
   const conf = (m && m.confidence!=null) ? ` <span class="muted">· match conf ${m.confidence.toFixed(2)}</span>` : '';
   return `<span>${pct}</span> <span class="tag" style="color:${basisColor}">${esc(basis)} sizing</span>${conf}`;
 }
+function _warrantyBadge(s){
+  // backend precomputes s.warranty_bucket (match.warranty_bucket) so we render
+  // that directly; fall back to deriving from the raw fields only if absent
+  // (e.g. a stale row from before the field shipped).
+  let b = s.warranty_bucket;
+  if(!b){
+    const ws=(s.warranty_status||'').toLowerCase().trim();
+    const eol=(s.hardware_eol||'').trim();
+    const today=new Date().toISOString().slice(0,10);
+    b='unknown';
+    if(['active','expiring','expired','unknown'].includes(ws)) b=ws;
+    else if(eol){
+      const days=(new Date(eol)-new Date(today))/86400000;
+      b = days<0 ? 'expired' : (days<=90 ? 'expiring' : 'active');
+    }
+  }
+  const c=_BUCKET_COLOR[b]||'var(--fg)';
+  const eolTxt=(s.hardware_eol||'').trim()?` <span class="muted">· EOL ${esc(s.hardware_eol)}</span>`:'';
+  return `<span class="tag" style="color:${c}">${b}</span>${eolTxt}`;
+}
+function _osEolBadge(s){
+  // s.os_eol_bucket precomputed by the backend (eol.os_eol_bucket) against the
+  // bundled EOL table — the silent-rehost-of-CentOS-6 flag.
+  const b = s.os_eol_bucket || 'unknown';
+  const c=_BUCKET_COLOR[b]||'var(--fg)';
+  return `<span class="tag" style="color:${c}">${b}</span> <span class="muted">${esc(s.os||'-')} ${esc(s.os_version||'')}</span>`;
+}
 function _codeSection(code){
   if(!code || !code.length) return '';
   const cards = code.map(c=>{
@@ -62,11 +89,13 @@ function openServer(id){
         ${kv('Utilization', `cpu ${u.cpu_p95??'-'}% · mem ${u.mem_p95??'-'}% · disk ${u.disk_used_pct??'-'}% <span class="muted">(${u.source||'-'})</span>`)}
         ${kv('Provenance', (s.source_refs||[]).map(r=>`<span class="tag">${esc(r.source)}:${esc(r.source_id)}</span>`).join(' ')||'-')}
         ${kv('Coverage', _coverageBadge(s, m))}
+        ${kv('Warranty', _warrantyBadge(s))}
+        ${kv('OS support', _osEolBadge(s))}
         ${kv('Target', `<b>${m.target?m.target.product:'-'}</b> ${m.target?esc(m.target.spec):''} <span class="muted">@ ${m.target?m.target.region:''}</span>`)}
         ${kv('Rule', m.rationale?esc(m.rationale):'-')}
       </div>
       ${_codeSection(s.code)}
-      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">LLM explain match</button><button onclick="rightSize('${s.id}')">right-size</button><button onclick="drawerAudit('${s.id}')">audit target</button></div>
+      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">LLM explain match</button><button onclick="rightSize('${s.id}')">right-size</button><button onclick="drawerAudit('${s.id}')">audit target</button><button onclick="setWarranty('${s.id}')">set warranty</button></div>
       <pre id="dExplain" style="margin-top:10px"></pre>`;
     openDrawer();
   }).catch(e=>{ $('dTitle').textContent='Error'; $('dBody').innerHTML='<span class="ev-err">'+esc(String(e))+'</span>'; openDrawer(); });
@@ -102,4 +131,39 @@ async function drawerAudit(id){
     // color the verdict line by injecting a leading marker
     $('dExplain').insertAdjacentHTML('afterbegin', `<span style="color:${color}">●</span> `);
   }catch(e){ $('dExplain').innerHTML='<span class="ev-err">Error: '+esc(e)+'</span>'; }
+}
+async function setWarranty(id){
+  // operator override of hardware support status (data-gap) — a small inline
+  // form (not sequential prompt() dialogs) so the operator sees both fields at
+  // once. Renders into dExplain; Save PUTs + re-opens the drawer to refresh.
+  $('dExplain').innerHTML = `
+    <div class="mcard" style="padding:10px">
+      <div style="font-weight:600;margin-bottom:8px">Set hardware support status</div>
+      <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">
+        <label style="font-size:13px">warranty_status
+          <select id="warrStatus" style="margin-left:4px">
+            <option value="">(derive from EOL)</option>
+            <option value="active">active</option>
+            <option value="expiring">expiring</option>
+            <option value="expired">expired</option>
+            <option value="unknown">unknown</option>
+          </select>
+        </label>
+        <label style="font-size:13px">hardware_eol
+          <input type="date" id="warrEol" style="margin-left:4px" />
+        </label>
+        <button class="sm primary" onclick="saveWarranty('${id}')">Save</button>
+        <button class="sm" onclick="document.getElementById('dExplain').innerHTML=''">Cancel</button>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:8px">Leave warranty_status blank to derive the bucket from the EOL date. Empty EOL clears it. Persists immediately (no rebuild needed).</div>
+    </div>`;
+}
+async function saveWarranty(id){
+  const ws=$('warrStatus').value, eol=$('warrEol').value;
+  try{
+    const r = await api('/servers/'+id+'/warranty', {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify({warranty_status:ws, hardware_eol:eol})});
+    toast(`warranty set: ${r.warranty_status||'(derive)'} ${r.hardware_eol||''}`, 'ok');
+    $('dExplain').innerHTML='';
+    openServer(id);  // re-open to refresh the badge
+  }catch(e){ toast('set warranty failed: '+e, 'err'); }
 }

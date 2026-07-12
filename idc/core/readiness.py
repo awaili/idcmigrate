@@ -12,6 +12,11 @@ Six signals per wave (each green/yellow/red):
   * ``deps_resolved``       — F1 + DAG: depends_on waves are done; no orphan code dep.
   * ``cutover_rehearsal``   — F6: every member MigrationJob reached ``tested``+.
   * ``rollback_channel``   — F5: db jobs have reverse_replication on (rollback net).
+  * ``hw_support``          — data-gap: member hardware under warranty through
+                              cutover (expired→red / expiring→yellow / active→green
+                              / unknown→n/a; n/a is ignored by the rollup).
+  * ``os_support``          — data-gap: member OS under vendor support through
+                              cutover (same levels; expired OS = silent-rehost risk).
 
 Wave rollup = worst case (red blocks cutover). A wave with no MigrationJobs
 yet is "not launched" (red on cutover_rehearsal, n/a elsewhere).
@@ -21,6 +26,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .codeintel import index_profiles
+from .match import (
+    WARRANTY_ACTIVE, WARRANTY_EXPIRING, WARRANTY_EXPIRED, WARRANTY_UNKNOWN,
+    WARRANTY_EXPIRING_DAYS,
+)
 from .models import (
     ChangeJob, CodeProfile, DBConversionProfile, Match, Server, Wave, Workload,
     DB_DIFFICULTY_C, DB_DIFFICULTY_B,
@@ -213,6 +222,75 @@ def _sig_rollback_channel(wave: Wave, servers: List[Server],
     return {"level": GREEN, "detail": "all DB hosts have reverse replication"}
 
 
+def _sig_hw_support(wave: Wave, servers: List[Server]) -> Dict[str, Any]:
+    """F10 + data-gap — member hardware is under warranty through the cutover
+    window. Traditional-IDC reality: CMDB often has no support data.
+
+    Worst-case across members: ``expired`` → red (out-of-warranty hardware is a
+    cutover + refresh risk), ``expiring`` (<90d to end-of-support) → yellow
+    (cutover deadline), ``active`` → green, ``unknown`` → n/a (not assessed;
+    doesn't gate cutover — the blind spot is surfaced in the data-gaps report
+    instead, not here). n/a is ignored by ``_worst`` so existing waves with no
+    warranty data keep their rollup unchanged.
+    """
+    from .match import warranty_bucket
+    members = [s for s in servers if s.id in (wave.server_ids or [])]
+    if not members:
+        return {"level": NA, "detail": "empty wave"}
+    _bucket_to_level = {WARRANTY_EXPIRED: RED, WARRANTY_EXPIRING: YELLOW,
+                        WARRANTY_ACTIVE: GREEN}
+    buckets = [warranty_bucket(s) for s in members]
+    levels = [_bucket_to_level.get(b, NA) for b in buckets]
+    rank = {RED: 0, YELLOW: 1, GREEN: 2}
+    present = [lv for lv in levels if lv in rank]
+    if not present:
+        return {"level": NA, "detail": "hardware support not assessed (no EOL data)"}
+    worst = min(present, key=lambda lv: rank[lv])
+    n_exp = buckets.count(WARRANTY_EXPIRED)
+    n_exp2 = buckets.count(WARRANTY_EXPIRING)
+    n_act = buckets.count(WARRANTY_ACTIVE)
+    if worst == RED:
+        return {"level": RED,
+                "detail": f"{n_exp} host(s) out of warranty — cutover + refresh risk"}
+    if worst == YELLOW:
+        return {"level": YELLOW,
+                "detail": f"{n_exp2} host(s) warranty expiring <{WARRANTY_EXPIRING_DAYS}d"}
+    return {"level": GREEN,
+            "detail": f"{n_act} host(s) under warranty"}
+
+
+def _sig_os_support(wave: Wave, servers: List[Server]) -> Dict[str, Any]:
+    """F10 + data-gap — member OS is under vendor support through cutover.
+
+    Traditional-IDC reality: CentOS 6/7, Windows Server 2008/2012, old Oracle
+    Linux are out of support and a silent rehost is a migration failure (no
+    supported cloud image). Same worst-case as ``_sig_hw_support``: expired→red
+    (silent-rehost risk), expiring→yellow (replatform deadline), active→green,
+    unknown→n/a (OS not in the EOL table — not flagged). n/a ignored by rollup.
+    """
+    from .eol import os_eol_bucket, EXPIRED as OS_EXPIRED, EXPIRING as OS_EXPIRING, ACTIVE as OS_ACTIVE
+    members = [s for s in servers if s.id in (wave.server_ids or [])]
+    if not members:
+        return {"level": NA, "detail": "empty wave"}
+    _bucket_to_level = {OS_EXPIRED: RED, OS_EXPIRING: YELLOW, OS_ACTIVE: GREEN}
+    buckets = [os_eol_bucket(s) for s in members]
+    levels = [_bucket_to_level.get(b, NA) for b in buckets]
+    rank = {RED: 0, YELLOW: 1, GREEN: 2}
+    present = [lv for lv in levels if lv in rank]
+    if not present:
+        return {"level": NA, "detail": "OS support not assessed (OS not in EOL table)"}
+    worst = min(present, key=lambda lv: rank[lv])
+    n_exp = buckets.count(OS_EXPIRED)
+    n_exp2 = buckets.count(OS_EXPIRING)
+    if worst == RED:
+        return {"level": RED,
+                "detail": f"{n_exp} host(s) on an out-of-support OS — replatform, do not rehost"}
+    if worst == YELLOW:
+        return {"level": YELLOW,
+                "detail": f"{n_exp2} host(s) OS nearing end-of-support"}
+    return {"level": GREEN, "detail": "all host OS under vendor support"}
+
+
 # ---------------------------------------------------------------------------
 # per-wave readiness
 # ---------------------------------------------------------------------------
@@ -249,6 +327,8 @@ def wave_readiness(store, wave_id: str) -> Dict[str, Any]:
         "deps_resolved": _sig_deps_resolved(store, wave, waves, servers, workloads),
         "cutover_rehearsal": _sig_cutover_rehearsal(wave, mjobs_by_server),
         "rollback_channel": _sig_rollback_channel(wave, servers, dbidx, mjobs_by_server),
+        "hw_support": _sig_hw_support(wave, servers),
+        "os_support": _sig_os_support(wave, servers),
     }
     levels = [s["level"] for s in signals.values()]
     rollup = _worst(levels)

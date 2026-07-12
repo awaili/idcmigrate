@@ -647,7 +647,7 @@ def readiness_cmd(wave: Optional[str] = typer.Option(None, "--wave", "-w",
     if fmt == "json":
         console.print_json(json.dumps(rows, ensure_ascii=False)); return
     tbl = Table("wave", "stage", "servers", "lz", "db", "code", "deps", "rehearsal",
-                "rollback", "rollup", "cutover?")
+                "rollback", "hw", "os", "rollup", "cutover?")
     for r in rows:
         sg = r.get("signals", {})
         def _cell(k):
@@ -659,7 +659,7 @@ def readiness_cmd(wave: Optional[str] = typer.Option(None, "--wave", "-w",
                     str(r.get("server_count", 0)),
                     _cell("lz_ready"), _cell("db_conversion"), _cell("code_refactor"),
                     _cell("deps_resolved"), _cell("cutover_rehearsal"),
-                    _cell("rollback_channel"),
+                    _cell("rollback_channel"), _cell("hw_support"), _cell("os_support"),
                     f"[{rc}]{r.get('rollup','-')}[/{rc}]",
                     "yes" if r.get("can_cutover") else "no")
     console.print(tbl)
@@ -670,9 +670,151 @@ def readiness_cmd(wave: Optional[str] = typer.Option(None, "--wave", "-w",
                 console.print(f"  [{_LVL_COLOR[v['level']]}]{k}: {v['detail']}[/{_LVL_COLOR[v['level']]}]")
 
 
-# ---------------------------------------------------------------------------
-# Claude Code agent
-# ---------------------------------------------------------------------------
+@app_cli.command("warranty")
+def warranty_cmd(fmt: str = typer.Option("table", "--format", "-f", help="table | json"),
+                 today: Optional[str] = typer.Option(None, "--today",
+                     help="ISO date to judge expiring/expired against (default: today)"),
+                 all_hosts: bool = typer.Option(False, "--all", help="list every host, not just non-active")):
+    """Hardware warranty / end-of-support status across the estate (data-gap).
+
+    Shows the active/expiring/expired/unknown distribution and lists the hosts
+    that are out-of-warranty or unassessed — the traditional-IDC reality
+    (脱保 / shadow IT) the F2 on-prem extended-support premium, the F10
+    hw_support readiness signal and the data-gaps report all consume."""
+    from ..core.match import (
+        warranty_bucket, WARRANTY_ACTIVE, WARRANTY_EXPIRING,
+        WARRANTY_EXPIRED, WARRANTY_UNKNOWN)
+    st = _store()
+    servers = st.list_all_servers()
+    rows = []
+    dist = {WARRANTY_ACTIVE: 0, WARRANTY_EXPIRING: 0,
+            WARRANTY_EXPIRED: 0, WARRANTY_UNKNOWN: 0}
+    for s in servers:
+        b = warranty_bucket(s, today)
+        dist[b] = dist.get(b, 0) + 1
+        rows.append((s, b))
+    st.close()
+    if fmt == "json":
+        console.print_json(json.dumps({
+            "distribution": dist,
+            "hosts": [{"hostname": s.hostname, "server_id": s.id, "bucket": b,
+                       "warranty_status": s.warranty_status, "hardware_eol": s.hardware_eol}
+                      for s, b in rows]}, ensure_ascii=False))
+        return
+    _WC = {WARRANTY_ACTIVE: "green", WARRANTY_EXPIRING: "yellow",
+           WARRANTY_EXPIRED: "red", WARRANTY_UNKNOWN: "dim"}
+    console.print("[bold]warranty distribution[/bold]")
+    for k in (WARRANTY_ACTIVE, WARRANTY_EXPIRING, WARRANTY_EXPIRED, WARRANTY_UNKNOWN):
+        console.print(f"  [{_WC[k]}]{k:9}[/{_WC[k]}] {dist.get(k, 0)}")
+    tbl = Table("hostname", "bucket", "warranty_status", "hardware_eol")
+    for s, b in rows:
+        if not all_hosts and b == WARRANTY_ACTIVE:
+            continue
+        c = _WC[b]
+        tbl.add_row(s.hostname, f"[{c}]{b}[/{c}]",
+                    s.warranty_status or "-", s.hardware_eol or "-")
+    console.print(tbl)
+
+
+@app_cli.command("data-gaps")
+def data_gaps_cmd(fmt: str = typer.Option("table", "--format", "-f", help="table | json"),
+                  top: int = typer.Option(12, "--top", help="top-N worst hosts to list")):
+    """Portfolio data-quality / information-blindspot report (data-gap).
+
+    Shows the assessment-confidence distribution, the missing characterization
+    fields across the estate, hosts with no utilization telemetry / no code
+    profile / unknown warranty, and the top-N most thinly-known hosts — the
+    traditional-IDC reality (脱保 / shadow IT) the soft confidence gate and
+    the F2/F10 signals consume. Pair with ``idc discovery`` for the shadow-IT
+    network-vs-CMDB diff."""
+    from ..core.datagaps import portfolio_data_gaps
+    st = _store()
+    rep = portfolio_data_gaps(st, top=top)
+    st.close()
+    if fmt == "json":
+        console.print_json(json.dumps(rep, ensure_ascii=False)); return
+    console.print(f"[bold]{rep['summary']}[/bold]\n")
+
+    console.print("[bold]assessment confidence[/bold]")
+    cc = {"high(>=0.85)": "green", "medium(0.5-0.85)": "yellow",
+           "low(<0.5)": "red", "none": "dim"}
+    for k in ("high(>=0.85)", "medium(0.5-0.85)", "low(<0.5)", "none"):
+        console.print(f"  [{cc[k]}]{k:18}[/{cc[k]}] {rep['confidence'].get(k, 0)}")
+
+    console.print("[bold]missing characterization fields[/bold]")
+    mt = Table("field", "hosts missing")
+    for f, n in sorted(rep["missing"].items(), key=lambda x: -x[1]):
+        mt.add_row(f, str(n))
+    console.print(mt)
+
+    console.print("[bold]warranty distribution[/bold]")
+    wc = {"active": "green", "expiring": "yellow", "expired": "red", "unknown": "dim"}
+    for k in ("active", "expiring", "expired", "unknown"):
+        console.print(f"  [{wc[k]}]{k:9}[/{wc[k]}] {rep['warranty'].get(k, 0)}")
+
+    console.print("[bold]OS vendor-support (EOL) distribution[/bold]")
+    oe = rep.get("os_eol", {})
+    for k in ("active", "expiring", "expired", "unknown"):
+        console.print(f"  [{wc[k]}]{k:9}[/{wc[k]}] {oe.get(k, 0)}")
+
+    console.print(f"[bold]top {len(rep['worst_hosts'])} thinly-known hosts[/bold]")
+    wt = Table("hostname", "conf", "missing", "util", "profile", "warranty", "os_eol")
+    for h in rep["worst_hosts"]:
+        conf = h["confidence"]
+        cstr = f"{conf:.2f}" if conf is not None else "-"
+        wc2 = wc.get(h["warranty"], "dim")
+        oc = wc.get(h.get("os_eol", "unknown"), "dim")
+        wt.add_row(h["hostname"], cstr, ",".join(h["missing"]) or "-",
+                   "yes" if h["has_util"] else "[red]no[/red]",
+                   "yes" if h["has_profile"] else "[red]no[/red]",
+                   f"[{wc2}]{h['warranty']}[/{wc2}]",
+                   f"[{oc}]{h.get('os_eol','unknown')}[/{oc}]")
+    console.print(wt)
+
+
+@app_cli.command("discovery")
+def discovery_cmd(save: bool = typer.Option(True, "--save/--no-save",
+                         help="persist the diff as the latest snapshot (for the web tab)"),
+                  fmt: str = typer.Option("table", "--format", "-f", help="table | json")):
+    """Shadow-IT / CMDB-drift discovery diff (Gap1).
+
+    Compares a discovery snapshot (``IDC_DISCOVERY_PATH`` — a JSON list of hosts
+    seen on the network / in vCenter / cloud drift) against the CMDB and
+    surfaces the three traditional-IDC blindspots: unknown_hosts (shadow IT —
+    on the network but not in CMDB), cmdb_orphans (in CMDB but not seen —
+    zombie/retired candidate), drifted (in both, attributes differ). Empty diff
+    when ``IDC_DISCOVERY_PATH`` is unset (the default off state)."""
+    from ..core.ingest.discovery import discover_drift
+    st = _store()
+    diff = discover_drift(get_settings(), st.list_all_servers())
+    if save:
+        st.save_discovery(diff, created_at=diff.get("scanned_at", ""))
+    st.close()
+    if fmt == "json":
+        console.print_json(json.dumps(diff, ensure_ascii=False)); return
+    console.print(f"[bold]{diff['summary']}[/bold] "
+                  f"[dim]· source {diff['source']} · scanned {diff['scanned_at']}[/dim]\n")
+
+    console.print(f"[red bold]unknown hosts ({len(diff['unknown_hosts'])}) — shadow IT[/red bold]")
+    ut = Table("hostname", "ips", "source", "role", "os")
+    for h in diff["unknown_hosts"]:
+        ut.add_row(h.get("hostname") or "-", ",".join(h.get("ips") or []) or "-",
+                   h.get("source") or "-", h.get("role") or "-", h.get("os") or "-")
+    console.print(ut)
+
+    console.print(f"[yellow bold]CMDB orphans ({len(diff['cmdb_orphans'])}) — zombie/retired candidate[/yellow bold]")
+    ot = Table("hostname", "ips", "role")
+    for h in diff["cmdb_orphans"]:
+        ot.add_row(h.get("hostname") or "-", ",".join(h.get("ips") or []) or "-",
+                   h.get("role") or "-")
+    console.print(ot)
+
+    console.print(f"[#a06bff bold]drifted ({len(diff['drifted'])}) — CMDB stale[/#a06bff bold]")
+    dt = Table("hostname", "field", "cmdb", "discovered")
+    for h in diff["drifted"]:
+        dt.add_row(h.get("hostname") or "-", h.get("field") or "-",
+                   h.get("cmdb") or "-", h.get("discovered") or "-")
+    console.print(dt)
 @app_cli.command()
 def agent(task: str = typer.Argument(..., help="Task for the Claude Code agent"),
           execute: bool = typer.Option(False, "--execute", help="Allow file/bash side-effects (dangerous)"),
@@ -750,6 +892,10 @@ def doctor():
     console.print(f"  sms/dts      {'wired' if s.has_sms() else 'track-only'}  "
                   f"base={s.sms_base or '(not configured)'}  region={s.sms_region or '-'}")
     console.print(f"  netdep       {s.netdep_source}  enabled={s.netdep_enabled()}  days={s.netdep_days}")
+    console.print(f"  warranty     {'on' if s.warranty_path else 'off'}  path={s.warranty_path or '(IDC_WARRANTY_PATH unset)'}")
+    console.print(f"  discovery    {'on' if s.discovery_path else 'off'}  path={s.discovery_path or '(IDC_DISCOVERY_PATH unset)'}")
+    console.print(f"  conf gate    min_assessment_confidence={s.min_assessment_confidence}"
+                  + ("  (off)" if not s.min_assessment_confidence else "  (thin hosts -> Needs Discovery)"))
     # checks
     import shutil, httpx
     from ..agent import get_executor_client, executor_status

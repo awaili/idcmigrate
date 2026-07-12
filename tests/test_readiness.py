@@ -239,7 +239,8 @@ def test_readiness_endpoints():
         assert body["wave_id"] == wid
         assert set(body["signals"].keys()) == {
             "lz_ready", "db_conversion", "code_refactor",
-            "deps_resolved", "cutover_rehearsal", "rollback_channel"}
+            "deps_resolved", "cutover_rehearsal", "rollback_channel",
+            "hw_support", "os_support"}
     finally:
         _cleanup([wid], [sid], app_ids=[app])
 

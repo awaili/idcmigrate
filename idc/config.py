@@ -118,6 +118,29 @@ class Settings:
     # offline/fixture snapshot (default bundled fixture, like the other sources)
     netdep_path: str = field(default_factory=lambda: _env("IDC_NETDEP_PATH", str(FIXTURES / "netdep.json")))
 
+    # data-gap — hardware warranty / end-of-support fold-in. OFF by default
+    # (empty path): the warranty fields stay "" on every server and the F2
+    # premium / F10 hw_support signal / data-gaps "unknown warranty" count all
+    # report "not assessed". Point at a JSON list (see ingest.warranty) to
+    # merge procurement/asset-system data onto CMDB servers by hostname/fqdn.
+    warranty_path: str = field(default_factory=lambda: _env("IDC_WARRANTY_PATH"))
+
+    # data-gap — shadow-IT discovery source. OFF by default (empty path): no
+    # network/vCenter sweep runs and the discovery diff is empty. Point at a
+    # JSON list (see ingest.discovery) of hosts seen on the network / in vCenter
+    # but potentially absent from CMDB; the diff vs Store.list_all_servers
+    # surfaces unknown_hosts (shadow IT) + cmdb_orphans (zombie/retired).
+    discovery_path: str = field(default_factory=lambda: _env("IDC_DISCOVERY_PATH"))
+
+    # data-gap — soft confidence gate on wave planning. 0.0 (default) = off:
+    # every server enters a migration wave regardless of how thinly it is
+    # characterized. When >0, servers whose assessment_confidence is below the
+    # threshold are pulled into a trailing "Needs Discovery" holding wave
+    # (not in the migration sequence) so thinly-known hosts don't get a
+    # cutover slot before they've been characterized. Set e.g. 0.3 to gate.
+    min_assessment_confidence: float = field(
+        default_factory=lambda: float(_env("IDC_MIN_ASSESSMENT_CONFIDENCE", "0") or 0))
+
     # derived helpers
     def has_servicenow(self) -> bool:
         return bool(self.sn_base and (self.sn_token or (self.sn_user and self.sn_password)))

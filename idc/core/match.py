@@ -15,8 +15,9 @@ env.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from .models import ALL_SOURCES, Match, Server, Target
 
@@ -171,6 +172,59 @@ def assessment_confidence_of(s: Server, has_code_profile: bool = False) -> float
     profile = 1.0 if has_code_profile else 0.0
     score = 0.25 * diversity + 0.35 * util + 0.20 * cov + 0.20 * profile
     return max(0.0, min(1.0, score))
+
+
+# ---------------------------------------------------------------------------
+# hardware support bucket (traditional-IDC reality: CMDB often lacks this)
+# ---------------------------------------------------------------------------
+# A host's hardware-warranty / end-of-support status is frequently missing,
+# stale, or wrong in a traditional IDC (脱保 boxes, shadow IT, manual racking
+# with no CMDB update). The bucket below is the single derived signal the
+# cost / readiness / data-gaps layers read. Explicit ``Server.warranty_status``
+# (operator/source truth) wins; otherwise the bucket is derived from
+# ``hardware_eol`` vs today. ``unknown`` is the neutral default — it lowers no
+# confidence score (we don't penalize what we haven't assessed) but it IS
+# counted in the data-gaps "unknown warranty" report so the operator sees the
+# blind spot. See docs/fusion-implementation-plan.md (data-gap gap).
+WARRANTY_ACTIVE = "active"
+WARRANTY_EXPIRING = "expiring"
+WARRANTY_EXPIRED = "expired"
+WARRANTY_UNKNOWN = "unknown"
+WARRANTY_EXPIRING_DAYS = 90  # expiring window: < this many days to hardware_eol
+
+
+def _today_iso() -> str:
+    return datetime.date.today().isoformat()
+
+
+def warranty_bucket(s: Server, today_iso: Optional[str] = None) -> str:
+    """Hardware support bucket: active / expiring / expired / unknown.
+
+    Explicit ``Server.warranty_status`` (one of the WARRANTY_* constants, or
+    ``""`` = not assessed) wins. When unset, the bucket is derived from
+    ``hardware_eol`` (an ISO ``YYYY-MM-DD`` date) compared to ``today_iso``
+    (default: today). Returns ``unknown`` when neither is available — the
+    traditional-IDC reality where CMDB has no support data. Pure w.r.t. the
+    server + the supplied today; default-today is the only non-determinism
+    and tests pass an explicit ``today_iso`` for reproducibility.
+    """
+    ws = (s.warranty_status or "").strip().lower()
+    if ws in (WARRANTY_ACTIVE, WARRANTY_EXPIRING, WARRANTY_EXPIRED, WARRANTY_UNKNOWN):
+        return ws
+    eol = (s.hardware_eol or "").strip()
+    if not eol:
+        return WARRANTY_UNKNOWN
+    today = today_iso or _today_iso()
+    try:
+        eol_d = datetime.date.fromisoformat(eol)
+        today_d = datetime.date.fromisoformat(today)
+    except ValueError:
+        return WARRANTY_UNKNOWN
+    if eol_d < today_d:
+        return WARRANTY_EXPIRED
+    if (eol_d - today_d).days <= WARRANTY_EXPIRING_DAYS:
+        return WARRANTY_EXPIRING
+    return WARRANTY_ACTIVE
 
 
 def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:

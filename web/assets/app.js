@@ -9,6 +9,18 @@ async function api(path, opts){ const r = await fetch(API+path, opts); if(!r.ok)
 function fmtUtil(u){ if(!u||(!u.cpu_p95&&!u.mem_p95&&!u.disk_used_pct)) return '-'; return `${u.cpu_p95??'-'}/${u.mem_p95??'-'}/${u.disk_used_pct??'-'}`; }
 function esc(s){ return (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
+/* shared support-bucket badge (data-gap) — warranty + OS-EOL both use the
+   active/expiring/expired/unknown bucket the backend precomputes on every
+   server row (s.warranty_bucket / s.os_eol_bucket). Used by the inventory list
+   and the server drawer. */
+const _BUCKET_COLOR = {active:'var(--green)',expiring:'var(--amber)',expired:'var(--red)',unknown:'#888'};
+const _BUCKET_SHORT = {active:'act',expiring:'exp',expired:'EXP',unknown:'?'};
+function bucketBadge(bucket, label){
+  bucket = bucket || 'unknown';
+  const c=_BUCKET_COLOR[bucket]||'#888';
+  return `<span class="tag" style="color:${c}" title="${esc(label)}: ${esc(bucket)}">${esc(_BUCKET_SHORT[bucket]||bucket)}</span>`;
+}
+
 /* ---------- toast notifications ---------- */
 function toast(msg, type='info', ms=3000){
   let wrap = document.querySelector('.toast-wrap');
@@ -30,6 +42,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.tab==='business-case') loadLatestBusinessCase();
   if(t.dataset.tab==='execution') loadExecution();
   if(t.dataset.tab==='readiness') loadReadiness();
+  if(t.dataset.tab==='data-quality'){ loadDataGaps(); loadDiscovery(); }
 });
 
 /* ---------- header stats ---------- */

@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS servers (
     status        VARCHAR(32),
     sizing_basis         VARCHAR(16),   -- F4: measured / estimated
     assessment_confidence DOUBLE,         -- F4: data-coverage score 0..1
+    warranty_status VARCHAR(16),          -- hardware support bucket (active/expiring/expired/unknown)
+    hardware_eol    VARCHAR(16),          -- ISO date of hardware end-of-support
     created_at    VARCHAR(40),
     updated_at    VARCHAR(40),
     KEY idx_srv_role (role),
@@ -304,9 +306,20 @@ CREATE TABLE IF NOT EXISTS lz_status (
     updated_by  VARCHAR(64)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
+-- data-gap (Gap1) — latest shadow-IT / CMDB-drift discovery snapshot. Single
+-- row (id='latest') upserted by POST /api/discovery/scan so the web tab shows
+-- the last scan without re-running. Payload is the full discover_drift dict.
+CREATE TABLE IF NOT EXISTS discovery_snapshots (
+    id          VARCHAR(16) PRIMARY KEY,
+    created_at  VARCHAR(40),
+    payload     LONGTEXT
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
 -- F4 server columns migrated in place via ALTER IF NOT EXISTS
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS sizing_basis VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS assessment_confidence DOUBLE;
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS warranty_status VARCHAR(16);
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS hardware_eol VARCHAR(16);
 """
 
 
@@ -507,6 +520,7 @@ class Store:
                     "tags", "business_criticality", "migration_tier",
                     "utilization", "source_refs", "status",
                     "sizing_basis", "assessment_confidence",
+                    "warranty_status", "hardware_eol",
                     "created_at", "updated_at"]
 
     def upsert_server(self, s: Server) -> None:
@@ -521,6 +535,7 @@ class Store:
                          s.business_criticality, s.migration_tier,
                          dumps(s.utilization.to_dict()), dumps(s.source_refs),
                          s.status, s.sizing_basis, s.assessment_confidence,
+                         s.warranty_status, s.hardware_eol,
                          s.created_at, s.updated_at))
 
     def _row_to_server(self, r) -> Server:
@@ -1001,6 +1016,27 @@ class Store:
     def delete_lz_status(self, archetype: str) -> None:
         with self.tx() as cur:
             cur.execute(self._x("DELETE FROM lz_status WHERE archetype=?"), (archetype,))
+
+    # -- discovery snapshots (Gap1 — shadow-IT / CMDB-drift diff) --
+    def save_discovery(self, payload: Dict[str, Any], created_at: str = "") -> None:
+        """Upsert the latest discovery-diff snapshot (single row id='latest').
+        POST /api/discovery/scan writes here so GET /api/discovery/diff can
+        return the last scan without re-running the source."""
+        if not created_at:
+            from datetime import datetime
+            created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        sql = self._upsert_sql("discovery_snapshots",
+                               ["id", "created_at", "payload"], "id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), ("latest", created_at, dumps(payload)))
+
+    def get_discovery(self) -> Optional[Dict[str, Any]]:
+        r = self._fetchone("SELECT * FROM discovery_snapshots WHERE id=?", ("latest",))
+        if not r:
+            return None
+        d = dict(r)
+        return {"id": d["id"], "created_at": d["created_at"],
+                "payload": loads(d.get("payload"))}
 
     # -- app strategies (AI-assigned 7R, separate from executor profiles) --
     _STRATEGY_COLS = ["app_id", "strategy", "rationale", "target", "confidence",

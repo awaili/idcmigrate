@@ -19,6 +19,7 @@
     <div class="tab" data-tab="business-case">Business Case</div>
     <div class="tab" data-tab="execution">Execution</div>
     <div class="tab" data-tab="readiness">Readiness</div>
+    <div class="tab" data-tab="data-quality">Data Quality</div>
   </div>
   <div class="stats" id="stats"></div>
   <div class="row">
@@ -45,6 +46,10 @@
   <!-- ===================== DASHBOARD ===================== -->
   <section id="tab-dashboard" class="tabsec">
     <div class="tiles" id="dashTiles"></div>
+    <div class="card" id="dashDataGap" style="border-left:3px solid var(--red)">
+      <h2>Data gaps <span class="muted">(脱保 / EOL OS / shadow IT — click for the full report)</span></h2>
+      <div id="dashDataGapBody" class="row" style="gap:18px;flex-wrap:wrap"><span class="muted">loading…</span></div>
+    </div>
     <div class="card"><h2>Distribution by role</h2><div class="bars" id="barRole"></div></div>
     <div class="row cols" style="gap:14px;align-items:flex-start">
       <div class="card" style="flex:1"><h2>By Tencent target product</h2><div class="bars" id="barTarget"></div></div>
@@ -285,8 +290,21 @@
   <!-- ===================== READINESS (F10) ===================== -->
   <section id="tab-readiness" class="tabsec hidden">
     <h2>Readiness heatmap <span class="muted">(F10 — is each wave safe to cut? red blocks cutover)</span></h2>
-    <div class="row" style="gap:8px;margin-bottom:8px"><button class="sm primary" onclick="loadReadiness()">Refresh</button><span class="muted">six signals per wave: lz / db / code / deps / rehearsal / rollback — rollup = worst case</span></div>
+    <div class="row" style="gap:8px;margin-bottom:8px"><button class="sm primary" onclick="loadReadiness()">Refresh</button><span class="muted">eight signals per wave: lz / db / code / deps / rehearsal / rollback / hw / os — rollup = worst case</span></div>
     <div id="readinessHeatmap" class="card"><span class="muted">loading…</span></div>
+  </section>
+
+  <section id="tab-data-quality" class="tabsec hidden">
+    <h2>Data Quality <span class="muted">(traditional-IDC blindspots: 脱保 / shadow IT / missing fields)</span></h2>
+    <div class="row" style="gap:8px;margin-bottom:8px">
+      <button class="sm primary" onclick="loadDataGaps()">Refresh gaps</button>
+      <button class="sm" onclick="loadDiscovery()">Refresh shadow-IT diff</button>
+      <button class="sm" onclick="runDiscoveryScan()">Run discovery scan</button>
+      <span class="muted">confidence + missing fields + warranty + thinly-known hosts; shadow IT = network/vCenter vs CMDB</span>
+    </div>
+    <div id="dataGaps" class="card"><span class="muted">loading…</span></div>
+    <h3 style="margin-top:14px">Shadow IT &amp; CMDB drift</h3>
+    <div id="discoveryDiff" class="card"><span class="muted">no scan run — click “Run discovery scan” (needs IDC_DISCOVERY_PATH)</span></div>
   </section>
 </div>
 
@@ -309,6 +327,7 @@
 <script src="/assets/pages/business-case.js"></script>
 <script src="/assets/pages/wave-execution.js"></script>
 <script src="/assets/pages/readiness.js"></script>
+<script src="/assets/pages/data-gaps.js"></script>
 <script src="/assets/pages/rail.js"></script>
 <script src="/assets/main.js"></script>
 </body>

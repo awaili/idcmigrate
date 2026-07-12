@@ -27,6 +27,8 @@ from ..core.models import (ALL_QUESTION_KINDS, ChangeJob, CodeProfile, DBConvers
 from ..llm import get_client
 from ..agent import ExecutorError, build_context, get_executor_client, run_agent
 from ..core.codeintel import app_targets, build_change_spec, resolve_value
+from ..core.match import warranty_bucket
+from ..core.eol import os_eol_bucket
 
 load_dotenv()
 settings = get_settings()
@@ -91,6 +93,10 @@ def _server_out(s, profiles_by_app=None, strategies_by_app=None):
     d = s.to_dict()
     m = STORE.get_match(s.id)
     d["match"] = m.to_dict() if m else None
+    # data-gap — precomputed support buckets so the inventory list + drawer can
+    # render warranty / OS-EOL badges without duplicating the EOL table in JS.
+    d["warranty_bucket"] = warranty_bucket(s)
+    d["os_eol_bucket"] = os_eol_bucket(s)
     # code-scan enrichment: only when a profile map is supplied (single-server
     # detail). The paginated list endpoint does NOT pass one, so it stays fast
     # and does not load all profiles per row.
@@ -212,6 +218,31 @@ def get_server(sid: str):
     pmap = {p.app_id: p for p in STORE.list_code_profiles()}
     smap = {s2.app_id: s2 for s2 in STORE.list_app_strategies()}
     return _server_out(s, profiles_by_app=pmap, strategies_by_app=smap)
+
+
+@app.put("/api/servers/{sid}/warranty")
+def put_server_warranty(sid: str, body: dict):
+    """Operator override of a server's hardware support status (data-gap).
+
+    Traditional-IDC CMDBs often lack warranty / end-of-support data; the
+    operator can set it per host here so the F2 on-prem extended-support
+    premium, the F10 ``hw_support`` readiness signal, and the data-gaps
+    "unknown warranty" count reflect reality. Both fields optional — send
+    either/both; empty string clears. Persists immediately (no rebuild needed).
+    """
+    s = STORE.get_server(sid)
+    if not s:
+        raise HTTPException(404, "server not found")
+    ws = (body.get("warranty_status") or "").strip().lower()
+    if ws and ws not in ("active", "expiring", "expired", "unknown"):
+        raise HTTPException(400, "warranty_status must be active/expiring/expired/unknown")
+    if "warranty_status" in body:
+        s.warranty_status = ws
+    if "hardware_eol" in body:
+        s.hardware_eol = (body.get("hardware_eol") or "").strip()
+    STORE.upsert_server(s)
+    return {"server_id": sid, "warranty_status": s.warranty_status,
+            "hardware_eol": s.hardware_eol, "updated": True}
 
 
 @app.get("/api/workloads")
@@ -1432,6 +1463,49 @@ def readiness_wave(wave_id: str):
     if "error" in out:
         raise HTTPException(404, out["error"])
     return out
+
+
+@app.get("/api/data-gaps")
+def data_gaps():
+    """Portfolio data-quality / information-blindspot report (data-gap).
+
+    Rolls the per-host F4 assessment-confidence + key-field provenance + live-
+    utilization + code-profile + warranty signals up to a portfolio view so the
+    operator sees the blind spots (脱保 / unknown role / no util telemetry / no
+    profile) in one place. The shadow-IT discovery diff (Gap1) is a separate
+    endpoint (``/api/discovery/diff``) surfaced on the same Data Quality tab."""
+    from ..core.datagaps import portfolio_data_gaps
+    return portfolio_data_gaps(STORE)
+
+
+@app.post("/api/discovery/scan")
+def discovery_scan():
+    """Run the shadow-IT / CMDB-drift discovery scan (Gap1).
+
+    Compares a discovery snapshot (``IDC_DISCOVERY_PATH`` — a JSON list of hosts
+    seen on the network / in vCenter / cloud drift) against the CMDB servers
+    and persists the diff as the latest snapshot. Returns the diff
+    (unknown_hosts / cmdb_orphans / drifted). Empty diff when
+    ``IDC_DISCOVERY_PATH`` is unset (the default off state)."""
+    from ..core.ingest.discovery import discover_drift
+    diff = discover_drift(settings, STORE.list_all_servers())
+    STORE.save_discovery(diff, created_at=diff.get("scanned_at", ""))
+    return diff
+
+
+@app.get("/api/discovery/diff")
+def discovery_diff():
+    """Return the latest persisted shadow-IT / CMDB-drift diff (Gap1).
+
+    404 when no scan has been run yet. The Data Quality tab calls this on open
+    so it shows the last scan without re-running the source; POST
+    /api/discovery/scan refreshes it."""
+    snap = STORE.get_discovery()
+    if not snap:
+        raise HTTPException(404, "no discovery scan run yet (POST /api/discovery/scan)")
+    payload = snap["payload"] or {}
+    payload.setdefault("scanned_at", snap.get("created_at", ""))
+    return payload
 
 
 # ---------------------------------------------------------------------------

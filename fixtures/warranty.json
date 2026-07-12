@@ -1,0 +1,9 @@
+[
+  {"hostname": "db-oracle-01", "hardware_eol": "2024-03-15", "warranty_status": "expired"},
+  {"hostname": "db-mysql-01", "hardware_eol": "2026-08-20", "warranty_status": "expiring"},
+  {"hostname": "db-mysql-02", "hardware_eol": "2029-01-01", "warranty_status": "active"},
+  {"hostname": "k8s-master-01", "hardware_eol": "2025-12-01", "warranty_status": "expired"},
+  {"hostname": "app-orders-01", "hardware_eol": "2028-06-30", "warranty_status": "active"},
+  {"hostname": "web-portal-01", "hardware_eol": "2026-09-10", "warranty_status": "expiring"},
+  {"hostname": "ghost-rack-07", "hardware_eol": "2023-05-01", "warranty_status": "expired"}
+]

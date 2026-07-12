@@ -18,9 +18,11 @@ from .models import (
     SOURCE_PROMETHEUS, SOURCE_RVTOOLS, SOURCE_SERVICENOW, SOURCE_ZABBIX,
 )
 from .db import Store, open_store
+from .eol import apply_os_eol
 from .ingest import all_sources, get_adapter
 from .ingest.netdep import discover_network_deps
-from .match import assessment_confidence_of, match_servers, sizing_basis_of
+from .ingest.warranty import merge_warranty
+from .match import assessment_confidence_of, match_servers, sizing_basis_of, warranty_bucket
 from .normalize import load_workloads, merge_network_deps, normalize, resolve_workloads
 from .plan import plan_waves
 
@@ -114,6 +116,11 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
         s.sizing_basis = sizing_basis_of(s)
         s.assessment_confidence = assessment_confidence_of(
             s, has_code_profile=any(a in pidx for a in s.app_ids))
+    # data-gap — fold hardware warranty / end-of-support onto matching servers
+    # (off by default; IDC_WARRANTY_PATH empty -> no-op). Runs before upsert so
+    # the merged warranty_status/hardware_eol persist on the first pass and the
+    # F2 eol premium / F10 hw_support signal / data-gaps count see them.
+    warranty_report = merge_warranty(servers, settings.warranty_path)
     # clear+rewrite servers: simplest is upsert (ids are fresh each rebuild).
     # To avoid dup growth we wipe the servers table first.
     _wipe_derived(store)
@@ -146,6 +153,11 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
         for m in match_servers(servers):
             profile = _profile_for_server(m.server_id, servers, pidx)
             srv = srv_by_id.get(m.server_id)
+            # data-gap — flag an out-of-support OS before enrichment so the EOL
+            # confidence dip compounds with the F4 coverage scale (no silent
+            # rehost of CentOS 6 / Windows 2008). No-op for active/unknown OS.
+            if srv:
+                apply_os_eol(m, srv)
             cov = srv.assessment_confidence if srv else None
             enrich_match(m, profile, assessment_confidence=cov or 1.0)
             dbp = None
@@ -169,12 +181,15 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
         for app_id, strat in strategies_from_tags(servers).items():
             strategies[app_id] = strat
         waves = plan_waves(servers, wls, code_profiles=profiles,
-                          max_waves=max_waves, strategies=strategies)
+                          max_waves=max_waves, strategies=strategies,
+                          min_assessment_confidence=settings.min_assessment_confidence)
         for w in waves:
             store.upsert_wave(w)
     out = store.stats()
     if netdep_report:
         out["netdep"] = netdep_report
+    if warranty_report and warranty_report["matched"]:
+        out["warranty"] = warranty_report
     return out
 
 
@@ -200,4 +215,5 @@ def _wipe_derived(store: Store) -> None:
 __all__ = [
     "Store", "open_store", "run_ingest", "rebuild",
     "normalize", "match_servers", "plan_waves", "load_workloads", "resolve_workloads",
+    "warranty_bucket",
 ]

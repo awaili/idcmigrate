@@ -156,6 +156,13 @@ class Server:
     # F4 — assessment-confidence signals (how much we actually know about this host)
     sizing_basis: str = ""           # measured / estimated (sizing from live util?)
     assessment_confidence: Optional[float] = None  # 0..1 data-coverage score
+    # hardware support status (traditional-IDC reality: CMDB often lacks this).
+    # ``warranty_status`` is an explicit bucket (active/expiring/expired/unknown);
+    # ``hardware_eol`` is the optional ISO date the bucket can be derived from.
+    # Drives the F2 on-prem extended-support premium, the F10 hw_support readiness
+    # signal, and the data-gaps "unknown warranty" count. See match.warranty_bucket.
+    warranty_status: str = ""       # "" (not assessed) / active / expiring / expired / unknown
+    hardware_eol: str = ""           # ISO date YYYY-MM-DD of hardware end-of-support, or ""
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
