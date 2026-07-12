@@ -169,6 +169,8 @@ def list_servers(role: Optional[str] = None, env: Optional[str] = None,
                  util_cpu_min: Optional[float] = None, util_mem_min: Optional[float] = None,
                  util_disk_min: Optional[float] = None,
                  conf_min: Optional[float] = None, conf_max: Optional[float] = None,
+                 warranty_bucket: Optional[str] = None,
+                 os_eol_bucket: Optional[str] = None,
                  page: int = 1, page_size: int = 50,
                  order_by: str = "hostname", order_dir: str = "asc"):
     """Paginated, filtered, faceted server query (scales to 15K+)."""
@@ -176,7 +178,8 @@ def list_servers(role: Optional[str] = None, env: Optional[str] = None,
                      os=os, criticality=criticality, cluster=cluster, datacenter=datacenter,
                      target_product=target_product, wave_id=wave_id, q=q,
                      util_cpu_min=util_cpu_min, util_mem_min=util_mem_min,
-                     util_disk_min=util_disk_min, conf_min=conf_min, conf_max=conf_max)
+                     util_disk_min=util_disk_min, conf_min=conf_min, conf_max=conf_max,
+                     warranty_bucket=warranty_bucket, os_eol_bucket=os_eol_bucket)
     res = STORE.query_servers(f, page=page, page_size=min(page_size, 500),
                               order_by=order_by, order_dir=order_dir)
     items = [_server_out(s) for s in res["items"]]

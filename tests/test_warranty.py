@@ -284,6 +284,45 @@ def test_persisted_buckets_roundtrip():
         st.close()
 
 
+def test_inventory_filter_and_facet_on_buckets():
+    """B2 gap-actionable — /api/servers filters + facets on the persisted buckets."""
+    from idc.core.models import _new_id
+    st = _store()
+    sids = []
+    try:
+        # unique env isolates to these two (estate envs are prod/staging/dev)
+        s_exp = Server(id=_new_id("srv"), hostname="inv-exp", env="zzgap",
+                       os="centos", os_version="7",
+                       warranty_bucket="expired", os_eol_bucket="expired")
+        s_act = Server(id=_new_id("srv"), hostname="inv-act", env="zzgap",
+                       os="windows", os_version="2019",
+                       warranty_bucket="active", os_eol_bucket="active")
+        sids = [s_exp.id, s_act.id]
+        st.upsert_server(s_exp); st.upsert_server(s_act)
+        # filter narrows to the expired cohort (env isolates to my 2, os_eol narrows to 1)
+        r = client.get("/api/servers?env=zzgap&os_eol_bucket=expired")
+        assert r.status_code == 200, r.text
+        items = r.json()["items"]
+        assert len(items) == 1 and items[0]["hostname"] == "inv-exp"
+        # warranty filter narrows to the active cohort
+        r2 = client.get("/api/servers?env=zzgap&warranty_bucket=active")
+        items2 = r2.json()["items"]
+        assert len(items2) == 1 and items2[0]["hostname"] == "inv-act"
+        # facets (over the env=zzgap cohort) include both buckets
+        r3 = client.get("/api/servers?env=zzgap")
+        fc = r3.json()["facets"]
+        assert fc.get("os_eol_bucket", {}).get("expired") == 1
+        assert fc.get("os_eol_bucket", {}).get("active") == 1
+        assert fc.get("warranty_bucket", {}).get("expired") == 1
+    finally:
+        st2 = _store()
+        with st2.tx() as cur:
+            for sid in sids:
+                cur.execute(st2._x("DELETE FROM servers WHERE id=?"), (sid,))
+        st2.close()
+        st.close()
+
+
 def test_backend_put_warranty_rejects_bad_status():
     wid, sid, host = _seed_server()
     try:

@@ -56,6 +56,8 @@ class ServerFilter:
     util_disk_min: Optional[float] = None
     conf_min: Optional[float] = None
     conf_max: Optional[float] = None
+    warranty_bucket: Optional[str] = None
+    os_eol_bucket: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +644,11 @@ class Store:
             args.append(f.wave_id)
             args.append('%"')
             args.append('"%')
+        # data-gap (gap-actionable) — facet/filter on the persisted derived buckets
+        for col, val in (("warranty_bucket", f.warranty_bucket),
+                         ("os_eol_bucket", f.os_eol_bucket)):
+            if val:
+                where.append(f"servers.{col}=?"); args.append(val)
         if join_matches:
             if f.target_product:
                 jq = self._jq("json_extract(matches.target,'$.product')")
@@ -677,7 +684,8 @@ class Store:
     def _facets(self, where: str, args: list, join_matches: bool) -> dict:
         join = " LEFT JOIN matches ON matches.server_id=servers.id" if join_matches else ""
         out: Dict[str, Dict[str, int]] = {}
-        for col in ("role", "env", "os", "source_type", "business_criticality", "cluster"):
+        for col in ("role", "env", "os", "source_type", "business_criticality",
+                    "cluster", "warranty_bucket", "os_eol_bucket"):
             rows = self._fetchall(
                 f"SELECT servers.{col} AS c, COUNT(*) AS n FROM servers{join} "
                 f"WHERE {where} GROUP BY servers.{col}", args)

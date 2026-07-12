@@ -23,13 +23,13 @@ report shows 5591 expired-OS hosts.
   `PUT /api/servers/{sid}/warranty`. `_server_out` reads the persisted bucket
   (fall back to compute if stale/NULL). Acceptance: rebuild persists non-NULL
   buckets; a server's `os_eol_bucket` survives a fresh load. Commit: B1 below.
-- [ ] **B2 inventory facets + quick filters** — `Store._facets` groups by the
+- [x] **B2 inventory facets + quick filters** — `Store._facets` groups by the
   two new columns; `ServerFilter` gains `warranty_bucket` + `os_eol_bucket`
   params + `_filters_sql` clauses; `GET /api/servers` accepts them;
   inventory.js renders facet chips for the buckets + quick-apply buttons
-  "EOL OS expired" / "脱保 (expired/expiring)". Acceptance: clicking the facet
+  "EOL OS expired" / "脱保 (out of warranty)". Acceptance: clicking the facet
   or quick-filter narrows the list to that cohort; backend test for the filter.
-  Commit: <sha>.
+  Commit: B2 below.
 - [ ] **B3 combine** — full `pytest`; update this doc's Result; wrap commit.
   Acceptance: 321+ green, no regressions. Commit: <sha>.
 

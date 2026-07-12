@@ -6,6 +6,8 @@ function applyQuick(kind){
   state.filters={};
   if(kind==='highutil') state.filters.util_mem_min=80;
   if(kind==='lowconf') state.filters.conf_max=0.79;
+  if(kind==='eolos') state.filters.os_eol_bucket='expired';     // data-gap: EOL OS cohort
+  if(kind==='oosw') state.filters.warranty_bucket='expired';    // data-gap: 脱保 cohort
   state.page=1; fetchInv();
 }
 function toggleFacet(dim, val){
@@ -33,6 +35,8 @@ function renderInv(r){
     ['source_type','Type',fc.source_type],
     ['criticality','Criticality',fc.criticality,{high:'r',medium:'a',low:'g'}],
     ['target_product','Target',fc.target_product,{CDB:'p',EMR:'a',TKE:'',CVM:''}],
+    ['os_eol_bucket','OS EOL',fc.os_eol_bucket,{active:'g',expiring:'a',expired:'r',unknown:'',unknown_or_none:''}],
+    ['warranty_bucket','Warranty',fc.warranty_bucket,{active:'g',expiring:'a',expired:'r',unknown:''}],
   ];
   $('facets').innerHTML = groups.map(([dim,label,data,colors])=>{
     if(!data || !Object.keys(data).length) return '';

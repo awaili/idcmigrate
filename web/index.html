@@ -72,6 +72,8 @@
         <input id="q" placeholder="search hostname / ip / tag / app…" style="flex:1;min-width:220px" oninput="debounceSearch()"/>
         <button class="sm" onclick="applyQuick('highutil')">⚙ high-util (≥80%)</button>
         <button class="sm" onclick="applyQuick('lowconf')">⚠ low-confidence (&lt;0.8)</button>
+        <button class="sm" onclick="applyQuick('eolos')">⌖ EOL OS (expired)</button>
+        <button class="sm" onclick="applyQuick('oosw')">⌖ 脱保 (out of warranty)</button>
         <button class="sm" onclick="resetFilters()">reset</button>
         <span style="flex:1"></span>
         <span id="activeChips" class="row"></span>
