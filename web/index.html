@@ -108,11 +108,11 @@
   <!-- ===================== WAVES ===================== -->
   <section id="tab-waves" class="tabsec hidden">
     <div class="card">
-      <h2>Plan with LLM <span class="muted">(natural-language wave policy → dry-run; Apply to persist)</span></h2>
+      <h2>Plan with MigraQ <span class="muted">(natural-language wave policy → dry-run; Apply to persist)</span></h2>
       <div class="row" style="gap:8px;align-items:flex-end">
         <textarea id="planDemand" rows="2" style="flex:1 1 240px;min-width:160px" placeholder="e.g. put DBs first, keep high-criticality apps in early waves, group by app dependency — or say 最多10个wave"></textarea>
         <label class="muted" style="white-space:nowrap">max waves
-          <input id="planMaxWaves" type="number" min="1" step="1" style="width:74px" title="Hard cap on total instantiated waves. If the engine produces more, the LLM is re-prompted (up to 2 rounds) to revise. Also auto-parsed from phrases like '最多10个wave' / 'max 8 waves'.">
+          <input id="planMaxWaves" type="number" min="1" step="1" style="width:74px" title="Hard cap on total instantiated waves. If the engine produces more, the MigraQ is re-prompted (up to 2 rounds) to revise. Also auto-parsed from phrases like '最多10个wave' / 'max 8 waves'.">
         </label>
         <button class="primary" onclick="proposePlan()">Propose</button>
       </div>
@@ -213,9 +213,9 @@
         <datalist id="srAppList"></datalist>
         <label class="muted" style="white-space:nowrap"><input type="checkbox" id="srApply"> apply to profile</label>
         <button class="primary" onclick="assignStrategy()">Assign 7R</button>
-        <button class="sm" onclick="assignStrategyAll()" title="assign a 7R strategy to every app (one LLM call each — slow)">batch all</button>
+        <button class="sm" onclick="assignStrategyAll()" title="assign a 7R strategy to every app (one MigraQ call each — slow)">batch all</button>
       </div>
-      <div class="out" id="srOut" style="margin-top:8px"><span class="muted">Pick an app (or click 7R on a profile row). The LLM picks one of rehost / rehost-container / replatform / refactor / repurchase / retain / retire, with rationale + target + key changes.</span></div>
+      <div class="out" id="srOut" style="margin-top:8px"><span class="muted">Pick an app (or click 7R on a profile row). The MigraQ picks one of rehost / rehost-container / replatform / refactor / repurchase / retain / retire, with rationale + target + key changes.</span></div>
     </div>
     <div class="card"><h2>Code profiles <span class="muted">(pushed by executor)</span></h2>
       <div class="xscroll"><table class="tbl mcard" id="codeTbl"><thead><tr>

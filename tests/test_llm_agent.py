@@ -64,7 +64,7 @@ def test_llm_error_falls_back(monkeypatch):
     def boom(*a, **k): raise RuntimeError("gateway down")
     monkeypatch.setattr("idc.llm.client.httpx.post", boom)
     out = c.explain_match(_mk_server(), match_server(_mk_server()))
-    assert "rule-based result only" in out or "LLM error" in out
+    assert "rule-based result only" in out or "MigraQ error" in out
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +118,7 @@ def test_audit_match_llm_exception_degrades():
     c = LLMClient(Settings(llm_enabled=True))
     with patch.object(c, "chat", side_effect=RuntimeError("gateway down")):
         r = c.audit_match(_mk_server(), match_server(_mk_server()))
-    assert not r["ok"] and "LLM error" in r["error"]
+    assert not r["ok"] and "MigraQ error" in r["error"]
 
 
 def test_audit_match_disabled():

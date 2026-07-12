@@ -8,7 +8,7 @@
 > Principle: **do not rebuild what we already do well** — multi-source
 > entity resolution + provenance, code-aware wave planning, the external
 > executor (evidence-backed findings + operator resolve/question loop),
-> and the LLM/Agent dual layer already match or lead the competitors; keep
+> and the MigraQ/Agent dual layer already match or lead the competitors; keep
 > them. **Only fill gaps**, prioritized by "impact on migration outcome ×
 > implementation cost".
 >
@@ -32,7 +32,7 @@
 | 4-source ingest + cross-source entity resolution + per-field provenance | AWS ADS/Transform, GCP Migration Center, Azure Migrate appliance (mostly single-source appliance) | Our multi-source fusion is stronger; **but we lack network-dependency discovery** → F1 |
 | Code-aware wave planning (DAG + code_deps + refactor_effort / migration_pattern secondary sort) | GCP has **no** native wave tracker; AWS Migration Hub / Azure Wave Planning have grouping but not code-aware | At parity / ahead; **but lacks execution-state tracking** → F7 |
 | External executor: file+line+evidence findings, `modify` actually edits code, operator resolve/question loop | AWS Strategy Recommendations does only static anti-pattern detection, no edit; AWS Transform code refactor has no operator loop; Azure has no equivalent | **Leading** — keep, extend to DB → F5 |
-| LLM ask/explain + Agent (Claude CLI) plan/execute dual mode | AWS Transform chat what-if; Azure Copilot migration agent (preview) | At parity, **deepen what-if** → F3 |
+| MigraQ ask/explain + Agent (Claude CLI) plan/execute dual mode | AWS Transform chat what-if; Azure Copilot migration agent (preview) | At parity, **deepen what-if** → F3 |
 
 ---
 
@@ -91,17 +91,17 @@ without it the copilot stalls at the "technical assessment" layer.
 **Source**: AWS Transform "chat-based refinement" — adjust
 region/licensing/utilization in natural language without re-running the
 assessment; Azure Copilot migration agent (preview).
-**Gap**: LLM `ask` answers from a precomputed snapshot; changing region or
+**Gap**: MigraQ `ask` answers from a precomputed snapshot; changing region or
 spec requires re-running `match`.
 **Fusion**: wrap `match.py` rule tables + `cost.py` as parameterized pure
-functions (region / sizing-strategy / BYOL as inputs); the LLM agent calls
+functions (region / sizing-strategy / BYOL as inputs); the MigraQ agent calls
 them for what-if:
 - "If I move all DBs to ap-guangzhou, what's the cost delta?" → agent calls
   `cost.what_if(region='ap-guangzhou', scope='db')`, returns the delta.
 - "Re-right-size this host as-is" → `match.right_size(server_id, strategy='as_is')`.
 **Landing**: `match.py` + `cost.py` (extract pure functions),
 `idc/agent/` (what-if tool set), `llm/planner.py`. Reuses the existing
-LLM/Agent layer; the increment is mostly function-izing match/cost.
+MigraQ/Agent layer; the increment is mostly function-izing match/cost.
 
 ### F4 — Data-coverage confidence rating — P1
 **Source**: Azure Migrate's 1–5 star confidence (by utilization data-point
@@ -134,8 +134,8 @@ schema/SQL**:
   syntax/packages → MySQL equivalent), `db_size_complexity`.
 - Produce a `DBConversionProfile`: conversion-difficulty grade (à la Ora2Pg
   A–C), man-day estimate, manual-review object list, blockers.
-- AI-assisted conversion (via our LLM/Agent): rule engine converts first,
-  LLM handles stored procedures/triggers, **with a quality score** (à la
+- AI-assisted conversion (via our MigraQ/Agent): rule engine converts first,
+  MigraQ handles stored procedures/triggers, **with a quality score** (à la
   DMS SC); flows back into `codeintel.py` to influence `migration_pattern`
   (hard DB conversion → replatform/refactor rather than direct rehost).
 - **Reverse replication** (à la GCP DMS): keep a write-back channel during
@@ -237,7 +237,7 @@ coverage blind spot; scope depends on customer source availability.
 **Source**: AWS CAF MRA (24 readiness-area heatmap); Azure CAF
 (Strategy→Plan→Ready→Adopt→Govern); GCP CAF (Learn/Lead/Scale/Secure +
 Assess→Plan→Deploy→Optimize).
-**Gap**: we have `doctor` (**tool-self** readiness: config/LLM/claude),
+**Gap**: we have `doctor` (**tool-self** readiness: config/MigraQ/claude),
 not **estate readiness** ("is this wave actually safe to cut?").
 **Fusion**: portfolio readiness scorecard, per wave:
 - LZ readiness (F8), DB conversion completeness (F5), code refactor

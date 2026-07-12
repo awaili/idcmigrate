@@ -3,7 +3,7 @@
 A robust system to assist migrating an IDC (15K+ servers, 200K+ cores) to
 Tencent Cloud. Accessible from **web** and **CLI**, with two AI layers:
 
-- **LLM layer** — local gateway (`glm-5.2:cloud`) for match explanations,
+- **MigraQ layer** — local gateway (`glm-5.2:cloud`) for match explanations,
   RAG Q&A over the inventory, wave briefs, right-sizing.
 - **Agent layer** — the `claude` CLI as a subprocess for agentic tasks:
   generate Terraform, draft runbooks, verify SG equivalence, run pre-flight
@@ -65,7 +65,7 @@ python -m idc.cli.main ask "which servers run mysql and what do they map to?"
 python -m idc.cli.main agent "draft a terraform module for the LZ VPC" --stream
 python -m idc.cli.main code profiles               # code profiles from executor
 python -m idc.cli.main code scan --app orders --repo git@gitlab:t/orders.git
-python -m idc.cli.main doctor          # check config / LLM / claude
+python -m idc.cli.main doctor          # check config / MigraQ / claude
 
 # Web
 python -m idc.cli.main serve --port 8010   # → http://localhost:8010
@@ -110,7 +110,7 @@ grouping, so infra hosts aren't duplicated into their app's wave).
 ## Configuration
 
 All settings are env-driven (`.env.example`):
-- `IDC_LLM_BASE` / `IDC_LLM_MODEL` — LLM gateway (default local Ollama-fronted
+- `IDC_LLM_BASE` / `IDC_LLM_MODEL` — MigraQ gateway (default local Ollama-fronted
   `glm-5.2:cloud`). `IDC_LLM_ENABLED=false` forces rule-only.
 - `IDC_CLAUDE_BIN` / `IDC_CLAUDE_DEFAULT_MODE` — Claude Code agent.
 - `IDC_EXECUTOR_URL` / `IDC_EXECUTOR_TOKEN` / `IDC_EXECUTOR_ENABLED` — external
@@ -162,7 +162,7 @@ python -m pytest tests/ -q     # 12 tests, no network/subprocess
   DictCursor, autocommit) supports multi-writer / concurrent agent execution.
 - Ingest is per-source and parallelizable; adapters page through APIs
   (`IDC_SERVICENOW_LIMIT`, Zabbix batched `host.get`).
-- The LLM RAG retriever (`idc/llm/client.py::_retrieve`) is keyword-based —
+- The MigraQ RAG retriever (`idc/llm/client.py::_retrieve`) is keyword-based —
   swap for a vector store at 15K scale.
 - Agent context is capped at 200 servers (`build_context`); use
   `--focus`/`focus_server_ids` to scope per task.

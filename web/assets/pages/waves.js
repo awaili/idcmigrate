@@ -107,7 +107,7 @@ async function assessWave(id){
         <div><div class="muted" style="font-size:11px">cutover</div>${list(rb.cutover)}</div>
         <div><div class="muted" style="font-size:11px">rollback</div>${list(rb.rollback)}</div>
       </div>
-      ${r.ok?'':`<div class="ev-err" style="margin-top:4px">LLM unavailable: ${esc(r.error||'')} — deterministic risk score above is still valid.</div>`}`;
+      ${r.ok?'':`<div class="ev-err" style="margin-top:4px">MigraQ unavailable: ${esc(r.error||'')} — deterministic risk score above is still valid.</div>`}`;
   }catch(e){ out.innerHTML='<span class="ev-err">Error: '+esc(e)+'</span>'; }
 }
 

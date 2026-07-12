@@ -12,13 +12,13 @@ async function proposePlan(){
   const mw = $('planMaxWaves').value.trim();
   const body = {demand, scope:'all'};
   if(mw && Number(mw) > 0) body.max_waves = Number(mw);
-  $('planOut').innerHTML = '<span class="spinner"></span> asking LLM to design a policy…';
+  $('planOut').innerHTML = '<span class="spinner"></span> asking MigraQ to design a policy…';
   let r; try{
     r = await api('/plan/propose', {method:'POST', headers:{'content-type':'application/json'},
               body:JSON.stringify(body)});
   }catch(e){ $('planOut').innerHTML = '<span class="ev-err">Error: '+esc(e)+'</span>'; return; }
   if(!r.ok){
-    $('planOut').innerHTML = `<span class="ev-err">LLM failed: ${esc((r.errors||[]).join('; '))||esc(r.raw||'')}</span>`;
+    $('planOut').innerHTML = `<span class="ev-err">MigraQ failed: ${esc((r.errors||[]).join('; '))||esc(r.raw||'')}</span>`;
     return;
   }
   _proposedWaves = r.waves || [];
@@ -47,7 +47,7 @@ async function proposePlan(){
   // first proposal was already within cap (or no cap was set).
   const revHtml = revs.length ? `
     <details class="mcard" style="margin:6px 0;padding:6px 10px">
-      <summary class="muted" style="cursor:pointer">LLM revision trail — ${revs.length} round(s)${cap?` · cap ${cap}`:''}</summary>
+      <summary class="muted" style="cursor:pointer">MigraQ revision trail — ${revs.length} round(s)${cap?` · cap ${cap}`:''}</summary>
       <div style="margin-top:4px">
         ${revs.map(rv=>{
           const before = rv.waves_before==null?'?':rv.waves_before;

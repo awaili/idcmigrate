@@ -22,7 +22,7 @@ import httpx
 from ..config import Settings, get_settings
 from ..core.models import ALL_PATTERNS_7R, CodeProfile, Match, Server, Wave, Workload
 
-UNAVAILABLE = "[LLM unavailable — rule-based result only]"
+UNAVAILABLE = "[MigraQ unavailable — rule-based result only]"
 
 
 SEVEN_R_SYSTEM = """You are a cloud-migration strategist for Tencent Cloud. After resources are
@@ -420,7 +420,7 @@ class LLMClient:
         try:
             return fn()
         except Exception as e:
-            return f"{fallback} (LLM error: {e!r})"
+            return f"{fallback} (MigraQ error: {e!r})"
 
     # -- migration helpers ------------------------------------------------
     def explain_match(self, server: Server, match: Match) -> str:
@@ -446,7 +446,7 @@ class LLMClient:
     def ask(self, question: str, servers: List[Server],
             matches: Optional[List[Match]] = None, k: int = 30) -> str:
         return self._safe(lambda: self._ask(question, servers, matches, k),
-                          fallback="(could not answer — LLM unavailable)")
+                          fallback="(could not answer — MigraQ unavailable)")
 
     def _ask(self, question: str, servers: List[Server],
              matches: Optional[List[Match]], k: int) -> str:
@@ -474,7 +474,7 @@ class LLMClient:
         result, so callers always get *an* answer)."""
         from ..core.query import INTENTS, estate_query
         fallback = {"ok": False, "intent": None, "params": {}, "result": None,
-                    "answer": "(could not answer — LLM unavailable)"}
+                    "answer": "(could not answer — MigraQ unavailable)"}
         if not self.settings.llm_enabled:
             return fallback
         # call 1: classify the question into an intent + params
@@ -514,7 +514,7 @@ class LLMClient:
     def summarize_wave(self, wave: Wave, servers: List[Server],
                        matches: List[Match]) -> str:
         return self._safe(lambda: self._summarize_wave(wave, servers, matches),
-                          fallback="(wave summary unavailable — LLM error)")
+                          fallback="(wave summary unavailable — MigraQ error)")
 
     def _summarize_wave(self, wave: Wave, servers: List[Server],
                         matches: List[Match]) -> str:
@@ -556,7 +556,7 @@ class LLMClient:
             "go_no_go": None, "runbook": None, "summary": "",
         }
         if not self.settings.llm_enabled:
-            result["error"] = "LLM disabled (risk score still returned)"
+            result["error"] = "MigraQ disabled (risk score still returned)"
             return result
         try:
             raw = self.chat([
@@ -564,11 +564,11 @@ class LLMClient:
                 {"role": "user", "content": _assess_wave_context(wave, servers, matches, basis)},
             ])
         except Exception as e:
-            result["error"] = f"LLM error: {e!r}"
+            result["error"] = f"MigraQ error: {e!r}"
             return result
         obj = _extract_json(raw)
         if not obj:
-            result["error"] = "LLM output not valid JSON"
+            result["error"] = "MigraQ output not valid JSON"
             result["raw"] = raw[:800]
             return result
         gng = str(obj.get("go_no_go", "")).strip().lower()
@@ -606,7 +606,7 @@ class LLMClient:
         """
         if not self.settings.llm_enabled:
             return {"ok": False, "overall": None, "findings": [],
-                    "error": "LLM disabled"}
+                    "error": "MigraQ disabled"}
         try:
             raw = self.chat([
                 {"role": "system", "content": REVIEW_SYSTEM},
@@ -615,11 +615,11 @@ class LLMClient:
             ])
         except Exception as e:
             return {"ok": False, "overall": None, "findings": [],
-                    "error": f"LLM error: {e!r}"}
+                    "error": f"MigraQ error: {e!r}"}
         obj = _extract_json(raw)
         if not obj:
             return {"ok": False, "overall": None, "findings": [],
-                    "error": "LLM output not valid JSON", "raw": raw[:800]}
+                    "error": "MigraQ output not valid JSON", "raw": raw[:800]}
         overall = str(obj.get("overall", "")).strip().lower()
         if overall not in ("sound", "needs-work", "risky"):
             overall = "needs-work"
@@ -636,7 +636,7 @@ class LLMClient:
 
     def right_size(self, server: Server, match: Match) -> str:
         return self._safe(lambda: self._right_size(server, match),
-                          fallback="(right-size unavailable — LLM error)")
+                          fallback="(right-size unavailable — MigraQ error)")
 
     def _right_size(self, server: Server, match: Match) -> str:
         sys = ("You are a capacity planner. Given observed utilization and the "
@@ -664,17 +664,17 @@ class LLMClient:
         to the rule match. Advisory only; never changes the stored Match.
         """
         if not self.settings.llm_enabled:
-            return {"ok": False, "verdict": "", "error": "LLM disabled"}
+            return {"ok": False, "verdict": "", "error": "MigraQ disabled"}
         try:
             raw = self.chat([
                 {"role": "system", "content": AUDIT_SYSTEM},
                 {"role": "user", "content": _audit_context(server, match, profile)},
             ])
         except Exception as e:
-            return {"ok": False, "verdict": "", "error": f"LLM error: {e!r}", "raw": ""}
+            return {"ok": False, "verdict": "", "error": f"MigraQ error: {e!r}", "raw": ""}
         obj = _extract_json(raw)
         if not obj:
-            return {"ok": False, "verdict": "", "error": "LLM output not valid JSON",
+            return {"ok": False, "verdict": "", "error": "MigraQ output not valid JSON",
                     "raw": raw[:800]}
         v = str(obj.get("verdict", "")).strip().lower()
         if v not in ("keep", "change", "review"):
@@ -705,18 +705,18 @@ class LLMClient:
         """
         if not self.settings.llm_enabled:
             return {"ok": False, "app_id": app_id, "strategy": "",
-                    "error": "LLM disabled"}
+                    "error": "MigraQ disabled"}
         ctx = _seven_r_context(app_id, servers, workloads, matches, profiles or [])
         try:
             raw = self.chat([{"role": "system", "content": SEVEN_R_SYSTEM},
                              {"role": "user", "content": ctx}])
         except Exception as e:
             return {"ok": False, "app_id": app_id, "strategy": "",
-                    "error": f"LLM error: {e!r}", "raw": ""}
+                    "error": f"MigraQ error: {e!r}", "raw": ""}
         obj = _extract_json(raw)
         if not obj:
             return {"ok": False, "app_id": app_id, "strategy": "",
-                    "error": "LLM output was not valid JSON", "raw": raw[:800]}
+                    "error": "MigraQ output was not valid JSON", "raw": raw[:800]}
         strat = str(obj.get("strategy", "")).strip().lower()
         if strat not in ALL_PATTERNS_7R:
             return {"ok": False, "app_id": app_id, "strategy": "",

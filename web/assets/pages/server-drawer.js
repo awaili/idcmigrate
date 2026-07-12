@@ -95,7 +95,7 @@ function openServer(id){
         ${kv('Rule', m.rationale?esc(m.rationale):'-')}
       </div>
       ${_codeSection(s.code)}
-      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">LLM explain match</button><button onclick="rightSize('${s.id}')">right-size</button><button onclick="drawerAudit('${s.id}')">audit target</button><button onclick="setWarranty('${s.id}')">set warranty</button></div>
+      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">MigraQ explain match</button><button onclick="rightSize('${s.id}')">right-size</button><button onclick="drawerAudit('${s.id}')">audit target</button><button onclick="setWarranty('${s.id}')">set warranty</button></div>
       <pre id="dExplain" style="margin-top:10px"></pre>`;
     openDrawer();
   }).catch(e=>{ $('dTitle').textContent='Error'; $('dBody').innerHTML='<span class="ev-err">'+esc(String(e))+'</span>'; openDrawer(); });
@@ -106,7 +106,7 @@ document.addEventListener('keydown', e=>{ if(e.key==='Escape' && $('drawer').cla
 async function explainServer(id){ $('dExplain').innerHTML='<span class="spinner"></span>'; try{ const r=await api('/explain',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({server_id:id})}); $('dExplain').textContent=r.explanation; }catch(e){ $('dExplain').textContent='Error: '+e; } }
 async function rightSize(id){ $('dExplain').innerHTML='<span class="spinner"></span>'; try{ const r=await api('/right-size',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({server_id:id})}); $('dExplain').textContent=r.advice; }catch(e){ $('dExplain').textContent='Error: '+e; } }
 async function drawerSevenR(appId){
-  $('dExplain').innerHTML = `<span class="spinner"></span> asking the LLM for a 7R strategy for ${esc(appId)}…`;
+  $('dExplain').innerHTML = `<span class="spinner"></span> asking the MigraQ for a 7R strategy for ${esc(appId)}…`;
   try{
     const r = await api('/strategy', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({app_id:appId})});
     if(!r.ok){ $('dExplain').innerHTML = `<span class="ev-err">7R failed: ${esc(r.error||'unknown')}</span>`; return; }

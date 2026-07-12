@@ -96,7 +96,7 @@ async function assignStrategy(appId){
   const out = $('srOut');
   if(!app_id){ out.innerHTML = '<span class="ev-err">enter an app_id first</span>'; return; }
   const apply = $('srApply') && $('srApply').checked;
-  out.innerHTML = `<span class="spinner"></span> asking the LLM for a 7R strategy for ${esc(app_id)}…`;
+  out.innerHTML = `<span class="spinner"></span> asking the MigraQ for a 7R strategy for ${esc(app_id)}…`;
   let r; try{
     r = await api('/strategy', {method:'POST', headers:{'content-type':'application/json'},
               body:JSON.stringify({app_id, apply})});
@@ -149,7 +149,7 @@ async function assignStrategyAll(){
 function _renderStrategy(r, apply){
   if(!r || !r.ok){
     return `<span class="ev-err">7R assignment failed: ${esc((r&&r.error)||'unknown')}</span>`
-      + (r&&r.raw ? `<details class="mcard" style="margin-top:4px;padding:4px 8px"><summary class="muted">raw LLM output</summary><pre>${esc((r.raw||'').slice(0,800))}</pre></details>` : '');
+      + (r&&r.raw ? `<details class="mcard" style="margin-top:4px;padding:4px 8px"><summary class="muted">raw MigraQ output</summary><pre>${esc((r.raw||'').slice(0,800))}</pre></details>` : '');
   }
   const kc = (r.key_changes||[]).map(k=>`<li>${esc(k)}</li>`).join('');
   const applied = r.applied===true ? `<span style="color:var(--green)">✓ written to app_strategies</span>`

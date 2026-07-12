@@ -125,7 +125,7 @@ The headline P0. Build on P0a/P0b.
     region / product / 6R-strategy; produce `annual_savings`,
     `per_server`, `per_strategy` arrays.
   - `what_if(servers, matches, prices, region=None, sizing=None,
-    byol=None) -> Dict` — the pure function the F3 LLM will call; returns
+    byol=None) -> Dict` — the pure function the F3 MigraQ will call; returns
     the delta vs the current estimate without re-running ingest.
 - `idc/core/__init__.py::rebuild` — after `match_servers`, call
   `estimate_server` for each and `Store.upsert_cost`. Set
@@ -133,7 +133,7 @@ The headline P0. Build on P0a/P0b.
 - Tag-driven retain/retire: `idc/core/codeintel.py::non_migrating_servers`
   (L82) already honors `AppStrategy`. Wire a tag convention
   `idc:retain` / `idc:retire` (read from `Server.tags`) into the
-  strategies overlay so operators can mark hosts without an LLM call
+  strategies overlay so operators can mark hosts without a MigraQ call
   (à la Azure `AzM.MigrationIntent`). Add a helper
   `strategies_from_tags(servers)`.
 - Backend `idc/backend/app.py` (new section after "7R strategy", ~L860):
@@ -262,7 +262,7 @@ Reuses F2's `cost.what_if` + match pure functions.
 - `idc/llm/planner.py` (or `client.py`) — register what-if tools the
   agent can call: `cost_what_if(region, scope)`, `right_size(server_id,
   strategy)`, `re_region(server_id, region)`. Each returns a structured
-  delta the LLM narrates. The LLM/agent layer already exists; this only
+  delta the MigraQ narrates. The MigraQ/agent layer already exists; this only
   adds tool definitions.
 - Backend: `POST /api/cost/what-if` (already in F2) — expose it to the
   `copilot` tab as a tool the agent uses; add a `copilot`-tab "What-if"
@@ -332,8 +332,8 @@ confirm-gate, without a repo URL.
 - **Tests first**: each F-item's DoD is a passing `tests/test_<feature>.py`
   following the existing `monkeypatch` + `TestClient` + pure-function
   patterns (see `test_codeintel.py` / `test_executor_endpoints.py`).
-- **No LLM in the loop for deterministic work**: F1/F2/F4/F6/F7/F10 are
-  deterministic (rules + telemetry + state machine); the LLM/agent only
+- **No MigraQ in the loop for deterministic work**: F1/F2/F4/F6/F7/F10 are
+  deterministic (rules + telemetry + state machine); the MigraQ/agent only
   drives F3 (what-if narration), F5 (DB conversion fallback), F8 (Terraform
   emit), F9 (scaffold gen). Keeps the copilot reproducible and cheap.
 - **Dep graph**: P0 → {F1, F4} ‖ F2; F2 → F3; F6 → F7; F5 ‖ F3 (both after

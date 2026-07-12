@@ -179,9 +179,9 @@ def server(sid: str):
 # matching + waves
 # ---------------------------------------------------------------------------
 @app_cli.command()
-def match(explain: bool = typer.Option(False, "--explain", help="Add LLM explanation per match"),
-          top: int = typer.Option(0, "--top", help="Only explain top N (LLM calls cost)")):
-    """List server→target matches; optionally LLM-explain each."""
+def match(explain: bool = typer.Option(False, "--explain", help="Add MigraQ explanation per match"),
+          top: int = typer.Option(0, "--top", help="Only explain top N (MigraQ calls cost)")):
+    """List server→target matches; optionally MigraQ-explain each."""
     st = _store()
     servers = {s.id: s for s in st.list_servers()}
     matches = st.list_matches()
@@ -224,16 +224,16 @@ def plan_llm(demand: str = typer.Argument(..., help="Natural-language wave-plan 
              role: Optional[str] = None, env: Optional[str] = None,
              target: Optional[str] = None, q: Optional[str] = None,
              max_waves: Optional[int] = typer.Option(None, "--max-waves",
-                help="hard cap on total instantiated waves; if exceeded the LLM is re-prompted to revise. Also parsed from the demand (e.g. '最多10个wave')"),
+                help="hard cap on total instantiated waves; if exceeded the MigraQ is re-prompted to revise. Also parsed from the demand (e.g. '最多10个wave')"),
              apply: bool = typer.Option(False, "--apply", help="persist the plan (replaces waves)"),
              fmt: str = typer.Option("table", "--format", "-f", help="table|json")):
-    """Build a wave plan from a natural-language demand via the LLM.
+    """Build a wave plan from a natural-language demand via the MigraQ.
 
-    The LLM produces a wave POLICY (a few stages); the deterministic engine
+    The MigraQ produces a wave POLICY (a few stages); the deterministic engine
     instantiates it over the estate. Validated before optional --apply.
 
     --max-waves enforces a cap on the final wave count: if the engine produces
-    more waves than the cap, the LLM is re-prompted (up to 2 rounds) to revise
+    more waves than the cap, the MigraQ is re-prompted (up to 2 rounds) to revise
     the policy. The cap is also auto-parsed from phrases like "最多10个wave".
 
     Example:
@@ -259,7 +259,7 @@ def plan_llm(demand: str = typer.Argument(..., help="Natural-language wave-plan 
         scope_ids = set(st.query_server_ids(f))
         console.print(f"[dim]scoped to {len(scope_ids)} filtered servers[/dim]")
     cap_note = f", cap={max_waves}" if max_waves else ""
-    console.print(f"[dim]asking LLM to design a policy for {len(servers if scope_ids is None else scope_ids)} servers{cap_note}…[/dim]")
+    console.print(f"[dim]asking MigraQ to design a policy for {len(servers if scope_ids is None else scope_ids)} servers{cap_note}…[/dim]")
     res = get_planner().propose(demand, servers, wls, matches, scope_ids,
                                 max_waves=max_waves, profiles=profiles,
                                 strategies=strategies)
@@ -324,7 +324,7 @@ def ask(question: str = typer.Argument(..., help="Question over the inventory"))
 
     Grounded: the question is classified into an intent, a deterministic engine
     computes the answer (deps, what-if, riskiest waves, aggregates, retain/retire,
-    server search), then the LLM narrates it. Falls back to keyword RAG if the
+    server search), then the MigraQ narrates it. Falls back to keyword RAG if the
     grounded path fails. Try: 'what if app-X is delayed?', 'which are the
     riskiest waves?', 'how many prod servers are in cutover?'.
     """
@@ -349,7 +349,7 @@ def ask(question: str = typer.Argument(..., help="Question over the inventory"))
 
 @app_cli.command()
 def explain(sid: str):
-    """LLM-explain the match for one server."""
+    """MigraQ-explain the match for one server."""
     st = _store()
     s = st.get_server(sid)
     if not s:
@@ -411,7 +411,7 @@ def wave_assess(wave_id: str):
 
     The risk score/level/factors are deterministic (reproducible); the
     go/no-go + runbook (pre_checks / cutover / rollback) + summary are
-    LLM-generated, grounded in the wave's members + targets + code profiles.
+    MigraQ-generated, grounded in the wave's members + targets + code profiles.
     """
     st = _store()
     w = next((x for x in st.list_waves() if x.id == wave_id), None)
@@ -439,7 +439,7 @@ def wave_assess(wave_id: str):
     if r.get("summary"):
         console.print(f"[bold]summary:[/bold] {r['summary']}")
     if not r.get("ok"):
-        console.print(f"[yellow](LLM unavailable: {r.get('error')} — risk score above is still valid)[/yellow]")
+        console.print(f"[yellow](MigraQ unavailable: {r.get('error')} — risk score above is still valid)[/yellow]")
     st.close()
 
 
@@ -486,10 +486,10 @@ def strategy(app_id: str = typer.Argument(..., help="app_id to assign a 7R strat
              all: bool = typer.Option(False, "--all", help="run for every app in the workloads graph"),
              apply: bool = typer.Option(False, "--apply", help="persist the chosen strategy into the app's CodeProfile.migration_pattern"),
              fmt: str = typer.Option("table", "--format", "-f", help="table|json")):
-    """Assign a 7R migration strategy (6R + rehost-container) per app via the LLM.
+    """Assign a 7R migration strategy (6R + rehost-container) per app via the MigraQ.
 
     Runs after reconsolidate: takes an app's consolidated context (servers,
-    workload/deps, matched Tencent targets, code profile) and asks the LLM to
+    workload/deps, matched Tencent targets, code profile) and asks the MigraQ to
     pick one of rehost / rehost-container / replatform / refactor / repurchase
     / retain / retire, with rationale + target + effort + key changes.
 
@@ -875,7 +875,7 @@ def executor_mock(host: str = "0.0.0.0", port: int = 8090):
 
 @app_cli.command()
 def doctor():
-    """Check config, DB, LLM gateway, and claude CLI availability."""
+    """Check config, DB, MigraQ gateway, and claude CLI availability."""
     s = get_settings()
     console.print(f"[bold]config[/bold]")
     console.print(f"  db           {s.db_url}")
@@ -883,7 +883,7 @@ def doctor():
     console.print(f"  zabbix       {'online' if s.has_zabbix() else 'fixture'}  path={s.zbx_path}")
     console.print(f"  prometheus   {'online' if s.has_prometheus() else 'fixture'}  path={s.prom_path}")
     console.print(f"  rvtools      {s.rvtools_path}")
-    console.print(f"  llm          {s.llm_base} model={s.llm_model} enabled={s.llm_enabled}")
+    console.print(f"  migraq       {s.llm_base} model={s.llm_model} enabled={s.llm_enabled}")
     console.print(f"  claude       bin={s.claude_bin} default_mode={s.claude_default_mode}")
     console.print(f"  executor     {s.executor_url or '(not configured)'}  "
                   f"enabled={s.executor_enabled}  token={'set' if s.executor_token else 'unset'}")
@@ -903,9 +903,9 @@ def doctor():
     console.print(f"  claude bin   {'OK' if shutil.which(s.claude_bin) else 'MISSING'}")
     try:
         r = httpx.get(f"{s.llm_base}/api/tags", timeout=5)
-        console.print(f"  llm gateway  OK ({r.status_code})")
+        console.print(f"  migraq gateway OK ({r.status_code})")
     except Exception as e:
-        console.print(f"  llm gateway  FAIL ({e!r})")
+        console.print(f"  migraq gateway FAIL ({e!r})")
     st = _store()
     console.print(f"  db           OK servers={st.count_servers()}")
     st.close()

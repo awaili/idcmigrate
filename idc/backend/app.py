@@ -307,7 +307,7 @@ class PlanApplyReq(BaseModel):
 
 @app.post("/api/plan/propose")
 def plan_propose(req: PlanProposeReq):
-    """Ask the LLM for a wave policy from the demand, instantiate it (dry-run).
+    """Ask the MigraQ for a wave policy from the demand, instantiate it (dry-run).
     Does NOT persist — call /api/plan/apply to save."""
     from ..core.llm_plan import validate_plan
     from ..llm import get_planner
@@ -976,7 +976,7 @@ def wave_assess(req: ExplainReq):
     generic). Returns {ok, risk_score, risk_level, risk_factors, signals,
     go_no_go, runbook{pre_checks,cutover,rollback}, summary}. The risk score /
     level / factors are deterministic (reproducible); the runbook + go/no-go +
-    summary are LLM-generated. On LLM failure the deterministic risk is still
+    summary are MigraQ-generated. On MigraQ failure the deterministic risk is still
     returned."""
     from ..core.models import Wave
     w = next((x for x in STORE.list_waves() if x.id == req.server_id), None)
@@ -1045,7 +1045,7 @@ class StrategyReq(BaseModel):
 @app.post("/api/strategy")
 def assign_strategy(req: StrategyReq):
     """Assign a 7R migration strategy (6R + rehost-container) to one app via the
-    LLM, given its reconsolidated context. Optionally persist into the
+    MigraQ, given its reconsolidated context. Optionally persist into the
     ``app_strategies`` table (separate from CodeProfile — the executor's scan
     pattern is NOT overwritten). The wave planners read app_strategies as a 7R
     overlay, so retain/retire then drive wave exclusion on the next Rebuild /

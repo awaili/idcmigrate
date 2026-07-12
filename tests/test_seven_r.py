@@ -144,7 +144,7 @@ def test_seven_r_strategy_llm_exception_degrades():
     with patch.object(c, "chat", side_effect=RuntimeError("gateway down")):
         r = c.seven_r_strategy("app-1", [s], wls, [], [prof])
     assert r["ok"] is False
-    assert "LLM error" in r["error"]
+    assert "MigraQ error" in r["error"]
 
 
 # ---------------------------------------------------------------------------

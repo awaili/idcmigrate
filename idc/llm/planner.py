@@ -223,7 +223,7 @@ class Planner:
         obj = _extract_json(raw)
         if obj is None:
             return {"policy": None, "waves": None, "raw": raw,
-                    "errors": ["LLM output was not valid JSON; no policy produced."],
+                    "errors": ["MigraQ output was not valid JSON; no policy produced."],
                     "warnings": [], "summary": summary, "waves_count": None,
                     "revisions": [], "max_waves": cap, "engine_capped": False}
         policy = WavePolicy.from_dict(obj)
@@ -369,7 +369,7 @@ class Planner:
             {"role": "user", "content": user},
         ])
         if not raw or raw == UNAVAILABLE:
-            return None, raw or "", ["LLM unavailable; cannot revise policy."]
+            return None, raw or "", ["MigraQ unavailable; cannot revise policy."]
         obj = _extract_json(raw)
         if obj is None:
             return None, raw, ["revision output was not valid JSON; kept prior policy."]
