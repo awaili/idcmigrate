@@ -10,11 +10,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import Response as StarletteResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -39,6 +43,65 @@ LLM = get_client(settings)
 _EVENT_BUS: Dict[str, "asyncio.Queue"] = {}
 
 app = FastAPI(title="idc-migrate", version="0.1.0")
+
+# ---------------------------------------------------------------------------
+# Web auth — shared-password login gate over the UI + API.
+# ---------------------------------------------------------------------------
+# A single shared password (IDC_WEB_PASSWORD env, or a DB system_config
+# `web_password` override set at runtime). When no password is configured, auth
+# is OFF and the app is open (backwards-compatible + lets the test suite run).
+# When a password is set, every non-public request needs EITHER a valid session
+# cookie (browser login) OR a valid executor bearer token (so the external
+# executor's callbacks + context pulls still work). Public: /login, /logout,
+# /executor (the contract page), /assets/*.
+_SESSION_SECRET = settings.web_session_secret or secrets.token_hex(32)
+
+
+def _web_auth_password() -> str:
+    """The active login password: DB override if set, else env. '' = auth off."""
+    try:
+        db = STORE.get_config("web_password")
+    except Exception:
+        db = None
+    return db or settings.web_password
+
+
+def _executor_bearer_ok(authorization: str) -> bool:
+    tok = _executor_settings().executor_token
+    if not tok or not authorization or not authorization.lower().startswith("bearer "):
+        return False
+    return authorization.split(" ", 1)[1].strip() == tok
+
+
+# paths that stay open when auth is on
+_PUBLIC_PREFIXES = ("/assets/",)
+_PUBLIC_PATHS = {"/login", "/logout", "/executor", "/favicon.ico"}
+
+
+async def _auth_dispatch(request: Request, call_next):
+    pw = _web_auth_password()
+    if not pw:  # auth disabled -> pass through
+        return await call_next(request)
+    path = request.url.path
+    if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+        return await call_next(request)
+    if request.session.get("authed"):
+        return await call_next(request)
+    if _executor_bearer_ok(request.headers.get("authorization", "")):
+        return await call_next(request)
+    # denied: JSON for API/WS, redirect for pages
+    if path.startswith("/api/") or path.startswith("/ws/"):
+        return JSONResponse({"detail": "authentication required"}, status_code=401)
+    return RedirectResponse("/login", status_code=303)
+
+
+# Order matters: Session must be OUTERMOST so request.session is populated
+# before _auth_dispatch reads it. add_middleware prepends, so add Auth first,
+# Session second (Session ends up outermost).
+app.add_middleware(BaseHTTPMiddleware, dispatch=_auth_dispatch)
+app.add_middleware(SessionMiddleware, secret_key=_SESSION_SECRET,
+                   session_cookie="idc_sess", same_site="lax", https_only=False,
+                   max_age=60 * 60 * 24 * 30)
 
 # ---------------------------------------------------------------------------
 # Live executor config — operator-editable at runtime via /api/executor/config
@@ -1787,6 +1850,75 @@ def _executor_spec():
     if p.exists():
         return FileResponse(str(p), media_type="text/html")
     return JSONResponse({"error": "web/executor.html not built yet"}, status_code=404)
+
+
+# ---------------------------------------------------------------------------
+# Web auth — login / logout / change password
+# ---------------------------------------------------------------------------
+def _login_page(error: str = "") -> str:
+    msg = f'<p class="err">{error}</p>' if error else '<p class="hint">Enter the operator password to access idc-migrate.</p>'
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>idc-migrate · login</title>
+<style>
+:root{{--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--red:#f85149}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+display:flex;align-items:center;justify-content:center;min-height:100vh}}
+.card{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:28px 28px 24px;width:340px;max-width:90vw}}
+h1{{font-size:18px;margin:0 0 2px}} .sub{{color:var(--muted);margin:0 0 16px;font-size:12.5px}}
+label{{display:block;margin:10px 0 4px;font-size:12.5px;color:var(--muted)}}
+input{{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--fg);
+border-radius:6px;padding:9px 10px;font-size:14px;outline:none}}
+input:focus{{border-color:var(--accent)}}
+button{{margin-top:16px;width:100%;background:var(--accent);color:#0d1117;border:0;border-radius:6px;
+padding:10px;font-size:14px;font-weight:600;cursor:pointer}}
+button:hover{{filter:brightness(1.08)}} .err{{color:var(--red);font-size:12.5px;margin:0 0 8px}}
+.hint{{color:var(--muted);font-size:12.5px;margin:0 0 8px}}
+</style></head><body>
+<form class="card" method="post" action="/login">
+<h1>idc-migrate</h1><p class="sub">IDC → Tencent Cloud copilot</p>
+{msg}
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autofocus required autocomplete="current-password"/>
+<button type="submit">Log in</button>
+</form></body></html>"""
+
+
+@app.get("/login")
+def login_get():
+    # public (in _PUBLIC_PATHS); serve the form. If auth is off, bounce to /.
+    if not _web_auth_password():
+        return RedirectResponse("/", status_code=303)
+    return HTMLResponse(_login_page())
+
+
+@app.post("/login")
+def login_post(request: Request, password: str = Form(...)):
+    pw = _web_auth_password()
+    if not pw:  # auth off
+        return RedirectResponse("/", status_code=303)
+    if password == pw:
+        request.session["authed"] = True
+        return RedirectResponse("/", status_code=303)
+    return HTMLResponse(_login_page("Wrong password."), status_code=401)
+
+
+@app.post("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
+
+
+@app.post("/api/auth/password")
+def change_password(request: Request, password: str = Form(...)):
+    """Change the login password (requires a logged-in session, which the
+    middleware enforces on /api/*). Persists to system_config so it survives a
+    restart and overrides the env IDC_WEB_PASSWORD."""
+    if not password or len(password) < 4:
+        raise HTTPException(400, "password must be at least 4 characters")
+    STORE.set_config("web_password", password)
+    return {"updated": True}
 
 
 @app.on_event("shutdown")

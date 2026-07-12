@@ -90,6 +90,15 @@ class Settings:
     executor_timeout: int = field(default_factory=lambda: _env_int("IDC_EXECUTOR_TIMEOUT", 600))
     executor_enabled: bool = field(default_factory=lambda: _env_bool("IDC_EXECUTOR_ENABLED", True))
 
+    # web UI password gate. IDC_WEB_PASSWORD = the shared login password; when
+    # empty (and no DB override), auth is OFF and the UI/API are open. A DB
+    # system_config `web_password` override (set at runtime) wins over env.
+    # IDC_WEB_SESSION_SECRET signs the session cookie; empty -> a random secret
+    # generated at startup (sessions then don't survive a restart, which is fine
+    # — the operator just re-logs in).
+    web_password: str = field(default_factory=lambda: _env("IDC_WEB_PASSWORD"))
+    web_session_secret: str = field(default_factory=lambda: _env("IDC_WEB_SESSION_SECRET"))
+
     # F2 — Tencent Cloud pricing source for TCO / business case.
     # IDC_PRICING_URL = public pricing endpoint; empty -> cost.py falls back
     # to a bundled price fixture so the business case still renders out of box.
