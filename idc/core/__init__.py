@@ -18,7 +18,7 @@ from .models import (
     SOURCE_PROMETHEUS, SOURCE_RVTOOLS, SOURCE_SERVICENOW, SOURCE_ZABBIX,
 )
 from .db import Store, open_store
-from .eol import apply_os_eol
+from .eol import apply_os_eol, os_eol_bucket
 from .ingest import all_sources, get_adapter
 from .ingest.netdep import discover_network_deps
 from .ingest.warranty import merge_warranty
@@ -116,6 +116,10 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
         s.sizing_basis = sizing_basis_of(s)
         s.assessment_confidence = assessment_confidence_of(
             s, has_code_profile=any(a in pidx for a in s.app_ids))
+        # data-gap — persist the derived support buckets so the inventory can
+        # facet/filter on them (warranty merge above has filled the raw fields).
+        s.warranty_bucket = warranty_bucket(s)
+        s.os_eol_bucket = os_eol_bucket(s)
     # data-gap — fold hardware warranty / end-of-support onto matching servers
     # (off by default; IDC_WARRANTY_PATH empty -> no-op). Runs before upsert so
     # the merged warranty_status/hardware_eol persist on the first pass and the

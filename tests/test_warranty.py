@@ -247,14 +247,41 @@ def test_backend_put_warranty_persists():
         body = r.json()
         assert body["warranty_status"] == "expired"
         assert body["hardware_eol"] == "2024-03-15"
-        # persisted
+        # B1 gap-actionable — PUT recomputes the derived bucket + persists it
+        assert body["warranty_bucket"] == "expired"
         st = _store()
         s = st.get_server(sid)
         st.close()
         assert s.warranty_status == "expired" and s.hardware_eol == "2024-03-15"
+        assert s.warranty_bucket == "expired"   # persisted, not just computed
         assert warranty_bucket(s, "2026-07-12") == WARRANTY_EXPIRED
     finally:
         _cleanup(wid, sid)
+
+
+def test_persisted_buckets_roundtrip():
+    """B1 gap-actionable — warranty_bucket + os_eol_bucket survive upsert+load."""
+    from idc.core.models import _new_id
+    st = _store()
+    sid = _new_id("srv")
+    try:
+        s = Server(id=sid, hostname="bkt-rt", os="centos", os_version="7",
+                   warranty_status="expired", hardware_eol="2024-01-01",
+                   warranty_bucket="expired", os_eol_bucket="expired")
+        st.upsert_server(s)
+        got = st.get_server(sid)
+        assert got.warranty_bucket == "expired"
+        assert got.os_eol_bucket == "expired"
+        # the GET /servers/{sid} surface prefers the persisted bucket
+        r = client.get(f"/api/servers/{sid}")
+        assert r.status_code == 200
+        assert r.json()["os_eol_bucket"] == "expired"
+    finally:
+        st2 = _store()
+        with st2.tx() as cur:
+            cur.execute(st2._x("DELETE FROM servers WHERE id=?"), (sid,))
+        st2.close()
+        st.close()
 
 
 def test_backend_put_warranty_rejects_bad_status():

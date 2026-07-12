@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS servers (
     assessment_confidence DOUBLE,         -- F4: data-coverage score 0..1
     warranty_status VARCHAR(16),          -- hardware support bucket (active/expiring/expired/unknown)
     hardware_eol    VARCHAR(16),          -- ISO date of hardware end-of-support
+    warranty_bucket VARCHAR(16),          -- derived: active/expiring/expired/unknown (persisted for faceting)
+    os_eol_bucket   VARCHAR(16),          -- derived: active/expiring/expired/unknown (persisted for faceting)
     created_at    VARCHAR(40),
     updated_at    VARCHAR(40),
     KEY idx_srv_role (role),
@@ -320,6 +322,8 @@ ALTER TABLE servers ADD COLUMN IF NOT EXISTS sizing_basis VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS assessment_confidence DOUBLE;
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS warranty_status VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS hardware_eol VARCHAR(16);
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS warranty_bucket VARCHAR(16);
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS os_eol_bucket VARCHAR(16);
 """
 
 
@@ -521,6 +525,7 @@ class Store:
                     "utilization", "source_refs", "status",
                     "sizing_basis", "assessment_confidence",
                     "warranty_status", "hardware_eol",
+                    "warranty_bucket", "os_eol_bucket",
                     "created_at", "updated_at"]
 
     def upsert_server(self, s: Server) -> None:
@@ -536,6 +541,7 @@ class Store:
                          dumps(s.utilization.to_dict()), dumps(s.source_refs),
                          s.status, s.sizing_basis, s.assessment_confidence,
                          s.warranty_status, s.hardware_eol,
+                         s.warranty_bucket, s.os_eol_bucket,
                          s.created_at, s.updated_at))
 
     def _row_to_server(self, r) -> Server:

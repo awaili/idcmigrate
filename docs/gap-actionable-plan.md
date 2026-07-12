@@ -16,13 +16,13 @@ report shows 5591 expired-OS hosts.
 
 ## Blocks
 
-- [ ] **B1 persist derived buckets** — add `warranty_bucket` + `os_eol_bucket`
+- [x] **B1 persist derived buckets** — add `warranty_bucket` + `os_eol_bucket`
   as stored server columns (db schema + ALTER + `_SERVER_COLS` + upsert +
   `_row_to_server`); compute + set them in `rebuild` (after the warranty merge,
   alongside the F4 loop); recompute `warranty_bucket` in
   `PUT /api/servers/{sid}/warranty`. `_server_out` reads the persisted bucket
   (fall back to compute if stale/NULL). Acceptance: rebuild persists non-NULL
-  buckets; a server's `os_eol_bucket` survives a fresh load. Commit: <sha>.
+  buckets; a server's `os_eol_bucket` survives a fresh load. Commit: B1 below.
 - [ ] **B2 inventory facets + quick filters** — `Store._facets` groups by the
   two new columns; `ServerFilter` gains `warranty_bucket` + `os_eol_bucket`
   params + `_filters_sql` clauses; `GET /api/servers` accepts them;

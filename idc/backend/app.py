@@ -95,8 +95,10 @@ def _server_out(s, profiles_by_app=None, strategies_by_app=None):
     d["match"] = m.to_dict() if m else None
     # data-gap — precomputed support buckets so the inventory list + drawer can
     # render warranty / OS-EOL badges without duplicating the EOL table in JS.
-    d["warranty_bucket"] = warranty_bucket(s)
-    d["os_eol_bucket"] = os_eol_bucket(s)
+    # Prefer the persisted bucket (B1 gap-actionable); fall back to computing
+    # for stale rows that predate the column.
+    d["warranty_bucket"] = s.warranty_bucket or warranty_bucket(s)
+    d["os_eol_bucket"] = s.os_eol_bucket or os_eol_bucket(s)
     # code-scan enrichment: only when a profile map is supplied (single-server
     # detail). The paginated list endpoint does NOT pass one, so it stays fast
     # and does not load all profiles per row.
@@ -240,9 +242,11 @@ def put_server_warranty(sid: str, body: dict):
         s.warranty_status = ws
     if "hardware_eol" in body:
         s.hardware_eol = (body.get("hardware_eol") or "").strip()
+    s.warranty_bucket = warranty_bucket(s)   # recompute the derived bucket
     STORE.upsert_server(s)
     return {"server_id": sid, "warranty_status": s.warranty_status,
-            "hardware_eol": s.hardware_eol, "updated": True}
+            "hardware_eol": s.hardware_eol, "warranty_bucket": s.warranty_bucket,
+            "updated": True}
 
 
 @app.get("/api/workloads")

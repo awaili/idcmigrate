@@ -163,6 +163,11 @@ class Server:
     # signal, and the data-gaps "unknown warranty" count. See match.warranty_bucket.
     warranty_status: str = ""       # "" (not assessed) / active / expiring / expired / unknown
     hardware_eol: str = ""           # ISO date YYYY-MM-DD of hardware end-of-support, or ""
+    # derived support buckets, persisted so SQL can facet/filter on them (the
+    # raw values above derive these; rebuild recomputes, the PUT-warranty path
+    # recomputes warranty_bucket). "" = not yet computed (rebuild will fill).
+    warranty_bucket: str = ""        # active / expiring / expired / unknown
+    os_eol_bucket: str = ""          # active / expiring / expired / unknown
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
