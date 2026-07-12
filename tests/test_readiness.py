@@ -52,7 +52,7 @@ def _seed_wave(role="web", app_id="app-rd", stage=STAGE_APP, with_match=True):
     if with_match:
         st.upsert_match(Match(server_id=sid,
                               target=Target(product="CVM", spec="SA5.SMALL2",
-                                            region="ap-shanghai"),
+                                            region="ap-bangkok"),
                               confidence=0.9, method="rule", rationale="x"))
     st.upsert_workload(Workload(app_id=app_id, name=app_id, server_ids=[sid]))
     st.upsert_wave(Wave(id=wid, name=f"RD {host}", stage=stage,

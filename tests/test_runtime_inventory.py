@@ -18,7 +18,7 @@ def _srv(role="db", os_="oracle linux", host="db-oracle-01"):
 
 def _mat(port=1521, product="CVM"):
     return Match(server_id="s1", target=Target(product=product, spec="x",
-                 region="ap-shanghai", extras={"port": port} if port else {}),
+                 region="ap-bangkok", extras={"port": port} if port else {}),
                  confidence=0.7, method="rule", rationale="x")
 
 
@@ -110,7 +110,7 @@ def _seed():
                role="db", os="oracle linux", app_ids=[], sizing_basis="estimated")
     st.upsert_server(s)
     st.upsert_match(Match(server_id=sid, target=Target(product="CVM", spec="SA5.SMALL2",
-                          region="ap-shanghai", extras={"port": 1521}),
+                          region="ap-bangkok", extras={"port": 1521}),
                           confidence=0.7, method="rule", rationale="x"))
     st.close()
     return sid, host

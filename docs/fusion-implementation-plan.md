@@ -269,7 +269,7 @@ Reuses F2's `cost.what_if` + match pure functions.
   panel that calls it directly too.
 - Tests: extend `test_cost.py` for `what_if`; add `test_whatif_tools.py`
   for the agent tool wiring (mock the underlying functions).
-**DoD**: ask the copilot "what if all DBs go to ap-guangzhou?" and get a
+**DoD**: ask the copilot "what if all DBs go to ap-bangkok?" and get a
 cost delta without re-running ingest.
 
 **Phase 2 DoD**: an operator can launch a wave, watch servers advance

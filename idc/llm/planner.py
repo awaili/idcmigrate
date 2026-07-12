@@ -38,7 +38,7 @@ to mean "no constraint"):
   target_products  Tencent products (e.g. ["CDB","TencentDB for Redis"])
   criticalities    e.g. ["high"]
   clusters         e.g. ["cl-db"]
-  regions          e.g. ["ap-shanghai"]
+  regions          e.g. ["ap-bangkok"]
   tags             server must have ANY of these tags
   app_ids          include servers belonging to these apps
   group_by         "none" | "app" | "cluster" | "env" | "region" | "role" | "target"

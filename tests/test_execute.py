@@ -177,7 +177,7 @@ def _make_wave_with_server():
                app_ids=[], sizing_basis="estimated")
     st.upsert_server(s)
     st.upsert_match(Match(server_id=sid, target=Target(product="CVM", spec="SA5.SMALL2",
-                          region="ap-shanghai", extras={"port": 22}), confidence=0.9))
+                          region="ap-bangkok", extras={"port": 22}), confidence=0.9))
     st.upsert_wave(Wave(id=wid, name="pytest-wave", stage="3_application",
                         server_ids=[sid], status="planned"))
     st.close()

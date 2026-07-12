@@ -19,7 +19,7 @@ from idc.core.models import (
 def _match(conf=0.9):
     return Match(server_id="s1",
                  target=Target(product="CVM", spec="SA5.LARGE8",
-                              region="ap-shanghai"),
+                              region="ap-bangkok"),
                  confidence=conf, method="rule", rationale="Oracle DB -> CVM BYOL")
 
 

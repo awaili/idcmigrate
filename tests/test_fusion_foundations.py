@@ -41,7 +41,7 @@ def st():
 # -- model layer (P0a) ------------------------------------------------------
 def test_model_roundtrips():
     ce = CostEstimate(server_id=SID, target_product="CVM", spec="SA5.MEDIUM4",
-                      region="ap-shanghai", monthly_usd=120.5, yearly_usd=1446.0,
+                      region="ap-bangkok", monthly_usd=120.5, yearly_usd=1446.0,
                       basis="measured", pricing_source="public")
     d = ce.to_dict()
     assert d["monthly_usd"] == 120.5
@@ -73,7 +73,7 @@ def test_cost_roundtrip(st):
     st.delete_cost(SID)  # idempotent baseline
     assert st.get_cost(SID) is None
     ce = CostEstimate(server_id=SID, target_product="CDB", spec="mysql-8.32",
-                      region="ap-guangzhou", monthly_usd=88.0, yearly_usd=1056.0,
+                      region="ap-bangkok", monthly_usd=88.0, yearly_usd=1056.0,
                       basis="estimated", pricing_source="contract")
     st.upsert_cost(ce)
     got = st.get_cost(SID)
@@ -82,7 +82,7 @@ def test_cost_roundtrip(st):
     assert got.basis == "estimated" and got.pricing_source == "contract"
     # upsert is idempotent overwrite
     ce2 = CostEstimate(server_id=SID, target_product="CDB", spec="mysql-8.64",
-                       region="ap-guangzhou", monthly_usd=160.0, yearly_usd=1920.0,
+                       region="ap-bangkok", monthly_usd=160.0, yearly_usd=1920.0,
                        basis="measured", pricing_source="public")
     st.upsert_cost(ce2)
     assert st.get_cost(SID).spec == "mysql-8.64" and st.get_cost(SID).monthly_usd == 160.0

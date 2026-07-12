@@ -22,7 +22,7 @@ def _srv(role="", tags=None, sid="s1"):
 
 
 def _mat(server):
-    return Match(server_id=server.id, target=Target(product="CVM", region="ap-shanghai"),
+    return Match(server_id=server.id, target=Target(product="CVM", region="ap-bangkok"),
                  confidence=0.9, method="rule", rationale="x")
 
 
@@ -119,7 +119,7 @@ def _setup_lz_and_workload(app_role="web", app_tag=None):
     st.upsert_server(lz_s)
     st.upsert_server(app_s)
     st.upsert_match(Match(server_id=app_sid, target=Target(product="CVM", spec="SA5.SMALL2",
-                          region="ap-shanghai"), confidence=0.9))
+                          region="ap-bangkok"), confidence=0.9))
     lz_wid = _new_id("wave")
     app_wid = _new_id("wave")
     st.upsert_wave(Wave(id=lz_wid, name="LZ", stage=STAGE_LZ, server_ids=[lz_sid],

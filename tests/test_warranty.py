@@ -78,9 +78,9 @@ def test_estimate_portfolio_eol_premium_only_when_onprem_rate():
     s1 = _srv(hostname="e1", warranty_status="expired")
     s2 = _srv(hostname="e2", warranty_status="active")
     matches = [
-        Match(server_id=s1.id, target=Target(product="CVM", spec="SA5.SMALL2", region="ap-shanghai"),
+        Match(server_id=s1.id, target=Target(product="CVM", spec="SA5.SMALL2", region="ap-bangkok"),
               confidence=0.9, method="rule", rationale="x"),
-        Match(server_id=s2.id, target=Target(product="CVM", spec="SA5.SMALL2", region="ap-shanghai"),
+        Match(server_id=s2.id, target=Target(product="CVM", spec="SA5.SMALL2", region="ap-bangkok"),
               confidence=0.9, method="rule", rationale="x"),
     ]
     # no onprem_rate -> no premium line, savings None
@@ -195,7 +195,7 @@ def _seed_server(warranty_status="", hardware_eol=""):
                warranty_status=warranty_status, hardware_eol=hardware_eol)
     st.upsert_server(s)
     st.upsert_match(Match(server_id=sid,
-                          target=Target(product="CVM", spec="SA5.SMALL2", region="ap-shanghai"),
+                          target=Target(product="CVM", spec="SA5.SMALL2", region="ap-bangkok"),
                           confidence=0.9, method="rule", rationale="x"))
     st.upsert_workload(__import__("idc.core.models", fromlist=["Workload"]).Workload(
         app_id="app-war", name="app-war", server_ids=[sid]))

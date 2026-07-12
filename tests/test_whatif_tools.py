@@ -82,19 +82,19 @@ def test_right_size_as_is_matches_match_server():
 
 def test_re_region_swaps_region_keeps_spec():
     s = _srv(cpu=16, mem=64, cpu_p95=25, mem_p95=30)
-    m = re_region(s, "ap-guangzhou")
-    assert m.target.region == "ap-guangzhou"
-    assert m.target.az == "ap-guangzhou-3"
+    m = re_region(s, "ap-bangkok")
+    assert m.target.region == "ap-bangkok"
+    assert m.target.az == "ap-bangkok-3"
     # spec is preserved (as_is sizing)
     assert m.target.spec == match_server(s, "as_is").target.spec
-    assert "what-if region=ap-guangzhou" in m.rationale
+    assert "what-if region=ap-bangkok" in m.rationale
 
 
 def test_right_size_and_re_region_are_pure_original_untouched():
     s = _srv(cpu=16, mem=64, cpu_p95=25, mem_p95=30)
     base = match_server(s)
     _ = right_size(s, "measured")
-    _ = re_region(s, "ap-guangzhou")
+    _ = re_region(s, "ap-bangkok")
     # base match not mutated by the what-if helpers
     assert base.target.spec == "SA5.4XLARGE32"
     assert base.target.region == "ap-bangkok"
@@ -127,13 +127,15 @@ def test_what_if_region_and_sizing_compose():
     book = load_pricebook(get_settings(), refresh=True)
     s = _srv(cpu=16, mem=64, cpu_p95=25, mem_p95=30)
     m = match_server(s)
-    both = what_if([s], [m], book, region="ap-guangzhou", sizing="measured")
-    reg_only = what_if([s], [m], book, region="ap-guangzhou")
+    both = what_if([s], [m], book, region="ap-bangkok", sizing="measured")
+    reg_only = what_if([s], [m], book, region="ap-bangkok")
     size_only = what_if([s], [m], book, sizing="measured")
-    # compositional: both deltas should both be savings (negative); the
-    # combined alternate must be cheaper than either single override.
+    # Bangkok is the only target region, so a region override is a no-op
+    # (delta 0) and region+sizing == sizing alone. Sizing still saves.
+    assert reg_only["delta"] == 0
+    assert size_only["delta"] < 0
     assert both["delta"] < reg_only["delta"]
-    assert both["delta"] < size_only["delta"]
+    assert both["delta"] == size_only["delta"]
 
 
 def test_what_if_sizing_without_util_is_no_op_delta():
@@ -167,7 +169,7 @@ def _seed_server_with_match(cpu=16, mem=64, cpu_p95=25, mem_p95=30):
     st.upsert_server(s)
     st.upsert_match(Match(server_id=sid,
                           target=Target(product="CVM", spec="SA5.4XLARGE32",
-                                        region="ap-shanghai"),
+                                        region="ap-bangkok"),
                           confidence=0.85, method="rule", rationale="x"))
     st.close()
     return sid
@@ -200,14 +202,15 @@ def test_what_if_re_region_endpoint():
     sid = _seed_server_with_match(cpu_p95=None, mem_p95=None)
     try:
         r = client.post("/api/what-if/re-region",
-                        json={"server_id": sid, "region": "ap-guangzhou"})
+                        json={"server_id": sid, "region": "ap-bangkok"})
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["before"]["region"] == "ap-shanghai"
-        assert body["after"]["region"] == "ap-guangzhou"
+        assert body["before"]["region"] == "ap-bangkok"
+        assert body["after"]["region"] == "ap-bangkok"
         assert body["after"]["spec"] == "SA5.4XLARGE32"   # spec preserved
-        # ap-guangzhou is cheaper than ap-shanghai in the fixture
-        assert body["delta_yearly"] < 0
+        # Bangkok is the only target region, so re-region to ap-bangkok is a
+        # no-op (same region -> delta 0); the endpoint still returns before/after.
+        assert body["delta_yearly"] == 0
     finally:
         _cleanup(sid)
 

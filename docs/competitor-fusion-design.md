@@ -96,8 +96,8 @@ spec requires re-running `match`.
 **Fusion**: wrap `match.py` rule tables + `cost.py` as parameterized pure
 functions (region / sizing-strategy / BYOL as inputs); the MigraQ agent calls
 them for what-if:
-- "If I move all DBs to ap-guangzhou, what's the cost delta?" → agent calls
-  `cost.what_if(region='ap-guangzhou', scope='db')`, returns the delta.
+- "If I move all DBs to ap-bangkok, what's the cost delta?" → agent calls
+  `cost.what_if(region='ap-bangkok', scope='db')`, returns the delta.
 - "Re-right-size this host as-is" → `match.right_size(server_id, strategy='as_is')`.
 **Landing**: `match.py` + `cost.py` (extract pure functions),
 `idc/agent/` (what-if tool set), `llm/planner.py`. Reuses the existing

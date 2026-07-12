@@ -352,7 +352,7 @@ def match_servers(servers: List[Server], sizing_strategy: str = "as_is") -> List
 # F3 — conversational what-if pure functions (no ingest re-run)
 # ---------------------------------------------------------------------------
 # These wrap match_server so the LLM copilot / ``cost.what_if`` can answer
-# "what if I right-size this host?" / "what if I move it to ap-guangzhou?"
+# "what if I right-size this host?" / "what if I re-price it in ap-bangkok?"
 # without re-running ingest. Each returns a NEW Match (the original is
 # untouched) so the caller can diff targets or feed both into cost.what_if
 # for a delta. They are pure: same inputs -> same outputs, no DB, no LLM.
