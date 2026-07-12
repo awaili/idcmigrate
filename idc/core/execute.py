@@ -210,8 +210,19 @@ def default_gates_for(kind: str, server: Optional[Server] = None,
         gates.append({"name": "db-reachable", "kind": "connect", "must_pass": True,
                       "host": host, "port": port or 3306, "timeout": 5})
     gates.append({"name": "app-health", "kind": "app_health_promql", "must_pass": False,
-                  "metric": f"up{{instance=\"{host}\"}}"})
+                  "metric": f"up{{instance=\"{_promql_label(host)}\"}}"})
     return gates
+
+
+def _promql_label(value: str) -> str:
+    """Escape a host/ip for a PromQL ``instance="..."`` label matcher.
+
+    A hostname containing ``"`` / ``\\`` / a newline would otherwise break the
+    query or match unintended series, yielding a false pass/fail on a cutover
+    gate. Per PromQL, escape backslash then the quote, and \\n for newline.
+    """
+    v = value or ""
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def run_validation_gates(job: MigrationJob, settings: Settings,
@@ -279,10 +290,19 @@ def launch_wave(store, wave_id: str, servers: List[Server],
     if not gate["ok"] and enforce_lz_gate:
         raise LZNotReady(gate["blocking_archetypes"])
     gate_note = "" if gate["ok"] else f"LZ gate warning: {gate['reason']}"
+    # idempotency: a server that already has a non-terminal job for this wave
+    # keeps its existing job — re-launching must not create duplicate jobs
+    # (the old code inserted a fresh row per call, accumulating orphans and
+    # duplicating handoff-CSV rows).
+    existing = {j.server_id: j for j in store.list_migration_jobs(wave_id=wave_id)
+                if j.status not in MIGRATION_JOB_TERMINAL}
     out: List[MigrationJob] = []
     for sid in (wave.server_ids or []):
         s = srv_by_id.get(sid)
         if not s:
+            continue
+        if sid in existing:
+            out.append(existing[sid])
             continue
         m = match_by_id.get(sid)
         gates = default_gates_for(kind, server=s, match=m)

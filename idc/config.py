@@ -205,9 +205,16 @@ def load_dotenv(path: Optional[Path] = None) -> None:
             continue
         k, _, v = line.partition("=")
         k, v = k.strip(), v.strip()
-        # strip inline comments only if value is unquoted
-        if v and v[0] not in ('"', "'") and "#" in v:
-            v = v.split("#", 1)[0].strip()
+        # strip inline comments only if value is unquoted. A '#' starts a
+        # comment only when preceded by whitespace — so a password like
+        # ``ab#cd`` is preserved (the old code truncated it to ``ab``).
+        if v and v[0] not in ('"', "'"):
+            i = 0
+            while i < len(v):
+                if v[i] == "#" and (i == 0 or v[i - 1].isspace()):
+                    v = v[:i].strip()
+                    break
+                i += 1
         if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
             v = v[1:-1]
         if k and k not in os.environ:

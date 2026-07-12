@@ -129,6 +129,25 @@ class WavePolicy:
             for dep in s.depends_on:
                 if dep not in known:
                     errs.append(f"stage '{s.label}' depends_on unknown '{dep}'")
+        # cycle check on depends_on — a cyclic policy (A→B→A) would otherwise
+        # pass validation, build a cyclic wave DAG, and crash cap_waves phase 2.
+        adj = {s.label: [d for d in s.depends_on if d in known] for s in self.stages}
+        color = {l: 0 for l in labels}  # 0=white,1=gray,2=black
+
+        def _has_cycle(u: str) -> bool:
+            color[u] = 1
+            for v in adj.get(u, []):
+                if color.get(v, 0) == 1:
+                    return True
+                if color.get(v, 0) == 0 and _has_cycle(v):
+                    return True
+            color[u] = 2
+            return False
+
+        for l in labels:
+            if color[l] == 0 and _has_cycle(l):
+                errs.append(f"cycle in stage depends_on (involving '{l}')")
+                break
         return errs
 
 
@@ -446,9 +465,17 @@ def cap_waves(waves: List[Wave], cap: int) -> Tuple[List[Wave], List[str]]:
     def lvl(wid: str) -> int:
         if wid in level:
             return level[wid]
+        if wid in visiting:
+            # cyclic wave DAG — break the recursion (return 0) instead of
+            # looping forever; validate_plan flags the cycle upstream.
+            return 0
+        visiting.add(wid)
         deps = [d for d in by_id[wid].depends_on if d in ids]
         level[wid] = 0 if not deps else 1 + max(lvl(d) for d in deps)
+        visiting.discard(wid)
         return level[wid]
+
+    visiting: Set[str] = set()
 
     for w in waves:
         lvl(w.id)

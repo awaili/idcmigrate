@@ -190,7 +190,11 @@ class Server:
         d = dict(d)
         disks = [Disk.from_dict(x) for x in d.pop("disks", []) or []]
         util = Utilization.from_dict(d.pop("utilization", {}) or {})
-        return cls(**d, disks=disks, utilization=util)  # type: ignore[arg-type]
+        # filter to known fields so a SELECT * that returns a column added by
+        # a later migration (no matching dataclass field) doesn't raise
+        # TypeError — matches Disk/Workload/etc. from_dict behaviour.
+        keep = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
+        return cls(**keep, disks=disks, utilization=util)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

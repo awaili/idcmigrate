@@ -82,7 +82,7 @@ class ZabbixAdapter(Adapter):
                 "selectTags": ["tag", "value"],
             })
         except Exception as e:
-            fix = self._fixture()
+            fix = self._fixture(settings)
             return IngestResult(assets=fix.assets, mode="fixture",
                                 error=f"zabbix online failed ({e!r}); used fixture")
 
@@ -99,23 +99,40 @@ class ZabbixAdapter(Adapter):
                        "tags": tags, "utilization": {}},
             ))
         # utilization: try to pull a few key items per host. This is best-effort
-        # and tolerant of missing items.
+        # and tolerant of missing items. Map Zabbix item keys to the normalized
+        # utilization field names so normalize() picks them up (the old code
+        # stored under "utilization_raw" with raw Zabbix keys, which normalize
+        # never read — every online host silently lost its utilization).
+        _KEY_MAP = {
+            "system.cpu.util": "cpu_p95",
+            "vm.memory.util": "mem_p95",
+            "vfs.fs.util": "disk_used_pct",
+        }
         try:
             for a in assets:
                 items = call("item.get", {
                     "hostids": a.source_id, "output": ["itemid", "key_", "name"],
-                    "search": {"key_": "system.cpu.util,vm.memory.util,vfs.fs.util"},
+                    # array value + searchByAny ORs the keys; a single comma
+                    # string matched nothing (Zabbix substring-matched the
+                    # whole literal).
+                    "search": {"key_": list(_KEY_MAP.keys())},
                     "searchByAny": True, "limit": 20,
                 })
                 util: Dict[str, Any] = {}
                 for it in items:
                     key = it.get("key_", "")
+                    field = _KEY_MAP.get(key)
+                    if not field:
+                        continue
                     hist = call("history.get", {"itemids": it["itemid"], "history": 0,
                                                 "output": "extend", "sortfield": "clock",
                                                 "sortorder": "DESC", "limit": 1})
                     if hist:
-                        util[key] = hist[0].get("value")
-                a.attrs["utilization_raw"] = util
+                        try:
+                            util[field] = float(hist[0].get("value"))
+                        except (TypeError, ValueError):
+                            continue
+                a.attrs["utilization"] = util
         except Exception:
             pass
         return IngestResult(assets=assets, mode="online")

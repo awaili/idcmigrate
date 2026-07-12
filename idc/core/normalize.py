@@ -34,6 +34,48 @@ def _key(hostname: str, fqdn: str, ip: str = "") -> str:
     return (hostname or fqdn or ip).strip().lower()
 
 
+def _tok(v: str) -> str:
+    return (v or "").strip().lower()
+
+
+# Source precedence for the merge: ServiceNow (CMDB) is authoritative for
+# identity & classification, RVTools enriches sizing, Zabbix/Prometheus add
+# utilization. The merge uses first-wins per field, so the group MUST be
+# iterated in precedence order — otherwise alphabetical ingest order
+# (prometheus, rvtools, servicenow, zabbix) lets RVTools/Prometheus win the
+# hostname/role over CMDB.
+_SOURCE_PRECEDENCE = {"servicenow": 0, "rvtools": 1, "zabbix": 2, "prometheus": 3}
+
+
+class _UnionFind:
+    """Union-find over identity tokens (hostname / fqdn / ip).
+
+    A single physical host is reported by several sources that may each
+    carry a different identity field: ServiceNow has hostname+ip, RVTools has
+    hostname, Prometheus has ``instance=ip:port``. Keying on a single field
+    (the old ``_key`` picked hostname OR fqdn OR ip) split one host into
+    several phantom servers and silently lost utilization. Unioning every
+    token an asset carries — and letting shared tokens merge across assets —
+    keeps one physical host as one Server.
+    """
+
+    def __init__(self):
+        self.parent: Dict[str, str] = {}
+
+    def find(self, x: str) -> str:
+        self.parent.setdefault(x, x)
+        root = x
+        while self.parent[root] != root:
+            self.parent[root] = self.parent[self.parent[root]]
+            root = self.parent[root]
+        return root
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
 def _to_int(v) -> int:
     try:
         return int(float(v or 0))
@@ -84,17 +126,37 @@ def _role_from_servicenow(row: dict) -> str:
 
 
 def normalize(assets: List[RawAsset]) -> List[Server]:
-    """Merge raw assets into unified Server records (dedup by hostname/fqdn)."""
-    by_key: Dict[str, List[RawAsset]] = defaultdict(list)
+    """Merge raw assets into unified Server records.
+
+    Entity resolution unions every identity token (hostname / fqdn / ip) an
+    asset carries, so a host reported by ServiceNow (hostname+ip), RVTools
+    (hostname) and Prometheus (ip) collapses into one Server instead of
+    splitting into phantoms. Each resolved group is then merged in source
+    precedence order (ServiceNow authoritative, then RVTools, Zabbix,
+    Prometheus) with first-wins per field.
+    """
+    uf = _UnionFind()
     for a in assets:
-        k = _key(a.hostname, a.fqdn, a.ip)
-        if k:
-            by_key[k].append(a)
+        toks = [t for t in (_tok(a.hostname), _tok(a.fqdn), _tok(a.ip)) if t]
+        for t in toks[1:]:
+            uf.union(toks[0], t)
+
+    by_root: Dict[str, List[RawAsset]] = defaultdict(list)
+    _noid = 0
+    for a in assets:
+        toks = [t for t in (_tok(a.hostname), _tok(a.fqdn), _tok(a.ip)) if t]
+        if not toks:
+            # no identity at all — keep as its own singleton group
+            by_root[f"__noid_{_noid}"].append(a)
+            _noid += 1
+            continue
+        by_root[uf.find(toks[0])].append(a)
 
     servers: List[Server] = []
-    for k, group in by_key.items():
+    for k, group in by_root.items():
         srv = Server()
         # authoritative: servicenow first, then rvtools for sizing, zbx/prom for util
+        group = sorted(group, key=lambda a: _SOURCE_PRECEDENCE.get(a.source, 99))
         for a in group:
             srv.source_refs.append({"source": a.source, "source_id": a.source_id,
                                     "ip": a.ip, "attrs": a.attrs})
@@ -103,7 +165,12 @@ def normalize(assets: List[RawAsset]) -> List[Server]:
                 srv.fqdn = srv.fqdn or a.fqdn
                 if a.ip and a.ip not in srv.ips:
                     srv.ips.append(a.ip)
-                srv.os = _clean_os(a.attrs.get("os", srv.os))
+                # only set OS when CMDB actually carries one; the old
+                # ``_clean_os(attrs.get("os", srv.os))`` set "unknown" on
+                # empty, which then blocked RVTools' accurate vSphere OS.
+                os_val = a.attrs.get("os")
+                if os_val:
+                    srv.os = _clean_os(os_val)
                 srv.os_version = a.attrs.get("os_version") or srv.os_version
                 srv.cpu_cores = _to_int(a.attrs.get("cpus")) or srv.cpu_cores
                 srv.mem_gb = _to_int(a.attrs.get("ram_gb")) or srv.mem_gb
@@ -129,11 +196,19 @@ def normalize(assets: List[RawAsset]) -> List[Server]:
                     srv.mem_gb = max(srv.mem_gb, mem_mb // 1024 or 1)
                 srv.datacenter = a.attrs.get("datacenter") or srv.datacenter
                 srv.cluster = a.attrs.get("cluster") or srv.cluster
-                # disks
+                # disks (dedup by name+size — RVTools re-export must not double
+                # capacity by appending the same spindles again)
+                seen_disks = {(d.name, d.size_gb) for d in srv.disks}
                 for d in a.attrs.get("disks", []):
+                    key = (d.get("name", ""), _to_int(d.get("size_gb")))
+                    if key in seen_disks:
+                        continue
+                    seen_disks.add(key)
                     srv.disks.append(Disk(name=d.get("name", ""), size_gb=_to_int(d.get("size_gb")),
                                           kind=(d.get("kind") or "").lower(), fs=d.get("fs", "")))
-                srv.source_type = "vm"  # rvtools only sees VMs
+                # RVTools only sees VMs, but don't overwrite a CMDB baremetal
+                # classification on a hostname collision.
+                srv.source_type = srv.source_type or "vm"
             elif a.source == "zabbix":
                 srv.hostname = srv.hostname or a.hostname
                 srv.fqdn = srv.fqdn or a.fqdn
@@ -155,7 +230,10 @@ def normalize(assets: List[RawAsset]) -> List[Server]:
             elif a.source == "prometheus":
                 srv.hostname = srv.hostname or a.hostname
                 u = a.attrs.get("utilization") or {}
-                if u and not srv.utilization.cpu_p95:
+                # distinguish "no data" (None) from a real zero reading (0.0):
+                # the old ``not srv.utilization.cpu_p95`` treated an idle host's
+                # 0.0 as missing and let the next source overwrite it.
+                if u and srv.utilization.cpu_p95 is None:
                     srv.utilization = Utilization(
                         cpu_p95=_to_float(u.get("cpu_p95")),
                         mem_p95=_to_float(u.get("mem_p95")),
@@ -170,10 +248,13 @@ def normalize(assets: List[RawAsset]) -> List[Server]:
         if not srv.disks and srv.source_type == "vm":
             pass
         srv.role = srv.role or "app"
+        # default env BEFORE criticality so the two stay consistent; an unknown
+        # env is "unknown" (conservative — don't rush a shadow-IT host into the
+        # prod cutover wave), not "prod".
+        if not srv.env:
+            srv.env = "unknown"
         if not srv.business_criticality:
             srv.business_criticality = "medium" if srv.env == "prod" else "low"
-        if not srv.env:
-            srv.env = "prod"
         srv.updated_at = srv.created_at
         servers.append(srv)
     return servers
@@ -216,7 +297,7 @@ def load_workloads(path: Optional[str] = None) -> List[Workload]:
                 notes=row.get("notes", ""),
                 # stash hostnames temporarily via attrs-free field
             ))
-            out[-1].server_ids = [h for h in (row.get("server_hostnames") or "").split(";") if h]
+            out[-1].server_ids = [h.strip() for h in (row.get("server_hostnames") or "").split(";") if h.strip()]
     return out
 
 

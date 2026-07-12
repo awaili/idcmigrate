@@ -132,7 +132,7 @@ def os_eol_bucket(s: Server, today_iso: Optional[str] = None) -> str:
         today_d = datetime.date.fromisoformat(today)
     except ValueError:
         return UNKNOWN
-    if eol_d < today_d:
+    if eol_d <= today_d:
         return EXPIRED
     if (eol_d - today_d).days <= EXPIRING_DAYS:
         return EXPIRING
@@ -169,7 +169,7 @@ def runtime_eol_bucket(runtime: str, language: str = "",
         today_d = datetime.date.fromisoformat(today)
     except ValueError:
         return UNKNOWN
-    if eol_d < today_d:
+    if eol_d <= today_d:
         return EXPIRED
     if (eol_d - today_d).days <= EXPIRING_DAYS:
         return EXPIRING

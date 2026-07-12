@@ -171,19 +171,32 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
     # hosts are NOT duplicated into their app's wave.
     infra_ids = set(lz_servers) | set(data_servers)
 
-    # map app -> server ids (from resolved workloads; exclude infra + non-migrating)
+    # map app -> server ids (from resolved workloads; exclude infra + non-migrating).
+    # A server joins exactly ONE primary app wave — the first app in topo order
+    # claims it — so a multi-app server is not duplicated into several waves
+    # (validate_plan rejects "server in two waves"). Without this, a host in
+    # both app A and app B landed in both waves.
     app_to_servers: Dict[str, List[str]] = defaultdict(list)
-    for w in workloads:
-        app_to_servers[w.app_id] = [sid for sid in w.server_ids
-                                    if sid in by_id and sid not in infra_ids
-                                    and sid not in excluded]
+    claimed: Set[str] = set()
+    for w in _topo_order(workloads, order_key=order_key):
+        sids = [sid for sid in w.server_ids
+                if sid in by_id and sid not in infra_ids
+                and sid not in excluded and sid not in claimed]
+        claimed.update(sids)
+        app_to_servers[w.app_id] = sids
     for s in servers:
         for a in s.app_ids:
-            if s.id not in infra_ids and s.id not in excluded \
-                    and s.id not in app_to_servers[a]:
+            if (s.id not in infra_ids and s.id not in excluded
+                    and s.id not in claimed
+                    and s.id not in app_to_servers[a]):
                 app_to_servers[a].append(s.id)
+                claimed.add(s.id)
 
+    # Pass 1: create each app wave (depends_on resolved in pass 2 so a cyclic
+    # app graph doesn't silently drop edges — every app is registered in
+    # app_to_wave before any dependency is resolved).
     app_to_wave: Dict[str, str] = {}
+    created: List[tuple] = []  # (workload, wave)
     for w in _topo_order(workloads, order_key=order_key):
         sids = app_to_servers.get(w.app_id, [])
         if not sids:
@@ -193,18 +206,24 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
             continue
         is_frontend = ((w.tier or "").lower() in ("frontend", "web")
                        and not _has_dependents(w.app_id, workloads))
-        deps = [data_wave.id] + [app_to_wave[d] for d in w.depends_on if d in app_to_wave]
         stage = STAGE_CUTOVER if is_frontend else STAGE_APP
         label = "Cutover" if stage == STAGE_CUTOVER else "App"
         name = f"W{len(waves)+1} {label}: {w.name or w.app_id}"
         base_rationale = (w.notes or f"Migrate {w.app_id} after its dependencies "
                                        f"({', '.join(w.depends_on) or 'none'}).")
         extra = wave_rationale_extra(w.app_id, pidx)
-        wv = Wave(name=name, stage=stage, server_ids=sids,
-                  depends_on=list(dict.fromkeys(deps)),
+        wv = Wave(name=name, stage=stage, server_ids=sids, depends_on=[],
                   rationale=(base_rationale + (f" [{extra}]" if extra else "")))
         app_to_wave[w.app_id] = wv.id
         waves.append(wv)
+        created.append((w, wv))
+
+    # Pass 2: resolve cross-app deps now that every app has a wave id. A cyclic
+    # app graph yields a cyclic wave DAG, which validate_plan flags as an error
+    # (preferred over the old silent edge-drop that produced a wrong order).
+    for w, wv in created:
+        deps = [data_wave.id] + [app_to_wave[d] for d in w.depends_on if d in app_to_wave]
+        wv.depends_on = list(dict.fromkeys(deps))
 
     # anything still unassigned (no role stage, no app, not retain/retire)
     # → catch-all after data

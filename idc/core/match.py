@@ -60,9 +60,23 @@ def _region(s: Server) -> str:
     return REGION_MAP.get((s.datacenter or "").lower(), REGION_MAP["default"])
 
 
+# Default AZ per region. Tencent Cloud's Bangkok region (ap-bangkok) has 2 AZs
+# (zone 1/2); zone 3 does NOT exist there, so the old hardcoded "{region}-3"
+# emitted an invalid AZ into every match/Terraform plan. Default to zone 1
+# (every region has at least one AZ); override per region when a different
+# default is wanted. Real HA-aware AZ selection still needs stock info.
+AZ_MAP = {
+    "ap-bangkok": "ap-bangkok-1",
+    "default": 1,  # integer => append as "{region}-{n}"
+}
+
+
 def _az(region: str) -> str:
-    # default to zone 3; real selection needs stock/HA constraints
-    return f"{region}-3"
+    if region in AZ_MAP:
+        az = AZ_MAP[region]
+        return az if isinstance(az, str) else f"{region}-{az}"
+    n = AZ_MAP.get("default", 1)
+    return f"{region}-{n}"
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +130,68 @@ def _size_by_mem(mem: int, table) -> Tuple[str, int]:
     return table[-1][1], table[-1][0]
 
 
-def _largest_data_disk_gb(s: Server) -> int:
+def _db_engine(tags_lc: List[str], hostname: str) -> str:
+    """Best-effort DB engine detection from tags + hostname (NOT from OS —
+    Oracle Linux would otherwise masquerade as the Oracle engine).
+
+    Returns one of ``postgres`` / ``sqlserver`` / ``mysql`` / ``""``
+    (unknown -> defaults to MySQL-class below). Oracle is handled separately
+    by :func:`_is_oracle_db` because the ``oracle`` token is ambiguous
+    (oracle-backup / oracle-client are not Oracle DBs).
+    """
+    tags = set(tags_lc)
+    name = (hostname or "").lower()
+    if "postgres" in tags or "postgresql" in tags or "pg" in tags \
+            or "postgres" in name or name.startswith("pg-"):
+        return "postgres"
+    if "sqlserver" in tags or "mssql" in tags or "sqlserver" in name or "mssql" in name:
+        return "sqlserver"
+    if "mysql" in tags or "mariadb" in tags or "mysql" in name or "mariadb" in name:
+        return "mysql"
+    return ""
+
+
+# oracle-adjacent tokens that do NOT indicate an Oracle DB server
+_ORACLE_NON_DB = ("backup", "client", "gateway", "agent", "connect", "proxy")
+
+
+def _is_oracle_db(tags_lc: List[str], hostname: str) -> bool:
+    """True when the host is an Oracle *DB* (not an oracle-client/backup box).
+
+    Within the ``role == "db"`` branch this still needs care: ServiceNow's
+    ``_role_from_servicenow`` assigns role=db to ANY hostname containing
+    "oracle", so ``oracle-backup-01`` reaches the DB branch. We accept oracle
+    as a DB unless the token immediately after "oracle" names a non-DB role,
+    or an explicit ``oracle-client``/``oracle-backup`` tag is present.
+    """
+    tags = set(tags_lc)
+    for neg in ("oracle-client", "oracle-backup", "oracle-gateway", "oracle-agent"):
+        if neg in tags:
+            return False
+    if "oracle-db" in tags or "oracle" in tags:
+        return True
+    name = (hostname or "").lower()
+    if "oracle" not in name:
+        return False
+    tail = name.split("oracle", 1)[1].lstrip("-_. ")
+    nxt = tail.split("-", 1)[0].split("_", 1)[0].split(".", 1)[0]
+    return nxt not in _ORACLE_NON_DB
+
+
+def _data_disk_gb(s: Server) -> int:
+    """Aggregate data-disk capacity for cloud block-storage sizing.
+
+    A traditional-IDC DB server typically has several data disks (RAID10/5
+    across N spindles). The cloud replaces the RAID group with a single CBS
+    volume sized to the *total* on-prem data capacity, so we sum the data
+    disks — not the largest single disk (the old behaviour under-provisioned
+    CBS by a factor of N, the most common DB shape). Falls back to the largest
+    single disk when no dedicated data filesystem is present.
+    """
     data = [d for d in s.disks if d.fs and d.fs not in ("/", "/boot") and d.size_gb > 0]
-    return max((d.size_gb for d in data), default=0) or (max((d.size_gb for d in s.disks), default=0))
+    if data:
+        return sum(d.size_gb for d in data)
+    return max((d.size_gb for d in s.disks), default=0)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +295,7 @@ def warranty_bucket(s: Server, today_iso: Optional[str] = None) -> str:
         today_d = datetime.date.fromisoformat(today)
     except ValueError:
         return WARRANTY_UNKNOWN
-    if eol_d < today_d:
+    if eol_d <= today_d:
         return WARRANTY_EXPIRED
     if (eol_d - today_d).days <= WARRANTY_EXPIRING_DAYS:
         return WARRANTY_EXPIRING
@@ -243,7 +316,7 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
     cpu, mem = _sizing_cpu_mem(s, sizing_strategy)
     role = (s.role or "app").lower()
     stype = (s.source_type or "vm").lower()
-    disk_gb = _largest_data_disk_gb(s)
+    disk_gb = _data_disk_gb(s)
     high = (s.business_criticality or "").lower() == "high"
 
     # --- container platform ---------------------------------------------
@@ -270,24 +343,31 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
                      rationale=f"K8s worker ({cpu}vCPU/{mem}GB) → CVM {sku} as TKE node pool member.",
                      alternatives=["原生 Pod 迁移到 TKE 并弃用节点"])
 
-    # --- big data / baremetal -------------------------------------------
-    if stype == "baremetal" or role == "hadoop":
+    # --- big data ------------------------------------------------------
+    # EMR is for Hadoop workloads regardless of metal/virtual. NB: do NOT gate
+    # on ``stype == "baremetal"`` here — that sent EVERY bare-metal host (Oracle
+    # DB, web, postgres ...) to EMR before the db/cache branches could run.
+    # A bare-metal non-Hadoop host falls through to its role branch below.
+    if role == "hadoop":
         tgt = Target(product="EMR", spec="EMR Hadoop cluster", region=region, az=az,
                      extras={"nn_size": f"{cpu}vCPU/{mem}GB", "data_disks": disk_gb},
                      notes="Tencent EMR managed Hadoop; re-onboard data via COS/HDFS distcp.")
         return Match(s.id, tgt, confidence=0.75, method="rule",
-                     rationale="Bare-metal Hadoop node → Tencent EMR (managed). "
+                     rationale="Hadoop node → Tencent EMR (managed). "
                                "Data migrated via COS distcp/HDFS sync.",
                      alternatives=["CPM 云物理机 (lift-and-shift, keep Hadoop stack)"])
 
     # --- databases ------------------------------------------------------
     if role == "db":
-        # Detect the Oracle *DB engine* from tags/hostname only — NOT from OS,
-        # because Oracle Linux normalizes to "oracle linux" and would misroute
-        # a MySQL server running on it to the CVM lift-and-shift path.
+        # Detect the DB *engine* from tags/hostname only — NOT from OS, because
+        # Oracle Linux normalizes to "oracle linux" and would misroute a MySQL
+        # server running on it. Require the db role AND a specific engine token
+        # so a host merely named "oracle-backup-01" / tagged "oracle-client"
+        # (an app that *connects to* Oracle) is not lifted-and-shifted as an
+        # Oracle DB.
         tags_lc = [t.lower() for t in (s.tags or [])]
-        hints = " ".join(tags_lc) + " " + (s.hostname or "").lower()
-        if "oracle" in hints:
+        engine = _db_engine(tags_lc, s.hostname or "")
+        if _is_oracle_db(tags_lc, s.hostname or ""):
             sku, sz = _size_cvm(cpu, mem)
             tgt = Target(product="CVM", spec=sku, region=region, az=az,
                          extras={"size": sz, "data_disk": disk_gb, "license": "Oracle BYOL"},
@@ -297,7 +377,30 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
                          rationale="Oracle DB → CVM lift-and-shift (license mobility). "
                                    "Re-platforming to TDSQL is a separate project.",
                          alternatives=["TDSQL (Oracle 兼容)", "腾讯云数据库 Oracle 版"])
-        # default mysql/mariadb/postgres
+        if engine == "postgres":
+            spec, cap = _size_by_mem(mem, CDB_MYSQL_SPECS)  # same mem tiers
+            edition = "高可用版(HA)" if high else "基础版"
+            tgt = Target(product="TencentDB for PostgreSQL",
+                         spec=f"PostgreSQL 16 {spec} {edition}",
+                         region=region, az=az,
+                         extras={"mem_gb": cap, "disk_gb": disk_gb or 500, "edition": edition},
+                         notes=f"TencentDB for PostgreSQL, disk ≈ {disk_gb or 500} GB.")
+            return Match(s.id, tgt, confidence=0.9, method="rule",
+                         rationale=f"DB role (postgresql) → TencentDB for PostgreSQL {edition}, "
+                                   f"sized by {mem}GB RAM / {disk_gb}GB data.",
+                         alternatives=["自建 PostgreSQL on CVM"])
+        if engine == "sqlserver":
+            sku, sz = _size_cvm(cpu, mem)
+            tgt = Target(product="TencentDB for SQL Server",
+                         spec=f"SQL Server {sku} {('HA' if high else 'Basic')}",
+                         region=region, az=az,
+                         extras={"size": sz, "data_disk": disk_gb or 500,
+                                 "edition": "HA" if high else "Basic"},
+                         notes="TencentDB for SQL Server (managed). License included/BYOL.")
+            return Match(s.id, tgt, confidence=0.85, method="rule",
+                         rationale="DB role (sqlserver) → TencentDB for SQL Server (managed).",
+                         alternatives=["自建 SQL Server on CVM (BYOL)"])
+        # default mysql/mariadb
         spec, cap = _size_by_mem(mem, CDB_MYSQL_SPECS)
         edition = "高可用版(HA)" if high else "基础版"
         is_replica = "replica" in " ".join(s.tags or []).lower()

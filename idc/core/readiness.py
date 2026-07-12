@@ -275,7 +275,7 @@ def _build_readiness_state(store) -> Dict[str, Any]:
     workloads = store.list_workloads()
     profiles = store.list_code_profiles()
     db_profiles = store.list_db_profiles()
-    changejobs = store.list_change_jobs(limit=1000)
+    changejobs = store.list_change_jobs(status="done")
     mjobs_all = store.list_migration_jobs()
     lz_statuses = store.list_lz_status()
 
@@ -304,15 +304,11 @@ def _build_readiness_state(store) -> Dict[str, Any]:
     done_jobs = {(j.get("app_id"), j.get("kind")) for j in changejobs
                  if j.get("status") == "done"}
 
-    # DB profile index
-    dbidx: Dict[str, DBConversionProfile] = {}
-    for d in db_profiles:
-        dbidx[d.db_server_id] = d
-        # also index by hostname/identity for the lookup helper
-        # (we keep a separate reverse index keyed by the same tokens)
-        for k in (d.db_server_id or "").lower().strip(), (d.hostname or "").lower().strip(), (d.identity_key or "").lower().strip():
-            if k:
-                dbidx.setdefault(k, d)
+    # DB profile index — keyed by db_server_id (a Server.id, or a hostname when
+    # the executor keyed it that way). _db_profile_for looks up by hostname /
+    # identity_key / id, all of which are Server-side tokens that must match
+    # db_server_id, so a single key suffices.
+    dbidx: Dict[str, DBConversionProfile] = {d.db_server_id: d for d in db_profiles}
 
     # migration jobs grouped by wave + dominant status per wave
     mjobs_by_wave: Dict[str, List[Any]] = {}
@@ -399,7 +395,7 @@ def wave_readiness(store, wave_id: str) -> Dict[str, Any]:
     workloads = store.list_workloads()
     profiles = store.list_code_profiles()
     db_profiles = store.list_db_profiles()
-    changejobs = store.list_change_jobs(limit=1000)
+    changejobs = store.list_change_jobs(status="done")
     mjobs = store.list_migration_jobs(wave_id=wave_id)
 
     srv_by_id = {s.id: s for s in servers}

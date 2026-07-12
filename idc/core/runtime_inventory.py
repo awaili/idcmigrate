@@ -136,8 +136,9 @@ def _prometheus_ports(settings, host: str) -> List[int]:
     # We query a conservative textfile metric name that's common in practice; if
     # absent, we return [] (the caller falls back to match port).
     try:
+        _h = (host or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
         r = httpx.get(f"{settings.prom_url}/api/v1/query",
-                      params={"query": f'node_port_listen{{instance="{host}"}}'},
+                      params={"query": f'node_port_listen{{instance="{_h}"}}'},
                       timeout=settings.prom_timeout)
         if r.status_code != 200:
             return []

@@ -15,6 +15,28 @@ from ..models import RawAsset, SOURCE_PROMETHEUS
 from .base import Adapter, IngestResult, register
 
 
+def _split_instance(inst: str) -> tuple:
+    """Prometheus ``instance`` labels are ``host:port`` (or ``host``).
+
+    Strip the trailing ``:port`` so the asset's hostname/IP matches the
+    other sources' identity tokens — otherwise ``10.0.0.1:9100`` never
+    merged with the CMDB/RVTools host and created a phantom server that
+    hoarded the utilization data. Returns ``(host, ip_if_host_is_an_ip)``.
+    """
+    inst = (inst or "").strip()
+    # only strip a trailing :<digits>; leave IPv6 / non-port colons alone
+    if ":" in inst and not inst.startswith("["):
+        host, _, port = inst.rpartition(":")
+        if port.isdigit():
+            inst = host
+    # treat a bare IP as both hostname and ip so union-find joins it
+    ip = ""
+    parts = inst.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        ip = inst
+    return inst, ip
+
+
 # (key, promql) — keyed to the utilization field we want to fill
 QUERIES = {
     "cpu_p95": '100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)',
@@ -54,9 +76,10 @@ class PrometheusAdapter(Adapter):
                 by_host.setdefault(inst, {})[metric] = val
         assets: List[RawAsset] = []
         for host, util in by_host.items():
+            hostname, ip = _split_instance(host)
             assets.append(RawAsset(
-                source=SOURCE_PROMETHEUS, source_id=host,
-                hostname=host, fqdn="", ip="",
+                source=SOURCE_PROMETHEUS, source_id=hostname,
+                hostname=hostname, fqdn="", ip=ip,
                 attrs={"utilization": util},
             ))
         return IngestResult(assets=assets, mode="fixture")
@@ -85,7 +108,11 @@ class PrometheusAdapter(Adapter):
                     by_host.setdefault(inst, {})[key] = val
             except Exception as e:
                 errors.append(f"{key}: {e!r}")
-        assets = [RawAsset(source=SOURCE_PROMETHEUS, source_id=h, hostname=h, fqdn="", ip="",
-                           attrs={"utilization": u}) for h, u in by_host.items()]
+        assets = []
+        for h, u in by_host.items():
+            hostname, ip = _split_instance(h)
+            assets.append(RawAsset(source=SOURCE_PROMETHEUS, source_id=hostname,
+                                   hostname=hostname, fqdn="", ip=ip,
+                                   attrs={"utilization": u}))
         return IngestResult(assets=assets, mode="online",
                             error="; ".join(errors) if errors else "")

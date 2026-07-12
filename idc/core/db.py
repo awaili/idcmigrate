@@ -1233,7 +1233,16 @@ class Store:
         r = self._fetchone("SELECT * FROM change_jobs WHERE id=?", (job_id,))
         return dict(r) if r else None
 
-    def list_change_jobs(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_change_jobs(self, limit: int = 100,
+                          status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Change jobs newest-first. When ``status`` is given, filter server-side
+        and drop the LIMIT — readiness needs ALL done jobs to avoid false
+        YELLOW on estates with >1000 change jobs (old done jobs fell out of the
+        DESC window and the cutover gate lost its evidence)."""
+        if status:
+            return [dict(r) for r in self._fetchall(
+                "SELECT * FROM change_jobs WHERE status=? ORDER BY created_at DESC",
+                (status,))]
         return [dict(r) for r in self._fetchall(
             "SELECT * FROM change_jobs ORDER BY created_at DESC LIMIT ?", (limit,))]
 

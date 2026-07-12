@@ -147,12 +147,20 @@ async def stream_agent(
     cmd = _build_cmd(full_prompt, settings, mode, cwd, add_dirs)
     timeout = timeout or settings.claude_timeout
     try:
+        # Pass a minimal environment to the Claude subprocess: keep PATH/HOME/
+        # locale and the Claude/Anthropic auth vars the CLI needs, but DROP the
+        # project's IDC_* secrets (DB url, executor/zabbix/servicenow/web
+        # tokens). The agent's context is fed inventory data that originated
+        # from CMDB/executor pushes; a prompt-injection there must not be able
+        # to exfiltrate these secrets via the agent's tool use.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("IDC_")}
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env=dict(os.environ),
+            env=env,
         )
     except FileNotFoundError as e:
         yield AgentEvent("error", text=f"claude binary not found: {settings.claude_bin!r} ({e})")

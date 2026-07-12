@@ -135,6 +135,7 @@ def non_migrating_servers(servers: List[Server], workloads: List[Workload],
             srv_to_apps.setdefault(s.id, set()).add(a)
     retain_ids: Set[str] = set()
     retire_ids: Set[str] = set()
+    non_mig = retain_apps | retire_apps
     for s in servers:
         apps = srv_to_apps.get(s.id)
         if not apps:
@@ -143,7 +144,11 @@ def non_migrating_servers(servers: List[Server], workloads: List[Workload],
             retain_ids.add(s.id)
         elif apps <= retire_apps:
             retire_ids.add(s.id)
-        # mixed (retain+retire, or non-migrating + migrating) -> migrates
+        elif apps <= non_mig:
+            # all apps non-migrating but mixed retain+retire -> decommission
+            # (do NOT migrate a host whose every app is staying or retiring)
+            retire_ids.add(s.id)
+        # else: has at least one migrating app -> migrates
     return retain_ids, retire_ids
 
 
@@ -816,13 +821,13 @@ def build_change_spec(profile: Optional[CodeProfile],
     # 2. findings whose category is in scope but not in required_changes still
     #    matter (e.g. hardcoded_ip findings the comb step didn't fold into a
     #    required_change) — surface them so the executor addresses them too
-    rc_locs = {(rc.get("file", ""), int(rc.get("line") or 0))
+    rc_locs = {(rc.get("file", ""), int(rc.get("line") or 0), rc.get("category", ""))
                for rc in (profile.required_changes or [])}
     for f in (profile.findings or []):
         if scope_set is not None and f.category not in scope_set:
             continue
-        if (f.file, f.line) in rc_locs:
-            continue  # already emitted via required_changes
+        if (f.file or "", f.line or 0, f.category) in rc_locs:
+            continue  # already emitted via required_changes (same category)
         old = _extract_old(f.category, f.evidence)
         new = _DEFAULT_NEW.get(f.category, "${ENV}")
         note = ""

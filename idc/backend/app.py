@@ -204,6 +204,17 @@ _UPLOAD_EXT = {
     "prometheus": {".json"},
 }
 
+# Hard cap on a single upload so a huge (or malicious) file can't fill the disk.
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MiB
+
+# Serialize full-estate rebuilds: two concurrent POST /api/rebuild would both
+# DELETE+INSERT the derived tables, racing on row locks / deadlocking and
+# leaving matches pointing at servers that no longer exist. Hold this lock for
+# the whole rebuild; a second caller gets 409.
+import threading as _threading
+_REBUILD_LOCK = _threading.Lock()
+_REBUILD_RUNNING = False
+
 
 # ---------------------------------------------------------------------------
 # request / response schemas
@@ -230,7 +241,7 @@ class ExplainReq(BaseModel):
 
 class AgentReq(BaseModel):
     prompt: str
-    mode: str = "plan"            # plan | execute
+    mode: Literal["plan", "execute"] = "plan"   # execute = --dangerously-skip-permissions
     focus_server_ids: Optional[List[str]] = None
     cwd: Optional[str] = None
     timeout: Optional[int] = None
@@ -561,11 +572,20 @@ async def ingest_upload(source: str = Form(...), file: UploadFile = File(...)):
     # stable filename: <source>__<original>; collisions overwrite (re-ingest)
     safe = (file.filename or f"{source}{ext}").replace(os.sep, "_").lstrip("/ ")
     dest = UPLOAD_DIR / f"{source}__{safe}"
+    written = 0
     with open(dest, "wb") as fh:
         while True:
             chunk = await file.read(1 << 20)  # 1 MiB
             if not chunk:
                 break
+            written += len(chunk)
+            if written > MAX_UPLOAD_BYTES:
+                fh.close()
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                raise HTTPException(413, f"upload too large (limit {MAX_UPLOAD_BYTES} bytes)")
             fh.write(chunk)
 
     runs = run_ingest(STORE, settings, source, path_overrides={source: str(dest)})
@@ -1113,6 +1133,10 @@ def rebuild_derived(req: RebuildReq):
     import queue as _queue
     import threading as _threading
 
+    global _REBUILD_RUNNING
+    if not _REBUILD_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "a rebuild is already running; wait for it to finish")
+    _REBUILD_RUNNING = True
     out_q: "_queue.Queue" = _queue.Queue()
     _SENTINEL = object()
 
@@ -1134,6 +1158,8 @@ def rebuild_derived(req: RebuildReq):
             _emit({"type": "error", "error": f"{e!r}"})
         finally:
             out_q.put(_SENTINEL)
+            _REBUILD_LOCK.release()
+            _REBUILD_RUNNING = False
 
     _threading.Thread(target=_worker, daemon=True).start()
 
@@ -1537,7 +1563,7 @@ class CompleteReq(BaseModel):
 
 
 @app.post("/api/waves/{wave_id}/execute")
-def launch_wave_exec(wave_id: str, kind: str = "host"):
+def launch_wave_exec(wave_id: str, kind: Literal["host", "db", "code"] = "host"):
     """Create a MigrationJob (status=planned) for each server in the wave (F6).
     Track-only mode: the operator / external tool performs the migration."""
     from ..core.execute import launch_wave

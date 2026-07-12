@@ -84,7 +84,7 @@ def test_re_region_swaps_region_keeps_spec():
     s = _srv(cpu=16, mem=64, cpu_p95=25, mem_p95=30)
     m = re_region(s, "ap-bangkok")
     assert m.target.region == "ap-bangkok"
-    assert m.target.az == "ap-bangkok-3"
+    assert m.target.az == "ap-bangkok-1"  # zone 1 exists; zone 3 does not in ap-bangkok
     # spec is preserved (as_is sizing)
     assert m.target.spec == match_server(s, "as_is").target.spec
     assert "what-if region=ap-bangkok" in m.rationale
