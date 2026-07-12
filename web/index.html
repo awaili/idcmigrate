@@ -207,6 +207,19 @@
       <div class="out" id="exOut" style="margin-top:8px"><span class="muted">Requires IDC_EXECUTOR_URL. Results arrive async via callback → Rebuild to fold into waves.</span></div>
     </div>
     <div class="card">
+      <h2>Manage executor <span class="muted">(connection + enable/disable — persists across restarts)</span></h2>
+      <div id="execCfgStatus" class="muted" style="font-size:12px;margin-bottom:6px">loading…</div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <input id="execUrl" placeholder="executor URL (e.g. http://127.0.0.1:8090)" style="flex:1 1 300px;min-width:200px"/>
+        <input id="execToken" type="password" placeholder="token (leave blank to keep)" style="flex:1 1 180px;min-width:140px"/>
+        <label class="muted" style="white-space:nowrap"><input type="checkbox" id="execEnabled"> enabled</label>
+        <input id="execTimeout" type="number" min="1" step="1" value="600" style="width:80px" title="timeout (seconds)"/>
+        <button class="primary" onclick="saveExecConfig()">Save &amp; test</button>
+        <button class="sm" onclick="testExecConfig()">Test connection</button>
+      </div>
+      <div class="out" id="execCfgOut" style="margin-top:8px"><span class="muted">URL / token / enabled are saved to the DB and applied immediately (no redeploy). Start the mock with <span class="kbd">idc executor-mock</span> (port 8090).</span></div>
+    </div>
+    <div class="card">
       <h2>7R strategy <span class="muted">(AI assigns 6R + rehost-container per app after reconsolidate)</span></h2>
       <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
         <input id="srApp" placeholder="app_id" style="flex:0 1 200px;min-width:140px" list="srAppList"/>

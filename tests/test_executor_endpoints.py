@@ -20,6 +20,8 @@ TEST_APP = "pytest-exec-test"
 @pytest.fixture(autouse=True)
 def _executor_token(monkeypatch):
     # the raise-question endpoint requires a bearer; set one for the suite.
+    # _check_executor_auth reads the live config via _executor_settings(),
+    # which layers DB overrides over the current settings.executor_token.
     monkeypatch.setattr(m.settings, "executor_token", "test-token")
 
 
@@ -132,3 +134,65 @@ def test_strategy_batch_streams_ndjson(monkeypatch):
     assert _json.loads(lines[-1])["ok_count"] == 2
     # no apply -> nothing persisted
     assert m.STORE.get_app_strategy("pytest-batch-a") is None
+
+# -- executor runtime config (manage-executor panel) ------------------------
+@pytest.fixture
+def _clean_exec_config():
+    """Reset executor config to env defaults (no DB overrides) around each test,
+    so PUTs don't leak between tests or into other suites. _executor_settings()
+    reads the DB live, so deleting the rows is enough."""
+    def _reset():
+        with m.STORE.tx() as cur:
+            cur.execute(m.STORE._x("DELETE FROM system_config WHERE k LIKE 'executor_%'"))
+    _reset()
+    yield
+    _reset()
+
+
+def test_executor_config_get_shape_and_token_never_returned(_clean_exec_config):
+    r = client.get("/api/executor/config")
+    assert r.status_code == 200
+    d = r.json()
+    for k in ("url", "token_set", "enabled", "timeout", "status"):
+        assert k in d
+    assert "token" not in d          # the secret itself is never returned
+
+
+def test_executor_config_put_persists_and_applies_live(_clean_exec_config):
+    r = client.put("/api/executor/config",
+                   json={"url": "http://127.0.0.1:8090", "enabled": True, "timeout": 120})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["url"] == "http://127.0.0.1:8090"
+    assert d["enabled"] is True
+    assert d["timeout"] == 120
+    # persisted to the DB
+    assert m.STORE.get_config("executor_url") == "http://127.0.0.1:8090"
+    assert m.STORE.get_config("executor_enabled") == "true"
+    assert m.STORE.get_config("executor_timeout") == "120"
+    # applied to the live config -> the status probe sees the new url
+    assert client.get("/api/executor/status").json()["url"] == "http://127.0.0.1:8090"
+    assert client.get("/api/executor/config").json()["url"] == "http://127.0.0.1:8090"
+
+
+def test_executor_config_token_masked_and_kept_when_omitted(_clean_exec_config):
+    client.put("/api/executor/config", json={"token": "secret-token"})
+    d = client.get("/api/executor/config").json()
+    assert d["token_set"] is True
+    assert "token" not in d
+    # a later PUT without a token keeps the existing one
+    client.put("/api/executor/config", json={"url": "http://x:9"})
+    assert client.get("/api/executor/config").json()["token_set"] is True
+    # the live auth check uses the saved token
+    assert m._executor_settings().executor_token == "secret-token"
+
+
+def test_executor_test_probes_without_persisting(_clean_exec_config):
+    before = client.get("/api/executor/config").json()["url"]
+    r = client.post("/api/executor/test", json={"url": "http://127.0.0.1:1"})
+    assert r.status_code == 200, r.text
+    s = r.json()
+    assert s["reachable"] is False        # nothing on :1
+    # the probe must NOT persist
+    assert client.get("/api/executor/config").json()["url"] == before
+    assert m.STORE.get_config("executor_url") is None

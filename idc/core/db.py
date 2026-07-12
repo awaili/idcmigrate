@@ -319,6 +319,15 @@ CREATE TABLE IF NOT EXISTS discovery_snapshots (
     payload     LONGTEXT
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
+-- runtime system config (key/value) — currently holds the operator-editable
+-- executor connection (executor_url / executor_token / executor_enabled /
+-- executor_timeout) so the web panel can manage it without a redeploy/env edit.
+-- Values are strings — callers coerce (bool via "true"/"false", int via int()).
+CREATE TABLE IF NOT EXISTS system_config (
+    k           VARCHAR(64) PRIMARY KEY,
+    v           TEXT
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
 -- F4 server columns migrated in place via ALTER IF NOT EXISTS
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS sizing_basis VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS assessment_confidence DOUBLE;
@@ -983,6 +992,25 @@ class Store:
     def list_ingest_runs(self) -> List[Dict[str, Any]]:
         return [dict(r) for r in self._fetchall(
             "SELECT * FROM ingest_runs ORDER BY started_at DESC LIMIT 50")]
+
+    # -- system config (key/value) ----------------------------------------
+    def get_config(self, k: str) -> Optional[str]:
+        r = self._fetchone("SELECT v FROM system_config WHERE k=?", (k,))
+        return r["v"] if r else None
+
+    def set_config(self, k: str, v: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x(
+                "INSERT INTO system_config(k, v) VALUES(?, ?) "
+                "ON DUPLICATE KEY UPDATE v=VALUES(v)"), (k, v))
+
+    def get_config_map(self, keys: Iterable[str]) -> Dict[str, str]:
+        if not keys:
+            return {}
+        ph = ",".join(["?"] * len(keys))
+        return {r["k"]: r["v"] for r in
+                self._fetchall(f"SELECT k, v FROM system_config WHERE k IN ({ph})",
+                               list(keys))}
 
     # -- agent tasks -------------------------------------------------------
     def create_task(self, t: AgentTask) -> None:

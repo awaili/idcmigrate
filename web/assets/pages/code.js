@@ -1,6 +1,7 @@
 /* ---------- code intelligence (external executor) ---------- */
 async function loadCode(){
   loadExecStatus();   // connected/disconnected badge
+  loadExecConfig();   // manage-executor form + status line
   try{
     const profiles = await api('/code-profiles');
     const tb = $('codeTbl').querySelector('tbody'); tb.innerHTML='';
@@ -206,6 +207,48 @@ async function loadExecStatus(){
     el.innerHTML = `<span style="color:${color}">${label}${tok}${dis}</span>`;
     el.title = s.detail || '';
   }catch(e){ el.innerHTML = `<span style="color:var(--amber)">● status unavailable</span>`; }
+}
+
+/* ---------- Manage executor panel (runtime config, persisted) ---------- */
+async function loadExecConfig(){
+  const statusEl=$('execCfgStatus'); if(!statusEl) return;
+  try{
+    const c = await api('/executor/config');
+    $('execUrl').value = c.url || '';
+    $('execEnabled').checked = !!c.enabled;
+    $('execTimeout').value = c.timeout || 600;
+    $('execToken').value = '';   // token is never returned; blank = keep current
+    const s = c.status || {};
+    const color = s.reachable ? 'var(--green)' : (s.configured ? 'var(--amber)' : 'var(--fg)');
+    const lbl = s.reachable ? `● connected${s.version?` · ${esc(s.version)}`:''}`
+              : s.configured ? `● configured, unreachable`
+              : '○ not configured';
+    statusEl.innerHTML = `<span style="color:${color}">${lbl}${c.token_set?'':' · token unset'}${c.enabled?'':' · disabled'}</span> <span class="muted">${esc(s.detail||'')}</span>`;
+  }catch(e){ statusEl.innerHTML=`<span class="ev-err">config load failed: ${esc(e)}</span>`; }
+}
+async function saveExecConfig(){
+  const body = {url:$('execUrl').value.trim(), enabled:$('execEnabled').checked,
+                timeout:parseInt($('execTimeout').value,10)||600};
+  const tok=$('execToken').value;
+  if(tok) body.token=tok;   // only send a token if the operator typed a new one
+  const out=$('execCfgOut'); out.innerHTML='<span class="spinner"></span> saving…';
+  try{
+    await api('/executor/config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    out.innerHTML = `<span style="color:var(--green)">✓ saved</span>`;
+    await loadExecConfig();   // refresh the status line with the post-save probe
+    loadExecStatus();         // refresh the header badge too
+    toast('executor config saved','ok');
+  }catch(e){ out.innerHTML=`<span class="ev-err">save failed: ${esc(e)}</span>`; }
+}
+async function testExecConfig(){
+  const body={url:$('execUrl').value.trim()};
+  const tok=$('execToken').value; if(tok) body.token=tok;
+  const out=$('execCfgOut'); out.innerHTML='<span class="spinner"></span> testing…';
+  try{
+    const s = await api('/executor/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    const color = s.reachable ? 'var(--green)' : 'var(--amber)';
+    out.innerHTML = `<span style="color:${color}">${s.reachable?`✓ reachable${s.version?` · ${esc(s.version)}`:''}`:`✗ ${esc(s.detail||'unreachable')}`}</span>`;
+  }catch(e){ out.innerHTML=`<span class="ev-err">test failed: ${esc(e)}</span>`; }
 }
 
 /* ---------- F5 — DB conversion profiles ---------- */

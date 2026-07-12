@@ -40,6 +40,40 @@ _EVENT_BUS: Dict[str, "asyncio.Queue"] = {}
 
 app = FastAPI(title="idc-migrate", version="0.1.0")
 
+# ---------------------------------------------------------------------------
+# Live executor config — operator-editable at runtime via /api/executor/config
+# ---------------------------------------------------------------------------
+# The executor connection is env-driven by default (IDC_EXECUTOR_URL/TOKEN/
+# ENABLED/TIMEOUT), but the web "Manage executor" panel can override it without
+# a redeploy. Overrides persist in the system_config table so they survive
+# restart; on startup we layer DB values over the env defaults.
+_EXEC_CFG_KEYS = ("executor_url", "executor_token", "executor_enabled", "executor_timeout")
+_EXEC_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _executor_settings():
+    """A Settings copy with the executor fields overlaid from DB system_config
+    (operator-managed via /api/executor/config) on top of the CURRENT env
+    Settings. Read live on every call — no stale cache — so test monkeypatches
+    of ``settings.executor_*`` and runtime DB PUTs both take effect instantly.
+    The DB round-trip is fine: executor calls are infrequent operator actions /
+    push callbacks, not hot paths."""
+    import dataclasses
+    base = {k: getattr(settings, k) for k in _EXEC_CFG_KEYS}
+    ov = STORE.get_config_map(_EXEC_CFG_KEYS)
+    if "executor_url" in ov:
+        base["executor_url"] = ov["executor_url"]
+    if "executor_token" in ov:
+        base["executor_token"] = ov["executor_token"]
+    if "executor_enabled" in ov:
+        base["executor_enabled"] = str(ov["executor_enabled"]).strip().lower() in _EXEC_TRUTHY
+    if "executor_timeout" in ov:
+        try:
+            base["executor_timeout"] = int(ov["executor_timeout"])
+        except (TypeError, ValueError):
+            pass
+    return dataclasses.replace(settings, **base)
+
 # Landing dir for uploaded source files (CSV/xlsx/JSON). Persisted so a later
 # non-upload ingest can re-read them if the operator points IDC_*_PATH here.
 UPLOAD_DIR = ROOT / "uploads"
@@ -429,8 +463,9 @@ async def ingest_upload(source: str = Form(...), file: UploadFile = File(...)):
 #   push direction (executor → idc-migrate) is bearer-authed.
 # ---------------------------------------------------------------------------
 def _check_executor_auth(authorization: Optional[str]):
-    """Validate the bearer token against IDC_EXECUTOR_TOKEN."""
-    token = settings.executor_token
+    """Validate the bearer token against the configured executor token (live
+    config, so a token change via /api/executor/config takes effect immediately)."""
+    token = _executor_settings().executor_token
     if not token:
         raise HTTPException(401, "IDC_EXECUTOR_TOKEN not configured; "
                                   "set it to accept executor push callbacks")
@@ -712,7 +747,75 @@ def executor_status_endpoint():
     """Connectivity probe for the external code-modifying executor — powers the
     web status indicator + the `doctor` CLI check. Never raises."""
     from ..agent import executor_status
-    return executor_status(settings)
+    return executor_status(_executor_settings())
+
+
+class ExecutorConfigReq(BaseModel):
+    # All optional — only provided fields are updated on PUT; /test probes a
+    # candidate {url, token} without persisting.
+    url: Optional[str] = None
+    token: Optional[str] = None
+    enabled: Optional[bool] = None
+    timeout: Optional[int] = None
+
+
+def _executor_config_out(s=None) -> dict:
+    """Public view of the executor config (token NEVER returned — only token_set)
+    plus a live status probe."""
+    from ..agent import executor_status
+    s = s or _executor_settings()
+    status = executor_status(s)
+    return {
+        "url": s.executor_url or "",
+        "token_set": bool(s.executor_token),
+        "enabled": bool(s.executor_enabled),
+        "timeout": int(s.executor_timeout or 0),
+        "status": status,
+    }
+
+
+@app.get("/api/executor/config")
+def executor_get_config():
+    """Current executor connection (URL / enabled / timeout / token_set) + a
+    live health probe. The token itself is never returned."""
+    return _executor_config_out()
+
+
+@app.put("/api/executor/config")
+def executor_put_config(req: ExecutorConfigReq):
+    """Update the executor connection at runtime. Only provided fields change;
+    the token is kept as-is when not supplied (so the panel can edit the URL
+    without re-entering the secret). Persists to system_config so it survives a
+    restart; _executor_settings() reads the DB live, so it takes effect
+    immediately. Returns the new config + a probe."""
+    if req.url is not None:
+        STORE.set_config("executor_url", req.url)
+    if req.token is not None and req.token != "":
+        # empty token in the body means "leave unchanged" (the field was masked)
+        STORE.set_config("executor_token", req.token)
+    if req.enabled is not None:
+        STORE.set_config("executor_enabled", "true" if req.enabled else "false")
+    if req.timeout is not None:
+        STORE.set_config("executor_timeout", str(int(req.timeout)))
+    return _executor_config_out()
+
+
+@app.post("/api/executor/test")
+def executor_test_config(req: ExecutorConfigReq):
+    """Probe a candidate executor connection WITHOUT persisting — the panel's
+    "Test connection" button. Layer the provided url/token over the live config
+    (falling back to live values for fields not supplied) and run the probe."""
+    import dataclasses
+    s = _executor_settings()
+    overrides: Dict[str, Any] = {}
+    if req.url is not None:
+        overrides["executor_url"] = req.url
+    if req.token is not None and req.token != "":
+        overrides["executor_token"] = req.token
+    if overrides:
+        s = dataclasses.replace(s, **overrides)
+    from ..agent import executor_status
+    return executor_status(s)
 
 
 @app.post("/api/executor/trigger")
@@ -728,9 +831,9 @@ def executor_trigger(req: ExecutorScanReq):
     it does not re-scan or guess. If no profile exists yet the change list is
     empty and the spec's ``notes`` tell the executor to scan first.
     """
-    if not settings.executor_enabled:
+    if not _executor_settings().executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(settings)
+    ec = get_executor_client(_executor_settings())
     if not ec.configured:
         raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
     # The callback base is configured on the executor side (it pushes back to
@@ -782,9 +885,9 @@ def db_scan_trigger(req: DBScanReq):
     back to ``PUT /api/db-profiles/{db_server_id}``. Rebuild then folds the
     grade into the host's match (confidence dip / replatform force) + wave risk.
     """
-    if not settings.executor_enabled:
+    if not _executor_settings().executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(settings)
+    ec = get_executor_client(_executor_settings())
     if not ec.configured:
         raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
     try:
@@ -829,9 +932,9 @@ def runtime_containerize_trigger(req: RuntimeContainerizeReq):
     When ``inventory`` is empty/partial, idc-migrate auto-gathers it from the
     server's match port + role/os + telemetry (see ``GET /api/runtime-inventory``)
     and merges the operator-provided fields on top (operator wins)."""
-    if not settings.executor_enabled:
+    if not _executor_settings().executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(settings)
+    ec = get_executor_client(_executor_settings())
     if not ec.configured:
         raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
     # auto-gather + merge when the operator didn't supply a full inventory
@@ -862,7 +965,7 @@ def runtime_containerize_trigger(req: RuntimeContainerizeReq):
 @app.get("/api/executor/jobs/{job_id}")
 def executor_job(job_id: str):
     """Proxy a job-status poll to the executor."""
-    ec = get_executor_client(settings)
+    ec = get_executor_client(_executor_settings())
     if not ec.configured:
         raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
     try:
