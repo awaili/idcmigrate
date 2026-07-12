@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..config import FIXTURES, Settings
+from ..config import FIXTURES, ROOT, Settings
 from .models import (
     AppStrategy, CostEstimate, Match, Server,
     PATTERN_RETAIN, PATTERN_RETIRE, STRATEGY_SOURCE_OPERATOR, _now,
@@ -60,7 +60,10 @@ _PRICEBOOK_CACHE: Optional[Tuple[PriceBook, str]] = None  # (book, source-url-or
 def _read_fixture(path: str) -> Dict[str, Any]:
     p = Path(path) or (FIXTURES / "pricing.json")
     if not p.exists():
-        p = FIXTURES / "pricing.json"
+        # FIXTURES may point at a scale fixture dir (IDC_FIXTURES_DIR) that
+        # ships no pricing.json — fall back to the BUNDLED fixtures/pricing.json
+        # (ROOT/fixtures), not FIXTURES itself (which is the same missing file).
+        p = ROOT / "fixtures" / "pricing.json"
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:

@@ -111,9 +111,9 @@ def test_match_targets(all_assets):
     for m in matches.values():
         assert 0.0 <= m.confidence <= 1.0
     assert matches[by_host["db-mysql-01"].id].confidence >= 0.85
-    # region mapping: dc1→shanghai, dc2→beijing
-    assert matches[by_host["hdop-nn-01"].id].target.region == "ap-beijing"
-    assert matches[by_host["db-mysql-01"].id].target.region == "ap-shanghai"
+    # region mapping: target landing zone is Thailand, so every DC -> ap-bangkok
+    assert matches[by_host["hdop-nn-01"].id].target.region == "ap-bangkok"
+    assert matches[by_host["db-mysql-01"].id].target.region == "ap-bangkok"
 
 
 def test_match_k8s_master_vs_worker(all_assets):

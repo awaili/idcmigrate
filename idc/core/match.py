@@ -21,12 +21,14 @@ from typing import List, Optional, Tuple
 
 from .models import ALL_SOURCES, Match, Server, Target
 
-# datacenter → Tencent Cloud region (edit to match the real DC mapping)
+# datacenter → Tencent Cloud region. Target landing zone is Thailand, so the
+# whole estate maps to Tencent Cloud's Bangkok region (ap-bangkok) — Tencent
+# Cloud has a single Thailand region, so every on-prem datacenter lands there.
 REGION_MAP = {
-    "dc1": "ap-shanghai",
-    "dc2": "ap-beijing",
-    "dc3": "ap-guangzhou",
-    "default": "ap-shanghai",
+    "dc1": "ap-bangkok",
+    "dc2": "ap-bangkok",
+    "dc3": "ap-bangkok",
+    "default": "ap-bangkok",
 }
 
 # (vcpu, mem_gb, sku) — smallest fit wins; SA5 = AMD standard generation 5

@@ -97,7 +97,7 @@ def test_right_size_and_re_region_are_pure_original_untouched():
     _ = re_region(s, "ap-guangzhou")
     # base match not mutated by the what-if helpers
     assert base.target.spec == "SA5.4XLARGE32"
-    assert base.target.region == "ap-shanghai"
+    assert base.target.region == "ap-bangkok"
 
 
 # -- cost.what_if composable overrides --------------------------------------

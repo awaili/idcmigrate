@@ -1,48 +1,524 @@
 {
   "_source": "fixture",
-  "_note": "Bundled sample Tencent Cloud pricing (USD/month, pay-as-you-go) so the business case renders out-of-the-box. Replace with live pricing via IDC_PRICING_URL and/or contract pricing via IDC_PRICING_OVERRIDE_PATH. by_spec gives per-SKU precision; by_product is the fallback default per product+region.",
+  "_note": "Bundled sample Tencent Cloud pricing (USD/month, pay-as-you-go) so the business case renders out-of-the-box. Target region is Thailand (ap-bangkok); ap-bangkok prices mirror ap-shanghai as sample values — replace with live pricing via IDC_PRICING_URL and/or contract pricing via IDC_PRICING_OVERRIDE_PATH. by_spec gives per-SKU precision; by_product is the fallback default per product+region.",
   "currency": "USD",
   "by_spec": {
     "CVM": {
-      "SA5.SMALL2":  {"ap-shanghai": {"monthly": 25, "yearly": 270}, "ap-beijing": {"monthly": 26, "yearly": 280}, "ap-guangzhou": {"monthly": 24, "yearly": 260}},
-      "SA5.SMALL4":  {"ap-shanghai": {"monthly": 38, "yearly": 410}, "ap-beijing": {"monthly": 40, "yearly": 430}, "ap-guangzhou": {"monthly": 37, "yearly": 400}},
-      "SA5.MEDIUM4": {"ap-shanghai": {"monthly": 60, "yearly": 650}, "ap-beijing": {"monthly": 62, "yearly": 670}, "ap-guangzhou": {"monthly": 58, "yearly": 630}},
-      "SA5.LARGE8":  {"ap-shanghai": {"monthly": 95, "yearly": 1025}, "ap-beijing": {"monthly": 98, "yearly": 1060}, "ap-guangzhou": {"monthly": 92, "yearly": 990}},
-      "SA5.2XLARGE8":  {"ap-shanghai": {"monthly": 145, "yearly": 1565}, "ap-beijing": {"monthly": 150, "yearly": 1620}, "ap-guangzhou": {"monthly": 140, "yearly": 1510}},
-      "SA5.2XLARGE16": {"ap-shanghai": {"monthly": 210, "yearly": 2270}, "ap-beijing": {"monthly": 218, "yearly": 2350}, "ap-guangzhou": {"monthly": 205, "yearly": 2210}},
-      "SA5.4XLARGE16": {"ap-shanghai": {"monthly": 290, "yearly": 3130}, "ap-beijing": {"monthly": 300, "yearly": 3240}, "ap-guangzhou": {"monthly": 282, "yearly": 3045}},
-      "SA5.4XLARGE32": {"ap-shanghai": {"monthly": 420, "yearly": 4535}, "ap-beijing": {"monthly": 435, "yearly": 4700}, "ap-guangzhou": {"monthly": 410, "yearly": 4425}},
-      "SA5.8XLARGE64": {"ap-shanghai": {"monthly": 840, "yearly": 9070}, "ap-beijing": {"monthly": 870, "yearly": 9395}, "ap-guangzhou": {"monthly": 820, "yearly": 8855}}
+      "SA5.SMALL2": {
+        "ap-shanghai": {
+          "monthly": 25,
+          "yearly": 270
+        },
+        "ap-beijing": {
+          "monthly": 26,
+          "yearly": 280
+        },
+        "ap-guangzhou": {
+          "monthly": 24,
+          "yearly": 260
+        },
+        "ap-bangkok": {
+          "monthly": 25,
+          "yearly": 270
+        }
+      },
+      "SA5.SMALL4": {
+        "ap-shanghai": {
+          "monthly": 38,
+          "yearly": 410
+        },
+        "ap-beijing": {
+          "monthly": 40,
+          "yearly": 430
+        },
+        "ap-guangzhou": {
+          "monthly": 37,
+          "yearly": 400
+        },
+        "ap-bangkok": {
+          "monthly": 38,
+          "yearly": 410
+        }
+      },
+      "SA5.MEDIUM4": {
+        "ap-shanghai": {
+          "monthly": 60,
+          "yearly": 650
+        },
+        "ap-beijing": {
+          "monthly": 62,
+          "yearly": 670
+        },
+        "ap-guangzhou": {
+          "monthly": 58,
+          "yearly": 630
+        },
+        "ap-bangkok": {
+          "monthly": 60,
+          "yearly": 650
+        }
+      },
+      "SA5.LARGE8": {
+        "ap-shanghai": {
+          "monthly": 95,
+          "yearly": 1025
+        },
+        "ap-beijing": {
+          "monthly": 98,
+          "yearly": 1060
+        },
+        "ap-guangzhou": {
+          "monthly": 92,
+          "yearly": 990
+        },
+        "ap-bangkok": {
+          "monthly": 95,
+          "yearly": 1025
+        }
+      },
+      "SA5.2XLARGE8": {
+        "ap-shanghai": {
+          "monthly": 145,
+          "yearly": 1565
+        },
+        "ap-beijing": {
+          "monthly": 150,
+          "yearly": 1620
+        },
+        "ap-guangzhou": {
+          "monthly": 140,
+          "yearly": 1510
+        },
+        "ap-bangkok": {
+          "monthly": 145,
+          "yearly": 1565
+        }
+      },
+      "SA5.2XLARGE16": {
+        "ap-shanghai": {
+          "monthly": 210,
+          "yearly": 2270
+        },
+        "ap-beijing": {
+          "monthly": 218,
+          "yearly": 2350
+        },
+        "ap-guangzhou": {
+          "monthly": 205,
+          "yearly": 2210
+        },
+        "ap-bangkok": {
+          "monthly": 210,
+          "yearly": 2270
+        }
+      },
+      "SA5.4XLARGE16": {
+        "ap-shanghai": {
+          "monthly": 290,
+          "yearly": 3130
+        },
+        "ap-beijing": {
+          "monthly": 300,
+          "yearly": 3240
+        },
+        "ap-guangzhou": {
+          "monthly": 282,
+          "yearly": 3045
+        },
+        "ap-bangkok": {
+          "monthly": 290,
+          "yearly": 3130
+        }
+      },
+      "SA5.4XLARGE32": {
+        "ap-shanghai": {
+          "monthly": 420,
+          "yearly": 4535
+        },
+        "ap-beijing": {
+          "monthly": 435,
+          "yearly": 4700
+        },
+        "ap-guangzhou": {
+          "monthly": 410,
+          "yearly": 4425
+        },
+        "ap-bangkok": {
+          "monthly": 420,
+          "yearly": 4535
+        }
+      },
+      "SA5.8XLARGE64": {
+        "ap-shanghai": {
+          "monthly": 840,
+          "yearly": 9070
+        },
+        "ap-beijing": {
+          "monthly": 870,
+          "yearly": 9395
+        },
+        "ap-guangzhou": {
+          "monthly": 820,
+          "yearly": 8855
+        },
+        "ap-bangkok": {
+          "monthly": 840,
+          "yearly": 9070
+        }
+      }
     },
     "CDB": {
-      "MYSQL.HighMem - 2GB":  {"ap-shanghai": {"monthly": 35, "yearly": 380}, "ap-beijing": {"monthly": 36, "yearly": 390}, "ap-guangzhou": {"monthly": 34, "yearly": 370}},
-      "MYSQL.HighMem - 4GB":  {"ap-shanghai": {"monthly": 60, "yearly": 650}, "ap-beijing": {"monthly": 62, "yearly": 670}, "ap-guangzhou": {"monthly": 58, "yearly": 630}},
-      "MYSQL.HighMem - 8GB":  {"ap-shanghai": {"monthly": 110, "yearly": 1190}, "ap-beijing": {"monthly": 114, "yearly": 1230}, "ap-guangzhou": {"monthly": 107, "yearly": 1155}},
-      "MYSQL.HighMem - 16GB": {"ap-shanghai": {"monthly": 200, "yearly": 2160}, "ap-beijing": {"monthly": 208, "yearly": 2245}, "ap-guangzhou": {"monthly": 195, "yearly": 2105}},
-      "MYSQL.HighMem - 32GB": {"ap-shanghai": {"monthly": 380, "yearly": 4100}, "ap-beijing": {"monthly": 395, "yearly": 4265}, "ap-guangzhou": {"monthly": 370, "yearly": 3995}},
-      "MYSQL.HighMem - 64GB": {"ap-shanghai": {"monthly": 720, "yearly": 7775}, "ap-beijing": {"monthly": 750, "yearly": 8100}, "ap-guangzhou": {"monthly": 705, "yearly": 7600}}
+      "MYSQL.HighMem - 2GB": {
+        "ap-shanghai": {
+          "monthly": 35,
+          "yearly": 380
+        },
+        "ap-beijing": {
+          "monthly": 36,
+          "yearly": 390
+        },
+        "ap-guangzhou": {
+          "monthly": 34,
+          "yearly": 370
+        },
+        "ap-bangkok": {
+          "monthly": 35,
+          "yearly": 380
+        }
+      },
+      "MYSQL.HighMem - 4GB": {
+        "ap-shanghai": {
+          "monthly": 60,
+          "yearly": 650
+        },
+        "ap-beijing": {
+          "monthly": 62,
+          "yearly": 670
+        },
+        "ap-guangzhou": {
+          "monthly": 58,
+          "yearly": 630
+        },
+        "ap-bangkok": {
+          "monthly": 60,
+          "yearly": 650
+        }
+      },
+      "MYSQL.HighMem - 8GB": {
+        "ap-shanghai": {
+          "monthly": 110,
+          "yearly": 1190
+        },
+        "ap-beijing": {
+          "monthly": 114,
+          "yearly": 1230
+        },
+        "ap-guangzhou": {
+          "monthly": 107,
+          "yearly": 1155
+        },
+        "ap-bangkok": {
+          "monthly": 110,
+          "yearly": 1190
+        }
+      },
+      "MYSQL.HighMem - 16GB": {
+        "ap-shanghai": {
+          "monthly": 200,
+          "yearly": 2160
+        },
+        "ap-beijing": {
+          "monthly": 208,
+          "yearly": 2245
+        },
+        "ap-guangzhou": {
+          "monthly": 195,
+          "yearly": 2105
+        },
+        "ap-bangkok": {
+          "monthly": 200,
+          "yearly": 2160
+        }
+      },
+      "MYSQL.HighMem - 32GB": {
+        "ap-shanghai": {
+          "monthly": 380,
+          "yearly": 4100
+        },
+        "ap-beijing": {
+          "monthly": 395,
+          "yearly": 4265
+        },
+        "ap-guangzhou": {
+          "monthly": 370,
+          "yearly": 3995
+        },
+        "ap-bangkok": {
+          "monthly": 380,
+          "yearly": 4100
+        }
+      },
+      "MYSQL.HighMem - 64GB": {
+        "ap-shanghai": {
+          "monthly": 720,
+          "yearly": 7775
+        },
+        "ap-beijing": {
+          "monthly": 750,
+          "yearly": 8100
+        },
+        "ap-guangzhou": {
+          "monthly": 705,
+          "yearly": 7600
+        },
+        "ap-bangkok": {
+          "monthly": 720,
+          "yearly": 7775
+        }
+      }
     },
     "TencentDB for Redis": {
-      "Redis 标准版 1GB":  {"ap-shanghai": {"monthly": 30, "yearly": 325}, "ap-beijing": {"monthly": 31, "yearly": 335}, "ap-guangzhou": {"monthly": 29, "yearly": 315}},
-      "Redis 标准版 2GB":  {"ap-shanghai": {"monthly": 55, "yearly": 595}, "ap-beijing": {"monthly": 57, "yearly": 615}, "ap-guangzhou": {"monthly": 54, "yearly": 583}},
-      "Redis 标准版 4GB":  {"ap-shanghai": {"monthly": 100, "yearly": 1080}, "ap-beijing": {"monthly": 104, "yearly": 1123}, "ap-guangzhou": {"monthly": 98, "yearly": 1058}},
-      "Redis 标准版 8GB":  {"ap-shanghai": {"monthly": 190, "yearly": 2050}, "ap-beijing": {"monthly": 198, "yearly": 2135}, "ap-guangzhou": {"monthly": 186, "yearly": 2005}},
-      "Redis 标准版 16GB": {"ap-shanghai": {"monthly": 360, "yearly": 3890}, "ap-beijing": {"monthly": 375, "yearly": 4050}, "ap-guangzhou": {"monthly": 352, "yearly": 3800}},
-      "Redis 标准版 32GB": {"ap-shanghai": {"monthly": 700, "yearly": 7560}, "ap-beijing": {"monthly": 728, "yearly": 7860}, "ap-guangzhou": {"monthly": 685, "yearly": 7395}}
+      "Redis 标准版 1GB": {
+        "ap-shanghai": {
+          "monthly": 30,
+          "yearly": 325
+        },
+        "ap-beijing": {
+          "monthly": 31,
+          "yearly": 335
+        },
+        "ap-guangzhou": {
+          "monthly": 29,
+          "yearly": 315
+        },
+        "ap-bangkok": {
+          "monthly": 30,
+          "yearly": 325
+        }
+      },
+      "Redis 标准版 2GB": {
+        "ap-shanghai": {
+          "monthly": 55,
+          "yearly": 595
+        },
+        "ap-beijing": {
+          "monthly": 57,
+          "yearly": 615
+        },
+        "ap-guangzhou": {
+          "monthly": 54,
+          "yearly": 583
+        },
+        "ap-bangkok": {
+          "monthly": 55,
+          "yearly": 595
+        }
+      },
+      "Redis 标准版 4GB": {
+        "ap-shanghai": {
+          "monthly": 100,
+          "yearly": 1080
+        },
+        "ap-beijing": {
+          "monthly": 104,
+          "yearly": 1123
+        },
+        "ap-guangzhou": {
+          "monthly": 98,
+          "yearly": 1058
+        },
+        "ap-bangkok": {
+          "monthly": 100,
+          "yearly": 1080
+        }
+      },
+      "Redis 标准版 8GB": {
+        "ap-shanghai": {
+          "monthly": 190,
+          "yearly": 2050
+        },
+        "ap-beijing": {
+          "monthly": 198,
+          "yearly": 2135
+        },
+        "ap-guangzhou": {
+          "monthly": 186,
+          "yearly": 2005
+        },
+        "ap-bangkok": {
+          "monthly": 190,
+          "yearly": 2050
+        }
+      },
+      "Redis 标准版 16GB": {
+        "ap-shanghai": {
+          "monthly": 360,
+          "yearly": 3890
+        },
+        "ap-beijing": {
+          "monthly": 375,
+          "yearly": 4050
+        },
+        "ap-guangzhou": {
+          "monthly": 352,
+          "yearly": 3800
+        },
+        "ap-bangkok": {
+          "monthly": 360,
+          "yearly": 3890
+        }
+      },
+      "Redis 标准版 32GB": {
+        "ap-shanghai": {
+          "monthly": 700,
+          "yearly": 7560
+        },
+        "ap-beijing": {
+          "monthly": 728,
+          "yearly": 7860
+        },
+        "ap-guangzhou": {
+          "monthly": 685,
+          "yearly": 7395
+        },
+        "ap-bangkok": {
+          "monthly": 700,
+          "yearly": 7560
+        }
+      }
     },
     "EMR": {
-      "EMR Hadoop cluster": {"ap-shanghai": {"monthly": 520, "yearly": 5615}, "ap-beijing": {"monthly": 540, "yearly": 5830}, "ap-guangzhou": {"monthly": 510, "yearly": 5505}}
+      "EMR Hadoop cluster": {
+        "ap-shanghai": {
+          "monthly": 520,
+          "yearly": 5615
+        },
+        "ap-beijing": {
+          "monthly": 540,
+          "yearly": 5830
+        },
+        "ap-guangzhou": {
+          "monthly": 510,
+          "yearly": 5505
+        },
+        "ap-bangkok": {
+          "monthly": 520,
+          "yearly": 5615
+        }
+      }
     },
     "TKE": {
-      "_default": {"ap-shanghai": {"monthly": 0, "yearly": 0}, "ap-beijing": {"monthly": 0, "yearly": 0}, "ap-guangzhou": {"monthly": 0, "yearly": 0}}
+      "_default": {
+        "ap-shanghai": {
+          "monthly": 0,
+          "yearly": 0
+        },
+        "ap-beijing": {
+          "monthly": 0,
+          "yearly": 0
+        },
+        "ap-guangzhou": {
+          "monthly": 0,
+          "yearly": 0
+        },
+        "ap-bangkok": {
+          "monthly": 0,
+          "yearly": 0
+        }
+      }
     }
   },
   "by_product": {
-    "CVM":                 {"ap-shanghai": {"monthly": 80,  "yearly": 860},  "ap-beijing": {"monthly": 84,  "yearly": 905},  "ap-guangzhou": {"monthly": 78,  "yearly": 840}},
-    "CDB":                 {"ap-shanghai": {"monthly": 150, "yearly": 1620}, "ap-beijing": {"monthly": 156, "yearly": 1685}, "ap-guangzhou": {"monthly": 146, "yearly": 1575}},
-    "TencentDB for Redis": {"ap-shanghai": {"monthly": 120, "yearly": 1295}, "ap-beijing": {"monthly": 125, "yearly": 1350}, "ap-guangzhou": {"monthly": 117, "yearly": 1260}},
-    "EMR":                 {"ap-shanghai": {"monthly": 520, "yearly": 5615}, "ap-beijing": {"monthly": 540, "yearly": 5830}, "ap-guangzhou": {"monthly": 510, "yearly": 5505}},
-    "TKE":                 {"ap-shanghai": {"monthly": 0,   "yearly": 0},     "ap-beijing": {"monthly": 0,   "yearly": 0},     "ap-guangzhou": {"monthly": 0,   "yearly": 0}}
+    "CVM": {
+      "ap-shanghai": {
+        "monthly": 80,
+        "yearly": 860
+      },
+      "ap-beijing": {
+        "monthly": 84,
+        "yearly": 905
+      },
+      "ap-guangzhou": {
+        "monthly": 78,
+        "yearly": 840
+      },
+      "ap-bangkok": {
+        "monthly": 80,
+        "yearly": 860
+      }
+    },
+    "CDB": {
+      "ap-shanghai": {
+        "monthly": 150,
+        "yearly": 1620
+      },
+      "ap-beijing": {
+        "monthly": 156,
+        "yearly": 1685
+      },
+      "ap-guangzhou": {
+        "monthly": 146,
+        "yearly": 1575
+      },
+      "ap-bangkok": {
+        "monthly": 150,
+        "yearly": 1620
+      }
+    },
+    "TencentDB for Redis": {
+      "ap-shanghai": {
+        "monthly": 120,
+        "yearly": 1295
+      },
+      "ap-beijing": {
+        "monthly": 125,
+        "yearly": 1350
+      },
+      "ap-guangzhou": {
+        "monthly": 117,
+        "yearly": 1260
+      },
+      "ap-bangkok": {
+        "monthly": 120,
+        "yearly": 1295
+      }
+    },
+    "EMR": {
+      "ap-shanghai": {
+        "monthly": 520,
+        "yearly": 5615
+      },
+      "ap-beijing": {
+        "monthly": 540,
+        "yearly": 5830
+      },
+      "ap-guangzhou": {
+        "monthly": 510,
+        "yearly": 5505
+      },
+      "ap-bangkok": {
+        "monthly": 520,
+        "yearly": 5615
+      }
+    },
+    "TKE": {
+      "ap-shanghai": {
+        "monthly": 0,
+        "yearly": 0
+      },
+      "ap-beijing": {
+        "monthly": 0,
+        "yearly": 0
+      },
+      "ap-guangzhou": {
+        "monthly": 0,
+        "yearly": 0
+      },
+      "ap-bangkok": {
+        "monthly": 0,
+        "yearly": 0
+      }
+    }
   },
   "onprem_rate_default": 0
 }
