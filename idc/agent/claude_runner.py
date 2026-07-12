@@ -38,6 +38,30 @@ SYSTEM_PREAMBLE = (
 )
 
 
+# F8 — Landing Zone archetype context. When the operator asks the agent to
+# emit LZ Terraform, this parameterizes it by archetype (corp/online/dmz) so
+# the agent emits a per-archetype blueprint (VPC + peering + CAM + SG + tag
+# policy + policy-as-code) instead of a one-shot blob. The blueprints are data
+# from idc.core.lz; the agent does the actual HCL emit.
+def lz_context(archetype: str) -> str:
+    """One archetype's LZ blueprint as an agent context block (F8)."""
+    from ..core.lz import LZ_BLUEPRINTS, LZ_ARCHETYPES
+    if archetype not in LZ_ARCHETYPES:
+        return f"(unknown LZ archetype: {archetype})"
+    bp = LZ_BLUEPRINTS[archetype]
+    return (
+        f"LANDING ZONE ARCHETYPE: {archetype}\n"
+        f"{bp['summary']}\n"
+        f"Blueprint (emit Terraform matching this):\n"
+        + json.dumps(bp, ensure_ascii=False, indent=2)
+    )
+
+
+def lz_context_all() -> str:
+    """All three archetype blueprints (for a 'generate the full LZ' prompt)."""
+    return "\n\n---\n\n".join(lz_context(a) for a in ("corp", "online", "dmz"))
+
+
 @dataclass
 class AgentEvent:
     kind: str            # "text" | "tool" | "status" | "result" | "error"
@@ -62,6 +86,7 @@ def build_context(servers: Optional[List[Server]] = None,
                   waves: Optional[List[Wave]] = None,
                   focus_server_ids: Optional[List[str]] = None) -> str:
     """Compact, agent-grounding inventory context as a string."""
+    from ..core.lz import archetype_for
     parts: List[str] = []
     if servers is not None:
         m_by_id = {m.server_id: m for m in (matches or [])}
@@ -79,6 +104,7 @@ def build_context(servers: Optional[List[Server]] = None,
                 "tags": s.tags, "app_ids": s.app_ids,
                 "target": (m.target.product + " " + m.target.spec) if m else None,
                 "region": m.target.region if m else None,
+                "lz_archetype": archetype_for(s, m),   # F8 placement context
                 "utilization": s.utilization.to_dict(),
             })
         parts.append("SERVERS (source estate → proposed Tencent target):\n"

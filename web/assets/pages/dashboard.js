@@ -1,0 +1,31 @@
+/* ---------- dashboard ---------- */
+function bars(data, colors){
+  data = data || {};
+  const max = Math.max(1, ...Object.values(data));
+  const cmap = colors || {};
+  return Object.entries(data).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{
+    const cls = cmap[k] ? ' '+cmap[k] : '';
+    return `<div class="bar-row"><div title="${esc(k)}">${esc(k)}</div><div class="bar-track"><div class="bar-fill${cls}" style="width:${(v/max*100).toFixed(1)}%"></div></div><div class="n" style="text-align:right">${v}</div></div>`;
+  }).join('');
+}
+const ROLE_COLORS={db:'p',k8s:'',hadoop:'a',cache:'o',web:'g',monitoring:'',app:''};
+async function loadDashboard(){
+  let a; try{ a = await api('/aggregations'); }catch(e){ return; }
+  const tiles = [
+    {k:'servers', v:a.servers},
+    {k:'total cores', v:a.cores.toLocaleString()},
+    {k:'total RAM', v:a.mem_gb.toLocaleString(), sub:'GB'},
+    {k:'waves', v:a.waves.length},
+    {k:'targets mapped', v:Object.values(a.by_target).reduce((s,x)=>s+x,0)},
+    {k:'high-utilization', v:a.high_utilization, warn:true, sub:'≥80%'},
+    {k:'low-confidence', v:(a.confidence['low(<0.7)']||0)+(a.confidence['medium(0.7-0.85)']||0), warn:true, sub:'<0.85'},
+  ];
+  $('dashTiles').innerHTML = tiles.map(t=>`<div class="tile ${t.warn?'warn':''}"><div class="k">${t.k}</div><div class="v">${t.v}${t.sub?` <small>${t.sub}</small>`:''}</div></div>`).join('');
+  $('barRole').innerHTML = bars(a.by_role, ROLE_COLORS);
+  $('barTarget').innerHTML = bars(a.by_target, {CDB:'p',EMR:'a',TKE:'',CVM:''});
+  $('barOs').innerHTML = bars(a.by_os);
+  $('barConf').innerHTML = bars(a.confidence, {'high(>=0.85)':'g','medium(0.7-0.85)':'a','low(<0.7)':'r'});
+  $('barRegion').innerHTML = bars(a.by_region);
+  $('dashWaves').innerHTML = a.waves.map(w=>`<div class="wave" onclick="document.querySelector('.tab[data-tab=waves]').click(); openWave('${w.id}','${esc(w.name)}')">
+    <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${w.stage.startsWith('1')?'high':w.stage.startsWith('4')?'medium':'low'}">${w.stage}</span><span style="margin-left:auto" class="meta">${w.n} servers</span></div></div>`).join('');
+}

@@ -7,9 +7,10 @@ Offline: fixture JSON in the same instant-vector shape.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
-from ...config import FIXTURES, Settings
+from ...config import Settings
 from ..models import RawAsset, SOURCE_PROMETHEUS
 from .base import Adapter, IngestResult, register
 
@@ -31,11 +32,15 @@ class PrometheusAdapter(Adapter):
     def fetch(self, settings: Settings) -> IngestResult:
         if settings.has_prometheus():
             return self._online(settings)
-        return self._fixture()
+        return self._fixture(settings)
 
-    def _fixture(self) -> IngestResult:
-        path = FIXTURES / "prometheus_metrics.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
+    def _fixture(self, settings: Settings) -> IngestResult:
+        path = settings.prom_path
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except OSError as e:
+            return IngestResult(assets=[], mode="fixture",
+                                error=f"prometheus file not found: {path} ({e!r})")
         result = data.get("data", {}).get("result", {})
         # group by instance across all metrics
         by_host: Dict[str, Dict[str, float]] = {}

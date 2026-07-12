@@ -1,12 +1,14 @@
 # idc-migrate runtime dependencies (Python 3.9+)
-# Core stdlib (sqlite3, argparse/typer, json, subprocess) covers most needs.
+# Core stdlib (argparse/typer, json, subprocess) covers most needs.
 fastapi>=0.104
 uvicorn[standard]>=0.24
+# multipart form parsing for the /api/ingest/upload endpoint
+python-multipart>=0.0.6
 httpx>=0.25
 pydantic>=2.5
 typer>=0.9
 rich>=13
-# MariaDB backend (set IDC_DB_URL=mysql://...). SQLite needs no driver.
+# MariaDB backend (IDC_DB_URL=mysql://...)
 PyMySQL>=1.1
 # Optional: openpyxl for reading RVTools .xlsx exports (CSV needs nothing)
 # openpyxl>=3.1

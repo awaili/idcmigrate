@@ -39,8 +39,10 @@ FIXTURES = Path(os.environ.get("IDC_FIXTURES_DIR") or (ROOT / "fixtures"))
 
 @dataclass
 class Settings:
-    # data store
-    db_url: str = field(default_factory=lambda: _env("IDC_DB_URL", f"sqlite:///{ROOT}/idc_migrate.db"))
+    # data store — MariaDB on the DB box (10.0.0.3:3306). URL-encode special
+    # chars in the password (e.g. '#' -> %23, '!' -> %21).
+    db_url: str = field(default_factory=lambda: _env(
+        "IDC_DB_URL", "mysql://idc_migrate_app:IdcMigrate%232026%21@10.0.0.3:3306/idc_migrate"))
 
     # servicenow
     sn_base: str = field(default_factory=lambda: _env("IDC_SERVICENOW_BASE"))
@@ -49,8 +51,10 @@ class Settings:
     sn_token: str = field(default_factory=lambda: _env("IDC_SERVICENOW_TOKEN"))
     sn_table: str = field(default_factory=lambda: _env("IDC_SERVICENOW_TABLE", "cmdb_ci_server"))
     sn_limit: int = field(default_factory=lambda: _env_int("IDC_SERVICENOW_LIMIT", 10000))
+    # offline fixture / uploaded file path (defaults to bundled fixture)
+    sn_path: str = field(default_factory=lambda: _env("IDC_SERVICENOW_PATH", str(FIXTURES / "servicenow_cmdb_ci_server.csv")))
 
-    # rvtools
+    # rvtools (always file-based — vSphere export, no online API)
     rvtools_path: str = field(default_factory=lambda: _env("IDC_RVTOOLS_PATH", str(FIXTURES / "rvtools_vInfo.csv")))
 
     # zabbix
@@ -58,10 +62,14 @@ class Settings:
     zbx_token: str = field(default_factory=lambda: _env("IDC_ZABBIX_TOKEN"))
     zbx_user: str = field(default_factory=lambda: _env("IDC_ZABBIX_USER"))
     zbx_password: str = field(default_factory=lambda: _env("IDC_ZABBIX_PASSWORD"))
+    # offline fixture / uploaded file path (defaults to bundled fixture)
+    zbx_path: str = field(default_factory=lambda: _env("IDC_ZABBIX_PATH", str(FIXTURES / "zabbix_hosts.json")))
 
     # prometheus
     prom_url: str = field(default_factory=lambda: _env("IDC_PROM_URL"))
     prom_timeout: int = field(default_factory=lambda: _env_int("IDC_PROM_TIMEOUT", 30))
+    # offline fixture / uploaded file path (defaults to bundled fixture)
+    prom_path: str = field(default_factory=lambda: _env("IDC_PROMETHEUS_PATH", str(FIXTURES / "prometheus_metrics.json")))
 
     # llm
     llm_base: str = field(default_factory=lambda: _env("IDC_LLM_BASE", "http://127.0.0.1:11434"))
@@ -74,15 +82,43 @@ class Settings:
     claude_timeout: int = field(default_factory=lambda: _env_int("IDC_CLAUDE_TIMEOUT", 600))
     claude_default_mode: str = field(default_factory=lambda: _env("IDC_CLAUDE_DEFAULT_MODE", "plan"))
 
-    # derived helpers
-    @property
-    def sqlite_path(self) -> Path:
-        url = self.db_url
-        if url.startswith("sqlite:///"):
-            p = url[len("sqlite:///"):]
-            return Path(p) if p else ROOT / "idc_migrate.db"
-        return ROOT / "idc_migrate.db"
+    # external agent executor (code scan / comb / modify)
+    # IDC_EXECUTOR_URL = base URL of the executor (idc→executor direction).
+    # IDC_EXECUTOR_TOKEN = shared bearer secret (also validates push callbacks).
+    executor_url: str = field(default_factory=lambda: _env("IDC_EXECUTOR_URL"))
+    executor_token: str = field(default_factory=lambda: _env("IDC_EXECUTOR_TOKEN"))
+    executor_timeout: int = field(default_factory=lambda: _env_int("IDC_EXECUTOR_TIMEOUT", 600))
+    executor_enabled: bool = field(default_factory=lambda: _env_bool("IDC_EXECUTOR_ENABLED", True))
 
+    # F2 — Tencent Cloud pricing source for TCO / business case.
+    # IDC_PRICING_URL = public pricing endpoint; empty -> cost.py falls back
+    # to a bundled price fixture so the business case still renders out of box.
+    # IDC_PRICING_OVERRIDE_PATH = optional JSON {old_sku_or_target: price} map
+    # for customer contract pricing (same old->new override shape as executor).
+    pricing_url: str = field(default_factory=lambda: _env("IDC_PRICING_URL"))
+    pricing_override_path: str = field(default_factory=lambda: _env("IDC_PRICING_OVERRIDE_PATH"))
+
+    # F6.5 — Tencent SMS/DTS migration runner. Empty by default, so F6 runs in
+    # "track only" mode (operator / external tool performs the migration,
+    # idc-migrate records state + runs validation gates). Wire when SMS API
+    # access is available.
+    sms_base: str = field(default_factory=lambda: _env("IDC_SMS_BASE"))
+    sms_region: str = field(default_factory=lambda: _env("IDC_SMS_REGION"))
+    sms_token: str = field(default_factory=lambda: _env("IDC_SMS_TOKEN"))
+
+    # F1 — network dependency discovery source.
+    # prometheus (custom connection exporter, falls back to fixture) |
+    # zabbix (custom item, falls back to fixture) | collector (agentless
+    # TCP-connection snapshot, the realistic primary source) | off (disabled).
+    # Standard Prometheus/Zabbix exporters do NOT expose per-connection dst
+    # ip:port, so the fixture (an `ss -tn`-style snapshot) is the default
+    # out-of-the-box source; live sources fall back to it on error/empty.
+    netdep_source: str = field(default_factory=lambda: _env("IDC_NETDEP_SOURCE", "collector"))
+    netdep_days: int = field(default_factory=lambda: _env_int("IDC_NETDEP_DAYS", 7))
+    # offline/fixture snapshot (default bundled fixture, like the other sources)
+    netdep_path: str = field(default_factory=lambda: _env("IDC_NETDEP_PATH", str(FIXTURES / "netdep.json")))
+
+    # derived helpers
     def has_servicenow(self) -> bool:
         return bool(self.sn_base and (self.sn_token or (self.sn_user and self.sn_password)))
 
@@ -91,6 +127,23 @@ class Settings:
 
     def has_prometheus(self) -> bool:
         return bool(self.prom_url)
+
+    def has_pricing(self) -> bool:
+        """True if a live pricing endpoint is configured (else cost.py uses
+        the bundled price fixture so the business case still renders)."""
+        return bool(self.pricing_url)
+
+    def has_sms(self) -> bool:
+        """True if the Tencent SMS/DTS runner is wired. False -> F6 track-only."""
+        return bool(self.sms_base and self.sms_token)
+
+    def netdep_enabled(self) -> bool:
+        """True if network-dependency discovery should run during rebuild.
+
+        The fixture snapshot is always available, so any source other than
+        ``off`` enables discovery (live sources fall back to the fixture on
+        error/empty, like the inventory adapters)."""
+        return (self.netdep_source or "").strip().lower() not in ("", "off")
 
 
 _settings: Optional[Settings] = None

@@ -14,9 +14,11 @@ env.
 """
 from __future__ import annotations
 
+import dataclasses
+import math
 from typing import List, Tuple
 
-from .models import Match, Server, Target
+from .models import ALL_SOURCES, Match, Server, Target
 
 # datacenter → Tencent Cloud region (edit to match the real DC mapping)
 REGION_MAP = {
@@ -60,6 +62,42 @@ def _az(region: str) -> str:
     return f"{region}-3"
 
 
+# ---------------------------------------------------------------------------
+# F3 — sizing strategy (pure; reused by match_server, right_size, cost.what_if)
+# ---------------------------------------------------------------------------
+# ``as_is``    : size from CMDB specs (cpu_cores/mem_gb) — lift-and-shift, keep
+#                current capacity (the historical match_server behavior).
+# ``measured`` / ``right_size`` : size from live utilization p95 — right-size to
+#                actual use, with a headroom factor so we don't under-provision
+#                spikes. Falls back to specs when no live utilization is present.
+RIGHT_SIZE_HEADROOM = 1.3   # 30% headroom over observed p95 utilization
+
+
+def _sizing_cpu_mem(s: Server, strategy: str = "as_is") -> Tuple[int, int]:
+    """(cpu, mem_gb) used for target sizing, by strategy.
+
+    See ``right_size`` for the public wrapper. ``measured`` interprets the
+    utilization p95 percentages as a fraction of the on-prem capacity
+    (cpu_cores/mem_gb), applies headroom, and rounds up to whole units.
+    """
+    strat = (strategy or "as_is").lower()
+    spec_cpu = s.cpu_cores or 2
+    spec_mem = s.mem_gb or 4
+    if strat in ("measured", "right_size", "right-size"):
+        u = s.utilization
+        cpu_p = u.cpu_p95 if u and u.cpu_p95 is not None else None
+        mem_p = u.mem_p95 if u and u.mem_p95 is not None else None
+        if cpu_p is None or mem_p is None:
+            return spec_cpu, spec_mem   # no live util -> keep specs
+        cpu = max(2, math.ceil(spec_cpu * (cpu_p / 100.0) * RIGHT_SIZE_HEADROOM))
+        mem = max(4, math.ceil(spec_mem * (mem_p / 100.0) * RIGHT_SIZE_HEADROOM))
+        # never exceed the on-prem capacity (right-size down, not up)
+        cpu = min(cpu, spec_cpu)
+        mem = min(mem, spec_mem)
+        return cpu, mem
+    return spec_cpu, spec_mem
+
+
 def _size_cvm(cpu: int, mem: int) -> Tuple[str, str]:
     for c, m, sku in CVM_TYPES:
         if c >= cpu and m >= mem:
@@ -80,10 +118,73 @@ def _largest_data_disk_gb(s: Server) -> int:
     return max((d.size_gb for d in data), default=0) or (max((d.size_gb for d in s.disks), default=0))
 
 
-def match_server(s: Server) -> Match:
+# ---------------------------------------------------------------------------
+# F4 — data-coverage confidence: how much do we actually know about this host?
+# ---------------------------------------------------------------------------
+# The base rule confidence (match_server's hardcoded 0.7-0.9) says "how well the
+# rule fits the role/sizing". The assessment-confidence below says "how much
+# real data backs that sizing". The final persisted confidence is base x
+# coverage x code-intel dips (see codeintel.enrich_match), so a thinly-known
+# host is never reported as high-confidence even when its role matches a rule.
+
+# fields whose presence indicates the host is actually characterized
+_KEY_FIELDS = ("role", "os", "cpu_cores", "mem_gb", "env", "business_criticality")
+
+
+def _utilization_is_measured(s: Server) -> bool:
+    """True when live utilization telemetry drives sizing (not just CMDB specs)."""
+    u = s.utilization
+    return bool(u and u.source in ("zabbix", "prometheus")
+                and u.cpu_p95 is not None and u.mem_p95 is not None)
+
+
+def sizing_basis_of(s: Server) -> str:
+    """'measured' when live utilization drives sizing, else 'estimated'."""
+    return "measured" if _utilization_is_measured(s) else "estimated"
+
+
+def _provenance_coverage(s: Server) -> float:
+    """Fraction of key characterization fields populated (0..1)."""
+    vals = (s.role, s.os, s.cpu_cores, s.mem_gb, s.env, s.business_criticality)
+    present = sum(1 for v in vals if v)
+    return present / len(_KEY_FIELDS)
+
+
+def assessment_confidence_of(s: Server, has_code_profile: bool = False) -> float:
+    """Data-coverage confidence score in [0,1] (F4).
+
+    Weighted: 0.25 source diversity + 0.35 live-utilization history + 0.20
+    key-field provenance coverage + 0.20 executor code profile. A host with
+    all four sources, live utilization, full key fields and a code profile
+    scores ~1.0; a CMDB-only host with no telemetry scores ~0.45.
+    """
+    src_count = len({r.get("source") for r in s.source_refs
+                     if r.get("source") in ALL_SOURCES})
+    diversity = min(src_count / 4.0, 1.0)
+    if _utilization_is_measured(s):
+        util = 1.0
+    elif s.utilization and s.utilization.cpu_p95 is not None:
+        util = 0.4   # some utilization present but not from a live source
+    else:
+        util = 0.0
+    cov = _provenance_coverage(s)
+    profile = 1.0 if has_code_profile else 0.0
+    score = 0.25 * diversity + 0.35 * util + 0.20 * cov + 0.20 * profile
+    return max(0.0, min(1.0, score))
+
+
+def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
+    """Rule-match one server to a Tencent Cloud target.
+
+    ``sizing_strategy`` is forwarded to ``_sizing_cpu_mem`` so the same rule
+    engine drives both the default ``as_is`` match and the F3 ``measured``
+    right-size path (see ``right_size``). Defaults to ``as_is`` (lift-and-shift
+    keeps on-prem capacity) — the historical behavior, so existing callers and
+    ``test_pipeline`` are unaffected.
+    """
     region = _region(s)
     az = _az(region)
-    cpu, mem = s.cpu_cores or 2, s.mem_gb or 4
+    cpu, mem = _sizing_cpu_mem(s, sizing_strategy)
     role = (s.role or "app").lower()
     stype = s.source_type or "vm"
     disk_gb = _largest_data_disk_gb(s)
@@ -187,5 +288,49 @@ def match_server(s: Server) -> Match:
                  alternatives=["容器化到 TKE (refactor)"])
 
 
-def match_servers(servers: List[Server]) -> List[Match]:
-    return [match_server(s) for s in servers]
+def match_servers(servers: List[Server], sizing_strategy: str = "as_is") -> List[Match]:
+    return [match_server(s, sizing_strategy) for s in servers]
+
+
+# ---------------------------------------------------------------------------
+# F3 — conversational what-if pure functions (no ingest re-run)
+# ---------------------------------------------------------------------------
+# These wrap match_server so the LLM copilot / ``cost.what_if`` can answer
+# "what if I right-size this host?" / "what if I move it to ap-guangzhou?"
+# without re-running ingest. Each returns a NEW Match (the original is
+# untouched) so the caller can diff targets or feed both into cost.what_if
+# for a delta. They are pure: same inputs -> same outputs, no DB, no LLM.
+
+
+def right_size(server: Server, strategy: str = "measured") -> Match:
+    """Re-match a server under an alternate sizing strategy (F3).
+
+    ``strategy``:
+      * ``"as_is"``     — keep on-prem capacity (cpu_cores/mem_gb); the
+                          lift-and-shift default. Identical to ``match_server``.
+      * ``"measured"`` / ``"right_size"`` — right-size from live utilization
+                          p95 with headroom (see ``_sizing_cpu_mem``). Smaller
+                          spec when the host is under-used; falls back to specs
+                          when no live utilization is available.
+
+    Returns a fresh ``Match`` whose ``target`` reflects the new sizing. The
+    rationale is annotated with the strategy + the cpu/mem used so the LLM can
+    narrate the change. Pure function.
+    """
+    m = match_server(server, sizing_strategy=strategy)
+    cpu, mem = _sizing_cpu_mem(server, strategy)
+    note = f" [what-if sizing={strategy} -> {cpu}vCPU/{mem}GB]"
+    return dataclasses.replace(m, rationale=(m.rationale or "") + note)
+
+
+def re_region(server: Server, region: str) -> Match:
+    """Re-match a server as if its target region were ``region`` (F3).
+
+    Keeps the product/spec sizing (``as_is``) and only swaps the region + AZ,
+    so the caller can compare run-cost across regions without re-ingest. Pure.
+    """
+    m = match_server(server, sizing_strategy="as_is")
+    new_target = dataclasses.replace(m.target, region=region, az=_az(region))
+    note = f" [what-if region={region}]"
+    return dataclasses.replace(m, target=new_target,
+                               rationale=(m.rationale or "") + note)

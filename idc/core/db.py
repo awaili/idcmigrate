@@ -1,38 +1,37 @@
-"""Storage for idc-migrate — dual SQLite / MariaDB backend.
+"""Storage for idc-migrate — MariaDB backend (pymysql).
 
-Stdlib ``sqlite3`` for the portable default (no server, used by tests and
-offline runs); ``pymysql`` for MariaDB on the DB box at scale. The dialect is
-picked from ``IDC_DB_URL``:
-
-  * ``sqlite:///<path>``  or a bare filesystem path  → SQLite
-  * ``mysql://user:pass@host:port/db`` / ``mariadb://...`` → MariaDB
-
-Both backends share one ``Store`` API and the same method bodies; only a few
-dialect primitives differ (placeholder, upsert clause, JSON cast, string
-concat, DDL). Complex fields (disks, util, source_refs, target, ...) are
-stored as JSON text columns; both ``json_extract`` (SQLite) and
-``JSON_EXTRACT`` (MariaDB 10.2+) work on them.
+The DB lives on the DB box at ``10.0.0.3:3306`` (MariaDB 10.5); the dialect is
+fixed via ``IDC_DB_URL=mysql://user:pass@host:port/db`` (``mariadb://`` is also
+accepted). ``Store`` keeps a small connection pool (pymysql, DictCursor,
+autocommit) and shares one API across all callers. Complex fields (disks, util,
+source_refs, target, ...) are stored as JSON columns; reads use
+``JSON_EXTRACT`` / ``JSON_UNQUOTE`` / ``JSON_LENGTH`` (MariaDB 10.2+).
 """
 from __future__ import annotations
 
-import json
-import sqlite3
 import threading
 import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .models import (
     AgentTask,
+    AppStrategy,
+    ChangeJob,
+    CodeProfile,
+    CostEstimate,
+    DBConversionProfile,
     IngestRun,
     Match,
+    MigrationJob,
+    ScanFinding,
     Server,
     Target,
     Wave,
     Workload,
+    _now,
     dumps,
     loads,
 )
@@ -60,116 +59,12 @@ class ServerFilter:
 
 
 # ---------------------------------------------------------------------------
-# schema — one per dialect. JSON columns are TEXT on sqlite, JSON on MariaDB.
-# ---------------------------------------------------------------------------
-SCHEMA_SQLITE = """
-CREATE TABLE IF NOT EXISTS raw_assets (
-    source      TEXT NOT NULL,
-    source_id   TEXT NOT NULL,
-    hostname    TEXT,
-    fqdn        TEXT,
-    ip          TEXT,
-    attrs       TEXT,
-    ingested_at TEXT,
-    PRIMARY KEY (source, source_id)
-);
-CREATE INDEX IF NOT EXISTS idx_raw_hostname ON raw_assets(hostname);
-CREATE INDEX IF NOT EXISTS idx_raw_ip ON raw_assets(ip);
-
-CREATE TABLE IF NOT EXISTS servers (
-    id            TEXT PRIMARY KEY,
-    hostname      TEXT,
-    fqdn          TEXT,
-    ips           TEXT,
-    source_type   TEXT,
-    role          TEXT,
-    os            TEXT,
-    os_version    TEXT,
-    cpu_cores     INTEGER,
-    cpu_model     TEXT,
-    mem_gb        INTEGER,
-    disks         TEXT,
-    subnet        TEXT,
-    vlan          TEXT,
-    datacenter    TEXT,
-    cluster       TEXT,
-    env           TEXT,
-    app_ids       TEXT,
-    tags          TEXT,
-    business_criticality TEXT,
-    migration_tier TEXT,
-    utilization   TEXT,
-    source_refs   TEXT,
-    status        TEXT,
-    created_at    TEXT,
-    updated_at    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_srv_role ON servers(role);
-CREATE INDEX IF NOT EXISTS idx_srv_env ON servers(env);
-CREATE INDEX IF NOT EXISTS idx_srv_status ON servers(status);
-CREATE INDEX IF NOT EXISTS idx_srv_os ON servers(os);
-CREATE INDEX IF NOT EXISTS idx_srv_crit ON servers(business_criticality);
-CREATE INDEX IF NOT EXISTS idx_srv_stype ON servers(source_type);
-CREATE INDEX IF NOT EXISTS idx_srv_cluster ON servers(cluster);
-
-CREATE TABLE IF NOT EXISTS workloads (
-    app_id     TEXT PRIMARY KEY,
-    name       TEXT,
-    tier       TEXT,
-    env        TEXT,
-    server_ids TEXT,
-    depends_on TEXT,
-    notes      TEXT
-);
-
-CREATE TABLE IF NOT EXISTS matches (
-    server_id  TEXT PRIMARY KEY,
-    target     TEXT,
-    confidence REAL,
-    method     TEXT,
-    rationale  TEXT,
-    alternatives TEXT,
-    created_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_match_conf ON matches(confidence);
-
-CREATE TABLE IF NOT EXISTS waves (
-    id          TEXT PRIMARY KEY,
-    name        TEXT,
-    stage       TEXT,
-    server_ids  TEXT,
-    depends_on  TEXT,
-    rationale   TEXT,
-    status      TEXT
-);
-
-CREATE TABLE IF NOT EXISTS ingest_runs (
-    id          TEXT PRIMARY KEY,
-    source      TEXT,
-    mode        TEXT,
-    raw_count   INTEGER,
-    started_at  TEXT,
-    finished_at TEXT,
-    error       TEXT
-);
-
-CREATE TABLE IF NOT EXISTS agent_tasks (
-    id          TEXT PRIMARY KEY,
-    prompt      TEXT,
-    mode        TEXT,
-    status      TEXT,
-    created_at  TEXT,
-    finished_at TEXT,
-    output      TEXT,
-    error       TEXT
-);
-"""
-
-# MariaDB: ids are short text (srv-/wave-/…), JSON fields use the JSON alias,
+# schema — ids are short text (srv-/wave-/…), JSON fields use the JSON alias,
 # sizes are VARCHAR to act as PRIMARY KEY / indexed cols (TEXT can't be PK in
 # MySQL without a prefix length). Indexes are created without IF NOT EXISTS
 # (MariaDB 10.5 lacks it) — _exec_schema tolerates "Duplicate key name".
-SCHEMA_MARIADB = """
+# ---------------------------------------------------------------------------
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS raw_assets (
     source      VARCHAR(32)  NOT NULL,
     source_id   VARCHAR(255) NOT NULL,
@@ -208,6 +103,8 @@ CREATE TABLE IF NOT EXISTS servers (
     utilization   JSON,
     source_refs   JSON,
     status        VARCHAR(32),
+    sizing_basis         VARCHAR(16),   -- F4: measured / estimated
+    assessment_confidence DOUBLE,         -- F4: data-coverage score 0..1
     created_at    VARCHAR(40),
     updated_at    VARCHAR(40),
     KEY idx_srv_role (role),
@@ -270,71 +167,185 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     output      LONGTEXT,
     error       TEXT
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS code_profiles (
+    app_id            VARCHAR(128) PRIMARY KEY,
+    repo_url          VARCHAR(512),
+    branch            VARCHAR(128),
+    scan_id           VARCHAR(64),
+    scanner           VARCHAR(128),
+    scanned_at        VARCHAR(40),
+    language          VARCHAR(32),
+    runtime           VARCHAR(64),
+    framework         VARCHAR(128),
+    cloud_readiness   DOUBLE,
+    migration_pattern VARCHAR(16),
+    refactor_effort   VARCHAR(8),
+    findings          LONGTEXT,
+    code_deps         JSON,
+    network_endpoints JSON,
+    required_changes  JSON,
+    blockers          JSON,
+    summary           TEXT,
+    updated_at        VARCHAR(40)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- F9 — code profile provenance (repo / runtime-derived). ALTER in place.
+ALTER TABLE code_profiles ADD COLUMN IF NOT EXISTS source VARCHAR(24);
+
+CREATE TABLE IF NOT EXISTS app_strategies (
+    app_id        VARCHAR(128) PRIMARY KEY,
+    strategy      VARCHAR(24),
+    rationale     TEXT,
+    target        VARCHAR(64),
+    confidence    DOUBLE,
+    effort        VARCHAR(8),
+    key_changes   JSON,
+    source        VARCHAR(16),
+    assigned_at   VARCHAR(40),
+    updated_at    VARCHAR(40)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS change_jobs (
+    id          VARCHAR(64) PRIMARY KEY,
+    app_id      VARCHAR(128),
+    kind        VARCHAR(16),
+    repo_url    VARCHAR(512),
+    branch      VARCHAR(128),
+    status      VARCHAR(32),
+    patch_ref   VARCHAR(512),
+    summary     TEXT,
+    error       TEXT,
+    created_at  VARCHAR(40),
+    finished_at VARCHAR(40),
+    KEY idx_cjob_app (app_id),
+    KEY idx_cjob_status (status)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS questions (
+    id          VARCHAR(64) PRIMARY KEY,
+    app_id      VARCHAR(128),
+    job_id      VARCHAR(64),       -- ChangeJob that raised it (optional)
+    kind        VARCHAR(16),       -- value | choice | confirm
+    prompt      TEXT,             -- the human-facing question
+    options     JSON,             -- for choice: ["${DB_HOST}", "${DB_HOST_RO}"]
+    context     JSON,             -- {file, line, evidence, category, old, new, ...}
+    status      VARCHAR(16),      -- pending | answered | skipped
+    answer      TEXT,             -- operator's answer once status=answered
+    answered_by VARCHAR(128),
+    created_at  VARCHAR(40),
+    answered_at VARCHAR(40),
+    KEY idx_q_app (app_id),
+    KEY idx_q_status (status)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS cost_estimates (
+    server_id       VARCHAR(64) PRIMARY KEY,
+    target_product  VARCHAR(32),
+    spec            VARCHAR(128),
+    region          VARCHAR(32),
+    monthly_usd     DOUBLE,
+    yearly_usd      DOUBLE,
+    basis           VARCHAR(16),      -- measured / estimated
+    pricing_source  VARCHAR(16),      -- public / contract
+    computed_at     VARCHAR(40)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS migration_jobs (
+    id               VARCHAR(64) PRIMARY KEY,
+    server_id        VARCHAR(64),
+    app_id           VARCHAR(128),
+    wave_id          VARCHAR(64),
+    kind             VARCHAR(16),     -- host / db / code
+    executor_ref     VARCHAR(255),    -- SMS/DTS job id / ChangeJob id / external ref
+    status           VARCHAR(24),     -- planned/replicating/tested/ready_for_cutover/cut_over/finalized/rolled_back
+    stage_history    JSON,            -- [{status, at, note, by}] append-only audit
+    validation_gates JSON,            -- [{name, kind, must_pass, result, at}]
+    created_at       VARCHAR(40),
+    updated_at       VARCHAR(40),
+    KEY idx_mjob_server (server_id),
+    KEY idx_mjob_wave (wave_id),
+    KEY idx_mjob_status (status)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS business_case_snapshots (
+    id          VARCHAR(64) PRIMARY KEY,
+    created_at  VARCHAR(40),
+    payload     LONGTEXT              -- full JSON of the business-case run
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- F5 — heterogeneous DB conversion profiles (one row per DB host, keyed by
+-- db_server_id). Pushed by the executor's DB-scan step and consumed by
+-- codeintel.enrich_match_db to bias match confidence + wave deferral.
+CREATE TABLE IF NOT EXISTS db_profiles (
+    db_server_id       VARCHAR(64) PRIMARY KEY,
+    source_engine      VARCHAR(32),
+    target_engine      VARCHAR(32),
+    difficulty         VARCHAR(4),       -- A / B / C
+    est_man_days       DOUBLE,
+    review_objects     JSON,
+    blockers           JSON,
+    reverse_replication BOOLEAN,
+    auto_convert_pct   DOUBLE,
+    scan_id            VARCHAR(64),
+    scanned_at         VARCHAR(40),
+    summary            TEXT,
+    updated_at         VARCHAR(40)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- F8 — Landing Zone archetype status (per archetype: not_ready/applied/finalized).
+-- Operator persists the LZ lifecycle so the wave-launch placement gate
+-- (check_lz_gate) can block workload waves until the target archetype's LZ
+-- Terraform is applied + finalized.
+CREATE TABLE IF NOT EXISTS lz_status (
+    archetype   VARCHAR(16) PRIMARY KEY,
+    status      VARCHAR(16) NOT NULL,
+    updated_at  VARCHAR(40),
+    updated_by  VARCHAR(64)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- F4 server columns migrated in place via ALTER IF NOT EXISTS
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS sizing_basis VARCHAR(16);
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS assessment_confidence DOUBLE;
 """
 
 
 class Store:
-    """Dialect-aware store. ``url`` is an IDC_DB_URL string or a filesystem
-    path (interpreted as SQLite at that path)."""
+    """MariaDB-backed store. ``url`` is an ``IDC_DB_URL`` string
+    (``mysql://`` or ``mariadb://``)."""
 
-    def __init__(self, url: str | Path):
-        self.dialect, self._sqlite_path, self._mysql = self._parse(url)
-        # placeholder char and per-dialect bits
-        self.ph = "%s" if self.dialect == "mariadb" else "?"
-        if self.dialect == "sqlite":
-            self._conn: Optional[sqlite3.Connection] = None
-            # sqlite3 connection objects are not safe for concurrent use; every
-            # access is serialized through this lock (FastAPI threadpool).
-            self._lock = threading.RLock()
-        else:
-            self._pool: Optional[Queue] = None
-            self._pool_lock = threading.Lock()
-            self._pool_max = 8
+    def __init__(self, url: str):
+        self._mysql = self._parse(url)
+        self.ph = "%s"
+        self._pool: Optional[Queue] = None
+        self._pool_lock = threading.Lock()
+        self._pool_max = 8
 
     # -- url parsing / connection setup -----------------------------------
     @staticmethod
-    def _parse(url) -> tuple:
+    def _parse(url) -> dict:
         s = str(url)
-        if s.startswith(("mysql://", "mariadb://")):
-            p = urllib.parse.urlparse(s)
-            cfg = {
-                "host": p.hostname or "10.0.0.3",
-                "port": p.port or 3306,
-                "user": urllib.parse.unquote(p.username or ""),
-                "password": urllib.parse.unquote(p.password or ""),
-                "db": (p.path or "/").lstrip("/"),
-            }
-            return "mariadb", None, cfg
-        if s.startswith("sqlite:///"):
-            return "sqlite", Path(s[len("sqlite:///"):]), None
-        # bare path → sqlite at that path
-        return "sqlite", Path(s), None
-
-    def _open_sqlite(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self._sqlite_path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        self._exec_schema(conn, SCHEMA_SQLITE, sqlite=True)
-        return conn
+        if not s.startswith(("mysql://", "mariadb://")):
+            raise ValueError(
+                f"IDC_DB_URL must be mysql:// or mariadb:// (got {s!r}); "
+                "the SQLite backend was removed")
+        p = urllib.parse.urlparse(s)
+        return {
+            "host": p.hostname or "10.0.0.3",
+            "port": p.port or 3306,
+            "user": urllib.parse.unquote(p.username or ""),
+            "password": urllib.parse.unquote(p.password or ""),
+            "db": (p.path or "/").lstrip("/"),
+        }
 
     def _new_mysql(self):
-        import pymysql  # lazy: SQLite-only users don't need the driver
+        import pymysql  # lazy import
         return pymysql.connect(
             host=self._mysql["host"], port=self._mysql["port"],
             user=self._mysql["user"], password=self._mysql["password"],
             database=self._mysql["db"], charset="utf8mb4",
             autocommit=True, cursorclass=pymysql.cursors.DictCursor,
         )
-
-    # sqlite shared connection (used only on the sqlite path)
-    def connect(self) -> sqlite3.Connection:
-        if self.dialect != "sqlite":
-            raise RuntimeError("connect() is sqlite-only; use tx/_read on mariadb")
-        with self._lock:
-            if self._conn is None:
-                self._conn = self._open_sqlite()
-            return self._conn
 
     # -- mariadb pool ------------------------------------------------------
     def _pool_get(self):
@@ -360,44 +371,34 @@ class Store:
         except Exception:
             pass
 
-    # -- dialect primitives ------------------------------------------------
+    # -- driver primitives -------------------------------------------------
     def _x(self, sql: str) -> str:
-        """Translate ``?`` placeholders to the active driver's marker."""
-        return sql.replace("?", "%s") if self.dialect == "mariadb" else sql
+        """Translate ``?`` placeholders to pymysql's ``%s`` marker."""
+        return sql.replace("?", "%s")
 
     def _cast_real(self, expr: str) -> str:
         """Numeric cast for json_extract results."""
-        if self.dialect == "mariadb":
-            return f"CAST({expr} AS DECIMAL(20,4))"
-        return f"CAST({expr} AS REAL)"
+        return f"CAST({expr} AS DECIMAL(20,4))"
 
     def _jq(self, extract_expr: str) -> str:
         """Unquote a json_extract *string* scalar for compare/group/facet.
         MariaDB's JSON_EXTRACT returns the JSON representation (strings come
-        back double-quoted); SQLite returns the raw scalar unquoted."""
-        if self.dialect == "mariadb":
-            return f"JSON_UNQUOTE({extract_expr})"
-        return extract_expr
+        back double-quoted), so JSON_UNQUOTE strips that."""
+        return f"JSON_UNQUOTE({extract_expr})"
 
     def _json_array_len(self, col: str) -> str:
-        if self.dialect == "mariadb":
-            return f"JSON_LENGTH({col})"
-        return f"json_array_length({col})"
+        return f"JSON_LENGTH({col})"
 
     def _upsert_sql(self, table: str, cols: List[str], pk: str) -> str:
         cols = list(cols)
         placeholders = ", ".join(["?"] * len(cols))
         cols_csv = ", ".join(cols)
         set_cols = [c for c in cols if c != pk]
-        if self.dialect == "mariadb":
-            set_clause = ", ".join(f"{c}=VALUES({c})" for c in set_cols)
-            return (f"INSERT INTO {table}({cols_csv}) VALUES({placeholders}) "
-                    f"ON DUPLICATE KEY UPDATE {set_clause}")
-        set_clause = ", ".join(f"{c}=excluded.{c}" for c in set_cols)
+        set_clause = ", ".join(f"{c}=VALUES({c})" for c in set_cols)
         return (f"INSERT INTO {table}({cols_csv}) VALUES({placeholders}) "
-                f"ON CONFLICT({pk}) DO UPDATE SET {set_clause}")
+                f"ON DUPLICATE KEY UPDATE {set_clause}")
 
-    def _exec_schema(self, conn, schema: str, sqlite: bool) -> None:
+    def _exec_schema(self, conn, schema: str) -> None:
         cur = conn.cursor()
         try:
             for stmt in (s.strip() for s in schema.split(";")):
@@ -406,9 +407,10 @@ class Store:
                 try:
                     cur.execute(stmt)
                 except Exception as e:
-                    # tolerate duplicate index names on re-run (MariaDB 10.5 has
-                    # no CREATE INDEX IF NOT EXISTS)
-                    if "Duplicate key name" in str(e) or "already exists" in str(e):
+                    # tolerate duplicate index names on re-run (MariaDB 10.5
+                    # has no CREATE INDEX IF NOT EXISTS)
+                    if ("Duplicate key name" in str(e) or "already exists" in str(e)
+                            or "Duplicate column" in str(e)):
                         continue
                     raise
         finally:
@@ -416,62 +418,40 @@ class Store:
                 cur.close()
             except Exception:
                 pass
-        if sqlite:
-            conn.commit()
 
-    # -- transaction / read helpers (dialect-unified) ----------------------
+    # -- transaction / read helpers ---------------------------------------
     @contextmanager
     def tx(self):
-        """Write transaction. Holds the sqlite lock / a pooled mariadb conn."""
-        if self.dialect == "mariadb":
-            conn = self._pool_get()
-            cur = conn.cursor()
+        """Write transaction. Holds a pooled mariadb conn."""
+        conn = self._pool_get()
+        cur = conn.cursor()
+        try:
+            conn.begin()
+            yield cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
             try:
-                conn.begin()
-                yield cur
-                conn.commit()
+                cur.close()
             except Exception:
-                conn.rollback()
-                raise
-            finally:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
-                self._pool_put(conn)
-        else:
-            with self._lock:
-                conn = self.connect()
-                cur = conn.cursor()
-                try:
-                    yield cur
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    raise
+                pass
+            self._pool_put(conn)
 
     @contextmanager
     def _read_cursor(self):
         """A cursor for one or more reads. Don't use for writes."""
-        if self.dialect == "mariadb":
-            conn = self._pool_get()
-            cur = conn.cursor()
+        conn = self._pool_get()
+        cur = conn.cursor()
+        try:
+            yield cur
+        finally:
             try:
-                yield cur
-            finally:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
-                self._pool_put(conn)
-        else:
-            with self._lock:
-                conn = self.connect()
-                cur = conn.cursor()
-                try:
-                    yield cur
-                finally:
-                    cur.close()
+                cur.close()
+            except Exception:
+                pass
+            self._pool_put(conn)
 
     def _fetchall(self, sql: str, args: Iterable = ()) -> List[Dict[str, Any]]:
         with self._read_cursor() as cur:
@@ -492,20 +472,14 @@ class Store:
         return next(iter(r.values()))
 
     def close(self) -> None:
-        if self.dialect == "mariadb":
-            with self._pool_lock:
-                pool, self._pool = self._pool, None
-            if pool is not None:
-                while True:
-                    try:
-                        pool.get_nowait().close()
-                    except Empty:
-                        break
-        else:
-            with self._lock:
-                if self._conn:
-                    self._conn.close()
-                    self._conn = None
+        with self._pool_lock:
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            while True:
+                try:
+                    pool.get_nowait().close()
+                except Empty:
+                    break
 
     # -- raw assets --------------------------------------------------------
     def upsert_raw(self, assets: Iterable[Any]) -> int:
@@ -531,8 +505,9 @@ class Store:
                     "os_version", "cpu_cores", "cpu_model", "mem_gb", "disks",
                     "subnet", "vlan", "datacenter", "cluster", "env", "app_ids",
                     "tags", "business_criticality", "migration_tier",
-                    "utilization", "source_refs", "status", "created_at",
-                    "updated_at"]
+                    "utilization", "source_refs", "status",
+                    "sizing_basis", "assessment_confidence",
+                    "created_at", "updated_at"]
 
     def upsert_server(self, s: Server) -> None:
         sql = self._upsert_sql("servers", self._SERVER_COLS, "id")
@@ -545,7 +520,8 @@ class Store:
                          dumps(s.app_ids), dumps(s.tags),
                          s.business_criticality, s.migration_tier,
                          dumps(s.utilization.to_dict()), dumps(s.source_refs),
-                         s.status, s.created_at, s.updated_at))
+                         s.status, s.sizing_basis, s.assessment_confidence,
+                         s.created_at, s.updated_at))
 
     def _row_to_server(self, r) -> Server:
         d = dict(r)
@@ -639,13 +615,9 @@ class Store:
         if f.wave_id:
             # membership stored as a JSON array text in waves.server_ids.
             # Pass the '%' wildcards as params (a literal % in the SQL breaks
-            # pymysql's mogrify). MariaDB has CONCAT; sqlite uses ||.
-            if self.dialect == "mariadb":
-                where.append("EXISTS (SELECT 1 FROM waves WHERE waves.id=? "
-                             "AND waves.server_ids LIKE CONCAT(?, servers.id, ?))")
-            else:
-                where.append("EXISTS (SELECT 1 FROM waves WHERE waves.id=? "
-                             "AND waves.server_ids LIKE ? || servers.id || ?)")
+            # pymysql's mogrify).
+            where.append("EXISTS (SELECT 1 FROM waves WHERE waves.id=? "
+                         "AND waves.server_ids LIKE CONCAT(?, servers.id, ?))")
             args.append(f.wave_id)
             args.append('%"')
             args.append('"%')
@@ -748,8 +720,9 @@ class Store:
     def stream_servers_csv(self, f: "ServerFilter", order_by: str = "hostname"):
         """Yield CSV rows lazily for streaming export (no full load).
 
-        Uses a dedicated cursor (not the shared sqlite connection / a pooled
-        mariadb conn held long-term) so a long stream doesn't block writes."""
+        Uses a dedicated cursor on a pooled mariadb conn held long-term — a
+        long stream doesn't block writes (the conn isn't returned to the pool
+        until the generator closes)."""
         import csv as _csv, io
         where, args, join_matches = self._filters_sql(f)
         join = " LEFT JOIN matches ON matches.server_id=servers.id" if join_matches else ""
@@ -927,6 +900,290 @@ class Store:
         return [dict(r) for r in self._fetchall(
             "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?", (limit,))]
 
+    # -- code profiles (from external agent executor) ----------------------
+    _PROFILE_COLS = ["app_id", "repo_url", "branch", "scan_id", "scanner",
+                     "scanned_at", "language", "runtime", "framework",
+                     "cloud_readiness", "migration_pattern", "refactor_effort",
+                     "findings", "code_deps", "network_endpoints",
+                     "required_changes", "blockers", "summary", "source", "updated_at"]
+
+    def upsert_code_profile(self, p: CodeProfile) -> None:
+        sql = self._upsert_sql("code_profiles", self._PROFILE_COLS, "app_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                p.app_id, p.repo_url, p.branch, p.scan_id, p.scanner,
+                p.scanned_at, p.language, p.runtime, p.framework,
+                p.cloud_readiness, p.migration_pattern, p.refactor_effort,
+                dumps([f.to_dict() for f in p.findings]),
+                dumps(p.code_deps), dumps(p.network_endpoints),
+                dumps(p.required_changes), dumps(p.blockers),
+                p.summary, p.source or "repo", p.updated_at))
+
+    def _row_to_profile(self, d: Dict[str, Any]) -> CodeProfile:
+        d = dict(d)
+        d["findings"] = [ScanFinding.from_dict(x) for x in (loads(d.get("findings")) or [])]
+        d["code_deps"] = loads(d.get("code_deps")) or []
+        d["network_endpoints"] = loads(d.get("network_endpoints")) or []
+        d["required_changes"] = loads(d.get("required_changes")) or []
+        d["blockers"] = loads(d.get("blockers")) or []
+        # F9 — pre-ALTER rows have source=NULL; default to "repo"
+        if not d.get("source"):
+            d["source"] = "repo"
+        return CodeProfile.from_dict(d)
+
+    def list_code_profiles(self) -> List[CodeProfile]:
+        return [self._row_to_profile(r) for r in
+                self._fetchall("SELECT * FROM code_profiles ORDER BY updated_at DESC")]
+
+    def get_code_profile(self, app_id: str) -> Optional[CodeProfile]:
+        r = self._fetchone("SELECT * FROM code_profiles WHERE app_id=?", (app_id,))
+        return self._row_to_profile(r) if r else None
+
+    def delete_code_profile(self, app_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM code_profiles WHERE app_id=?"), (app_id,))
+
+    # -- DB conversion profiles (F5 — heterogeneous DB migration assessment) -
+    _DBP_COLS = ["db_server_id", "source_engine", "target_engine", "difficulty",
+                 "est_man_days", "review_objects", "blockers",
+                 "reverse_replication", "auto_convert_pct", "scan_id",
+                 "scanned_at", "summary", "updated_at"]
+
+    def upsert_db_profile(self, d: DBConversionProfile) -> None:
+        sql = self._upsert_sql("db_profiles", self._DBP_COLS, "db_server_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                d.db_server_id, d.source_engine, d.target_engine, d.difficulty,
+                d.est_man_days, dumps(d.review_objects), dumps(d.blockers),
+                bool(d.reverse_replication), d.auto_convert_pct, d.scan_id,
+                d.scanned_at, d.summary, d.updated_at))
+
+    def _row_to_db_profile(self, d: Dict[str, Any]) -> DBConversionProfile:
+        d = dict(d)
+        d["review_objects"] = loads(d.get("review_objects")) or []
+        d["blockers"] = loads(d.get("blockers")) or []
+        # MariaDB stores BOOLEAN as TINYINT (0/1); coerce back to a real bool
+        # so the model stays typed regardless of driver.
+        d["reverse_replication"] = bool(d.get("reverse_replication"))
+        return DBConversionProfile.from_dict(d)
+
+    def list_db_profiles(self) -> List[DBConversionProfile]:
+        return [self._row_to_db_profile(r) for r in
+                self._fetchall("SELECT * FROM db_profiles ORDER BY updated_at DESC")]
+
+    def get_db_profile(self, db_server_id: str) -> Optional[DBConversionProfile]:
+        r = self._fetchone("SELECT * FROM db_profiles WHERE db_server_id=?", (db_server_id,))
+        return self._row_to_db_profile(r) if r else None
+
+    def delete_db_profile(self, db_server_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM db_profiles WHERE db_server_id=?"), (db_server_id,))
+
+    # -- LZ archetype status (F8 — Landing Zone placement gate) --
+    def set_lz_status(self, archetype: str, status: str,
+                      updated_by: str = "operator") -> None:
+        """Upsert the lifecycle status of one LZ archetype (not_ready /
+        applied / finalized). Drives the wave-launch placement gate."""
+        sql = self._upsert_sql("lz_status",
+                               ["archetype", "status", "updated_at", "updated_by"],
+                               "archetype")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (archetype, status, _now(), updated_by))
+
+    def get_lz_status(self, archetype: str) -> str:
+        r = self._fetchone("SELECT status FROM lz_status WHERE archetype=?", (archetype,))
+        return r["status"] if r else "not_ready"
+
+    def list_lz_status(self) -> Dict[str, str]:
+        return {r["archetype"]: r["status"]
+                for r in self._fetchall("SELECT archetype, status FROM lz_status")}
+
+    def delete_lz_status(self, archetype: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM lz_status WHERE archetype=?"), (archetype,))
+
+    # -- app strategies (AI-assigned 7R, separate from executor profiles) --
+    _STRATEGY_COLS = ["app_id", "strategy", "rationale", "target", "confidence",
+                      "effort", "key_changes", "source", "assigned_at", "updated_at"]
+
+    def upsert_app_strategy(self, s: AppStrategy) -> None:
+        sql = self._upsert_sql("app_strategies", self._STRATEGY_COLS, "app_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                s.app_id, s.strategy, s.rationale, s.target, s.confidence,
+                s.effort, dumps(s.key_changes), s.source, s.assigned_at, s.updated_at))
+
+    def _row_to_strategy(self, d: Dict[str, Any]) -> AppStrategy:
+        d = dict(d)
+        d["key_changes"] = loads(d.get("key_changes")) or []
+        return AppStrategy.from_dict(d)
+
+    def list_app_strategies(self) -> List[AppStrategy]:
+        return [self._row_to_strategy(r) for r in
+                self._fetchall("SELECT * FROM app_strategies ORDER BY updated_at DESC")]
+
+    def get_app_strategy(self, app_id: str) -> Optional[AppStrategy]:
+        r = self._fetchone("SELECT * FROM app_strategies WHERE app_id=?", (app_id,))
+        return self._row_to_strategy(r) if r else None
+
+    def delete_app_strategy(self, app_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM app_strategies WHERE app_id=?"), (app_id,))
+
+    # -- change jobs (executor audit trail) --------------------------------
+    _CJOB_COLS = ["id", "app_id", "kind", "repo_url", "branch", "status",
+                  "patch_ref", "summary", "error", "created_at", "finished_at"]
+
+    def upsert_change_job(self, j: ChangeJob) -> None:
+        sql = self._upsert_sql("change_jobs", self._CJOB_COLS, "id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                j.id, j.app_id, j.kind, j.repo_url, j.branch, j.status,
+                j.patch_ref, j.summary, j.error, j.created_at, j.finished_at))
+
+    # alias matching the create/update naming used for agent_tasks
+    create_change_job = upsert_change_job
+    update_change_job = upsert_change_job
+
+    def get_change_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        r = self._fetchone("SELECT * FROM change_jobs WHERE id=?", (job_id,))
+        return dict(r) if r else None
+
+    def list_change_jobs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        return [dict(r) for r in self._fetchall(
+            "SELECT * FROM change_jobs ORDER BY created_at DESC LIMIT ?", (limit,))]
+
+    # -- questions (executor ↔ operator) -------------------------------------
+    _Q_COLS = ["id", "app_id", "job_id", "kind", "prompt", "options", "context",
+               "status", "answer", "answered_by", "created_at", "answered_at"]
+
+    def upsert_question(self, q) -> None:
+        from .models import Question  # local import avoids cycle at module load
+        sql = self._upsert_sql("questions", self._Q_COLS, "id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                q.id, q.app_id, q.job_id, q.kind, q.prompt,
+                dumps(q.options), dumps(q.context),
+                q.status, q.answer, q.answered_by, q.created_at, q.answered_at))
+
+    def get_question(self, qid: str):
+        from .models import Question
+        r = self._fetchone("SELECT * FROM questions WHERE id=?", (qid,))
+        if not r:
+            return None
+        d = dict(r)
+        d["options"] = loads(d.get("options")) or []
+        d["context"] = loads(d.get("context")) or {}
+        return Question.from_dict(d)
+
+    def list_questions(self, app_id: Optional[str] = None,
+                       status: Optional[str] = None) -> list:
+        from .models import Question
+        clauses, args = [], []
+        if app_id:
+            clauses.append("app_id=?"); args.append(app_id)
+        if status:
+            clauses.append("status=?"); args.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self._fetchall(
+            f"SELECT * FROM questions{where} ORDER BY created_at DESC",
+            tuple(args))
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["options"] = loads(d.get("options")) or []
+            d["context"] = loads(d.get("context")) or {}
+            out.append(Question.from_dict(d))
+        return out
+
+    # -- cost estimates (F2 — TCO per server) ------------------------------
+    _COST_COLS = ["server_id", "target_product", "spec", "region", "monthly_usd",
+                  "yearly_usd", "basis", "pricing_source", "computed_at"]
+
+    def upsert_cost(self, c: CostEstimate) -> None:
+        sql = self._upsert_sql("cost_estimates", self._COST_COLS, "server_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                c.server_id, c.target_product, c.spec, c.region,
+                c.monthly_usd, c.yearly_usd, c.basis, c.pricing_source,
+                c.computed_at))
+
+    def get_cost(self, server_id: str) -> Optional[CostEstimate]:
+        r = self._fetchone("SELECT * FROM cost_estimates WHERE server_id=?", (server_id,))
+        return CostEstimate.from_dict(dict(r)) if r else None
+
+    def list_costs(self) -> List[CostEstimate]:
+        return [CostEstimate.from_dict(dict(r)) for r in
+                self._fetchall("SELECT * FROM cost_estimates ORDER BY server_id")]
+
+    def delete_cost(self, server_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM cost_estimates WHERE server_id=?"), (server_id,))
+
+    # -- migration jobs (F6 — per-host migration execution state) ----------
+    _MJOB_COLS = ["id", "server_id", "app_id", "wave_id", "kind", "executor_ref",
+                  "status", "stage_history", "validation_gates", "created_at", "updated_at"]
+
+    def upsert_migration_job(self, j: MigrationJob) -> None:
+        sql = self._upsert_sql("migration_jobs", self._MJOB_COLS, "id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                j.id, j.server_id, j.app_id, j.wave_id, j.kind, j.executor_ref,
+                j.status, dumps(j.stage_history), dumps(j.validation_gates),
+                j.created_at, j.updated_at))
+
+    def _row_to_migration_job(self, d: Dict[str, Any]) -> MigrationJob:
+        d = dict(d)
+        d["stage_history"] = loads(d.get("stage_history")) or []
+        d["validation_gates"] = loads(d.get("validation_gates")) or []
+        return MigrationJob.from_dict(d)
+
+    def get_migration_job(self, job_id: str) -> Optional[MigrationJob]:
+        r = self._fetchone("SELECT * FROM migration_jobs WHERE id=?", (job_id,))
+        return self._row_to_migration_job(r) if r else None
+
+    def list_migration_jobs(self, wave_id: Optional[str] = None,
+                            status: Optional[str] = None,
+                            server_id: Optional[str] = None) -> List[MigrationJob]:
+        clauses: List[str] = []
+        args: List[Any] = []
+        if wave_id:
+            clauses.append("wave_id=?"); args.append(wave_id)
+        if status:
+            clauses.append("status=?"); args.append(status)
+        if server_id:
+            clauses.append("server_id=?"); args.append(server_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self._fetchall(
+            f"SELECT * FROM migration_jobs{where} ORDER BY updated_at DESC",
+            tuple(args))
+        return [self._row_to_migration_job(r) for r in rows]
+
+    # -- business case snapshots (F2 — immutable run history) --------------
+    def save_business_case(self, snapshot_id: str, payload: Dict[str, Any],
+                           created_at: str = "") -> None:
+        if not created_at:
+            from datetime import datetime
+            created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        sql = self._upsert_sql("business_case_snapshots",
+                               ["id", "created_at", "payload"], "id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (snapshot_id, created_at, dumps(payload)))
+
+    def get_business_case(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        r = self._fetchone("SELECT * FROM business_case_snapshots WHERE id=?", (snapshot_id,))
+        if not r:
+            return None
+        d = dict(r)
+        return {"id": d["id"], "created_at": d["created_at"],
+                "payload": loads(d.get("payload"))}
+
+    def list_business_cases(self, limit: int = 20) -> List[Dict[str, Any]]:
+        return [{"id": r["id"], "created_at": r["created_at"]} for r in
+                self._fetchall(
+                    "SELECT id, created_at FROM business_case_snapshots "
+                    "ORDER BY created_at DESC LIMIT ?", (limit,))]
+
     # -- stats -------------------------------------------------------------
     def stats(self) -> Dict[str, Any]:
         s = {
@@ -935,6 +1192,12 @@ class Store:
             "matches": self._scalar("SELECT COUNT(*) FROM matches"),
             "waves": self._scalar("SELECT COUNT(*) FROM waves"),
             "workloads": self._scalar("SELECT COUNT(*) FROM workloads"),
+            "code_profiles": self._scalar("SELECT COUNT(*) FROM code_profiles"),
+            "app_strategies": self._scalar("SELECT COUNT(*) FROM app_strategies"),
+            "change_jobs": self._scalar("SELECT COUNT(*) FROM change_jobs"),
+            "cost_estimates": self._scalar("SELECT COUNT(*) FROM cost_estimates"),
+            "migration_jobs": self._scalar("SELECT COUNT(*) FROM migration_jobs"),
+            "db_profiles": self._scalar("SELECT COUNT(*) FROM db_profiles"),
         }
         by_role = {
             r["role"]: r["n"] for r in self._fetchall(
@@ -949,16 +1212,12 @@ class Store:
         return s
 
 
-def open_store(url: str | Path) -> Store:
+def open_store(url: str) -> Store:
     st = Store(url)
-    # eager connect: runs schema on first connection
-    if st.dialect == "sqlite":
-        st.connect()
-    else:
-        # warm the pool + ensure schema on a real connection
-        conn = st._pool_get()
-        try:
-            st._exec_schema(conn, SCHEMA_MARIADB, sqlite=False)
-        finally:
-            st._pool_put(conn)
+    # warm the pool + ensure schema on a real connection
+    conn = st._pool_get()
+    try:
+        st._exec_schema(conn, SCHEMA)
+    finally:
+        st._pool_put(conn)
     return st

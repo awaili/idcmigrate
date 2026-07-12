@@ -2,92 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<meta name="theme-color" content="#0d1117"/>
 <title>idc-migrate · IDC→Tencent Cloud copilot</title>
-<style>
-  :root{
-    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#30363d;
-    --text:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --green:#3fb950;
-    --amber:#d29922; --red:#f85149; --purple:#a371f7; --orange:#f0883e;
-    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}
-  header{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:0;z-index:6}
-  header h1{font-size:15px;margin:0;font-weight:600}
-  header .sub{color:var(--muted);font-size:12px;margin-left:6px}
-  .tabs{display:flex;gap:2px;margin-left:18px}
-  .tab{padding:6px 14px;cursor:pointer;border-radius:6px 6px 0 0;color:var(--muted);border:1px solid transparent}
-  .tab.active{background:var(--bg);color:var(--text);border:1px solid var(--border);border-bottom:1px solid var(--bg)}
-  .tab:hover{color:var(--text)}
-  .stats{display:flex;gap:8px;margin-left:auto}
-  .stat{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:11px;color:var(--muted)}
-  .stat b{color:var(--accent);font-size:14px}
-  button{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 11px;cursor:pointer;font-size:12px}
-  button:hover{border-color:var(--accent)}
-  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-  button.sm{padding:3px 8px;font-size:11px}
-  input,select,textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 9px;font-size:12px;font-family:inherit}
-  textarea{font-family:var(--mono)}
-  .page{padding:14px;max-width:1700px;margin:0 auto}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px}
-  .card h2{margin:0 0 10px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-  .grid2{display:grid;grid-template-columns:200px 1fr;gap:14px}
-  @media(max-width:900px){.grid2{grid-template-columns:1fr}}
-  .facets{font-size:12px}
-  .facet-group{margin-bottom:12px}
-  .facet-group .ft{color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.05em;margin-bottom:4px}
-  .facet{display:flex;justify-content:space-between;align-items:center;padding:3px 6px;border-radius:4px;cursor:pointer}
-  .facet:hover{background:var(--panel2)}
-  .facet.active{background:rgba(47,129,247,.18);border:1px solid var(--accent)}
-  .facet .n{color:var(--muted);font-family:var(--mono);font-size:11px}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th,td{padding:5px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
-  th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.03em;cursor:pointer;white-space:nowrap;user-select:none}
-  th:hover{color:var(--text)}
-  th.sorted{color:var(--accent)}
-  tbody tr:hover{background:var(--panel2)}
-  .scroll{overflow:auto;border:1px solid var(--border);border-radius:6px;max-height:calc(100vh - 280px)}
-  .tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;background:var(--panel2);border:1px solid var(--border);color:var(--muted)}
-  .tag.db{color:var(--purple)}.tag.k8s{color:var(--accent)}.tag.hadoop{color:var(--amber)}
-  .tag.cache{color:var(--orange)}.tag.web{color:var(--green)}.tag.monitoring{color:var(--muted)}.tag.app{color:#58a6ff}
-  .pill{font-size:10px;padding:1px 6px;border-radius:10px}
-  .pill.high{background:rgba(248,81,73,.15);color:var(--red)}
-  .pill.medium{background:rgba(210,153,34,.15);color:var(--amber)}
-  .pill.low{background:rgba(63,185,80,.15);color:var(--green)}
-  .conf{font-family:var(--mono);font-size:11px;color:var(--muted)}
-  .pager{display:flex;gap:8px;align-items:center;margin-top:8px;justify-content:space-between}
-  .bars{display:flex;flex-direction:column;gap:5px}
-  .bar-row{display:grid;grid-template-columns:120px 1fr 50px;align-items:center;gap:8px;font-size:12px}
-  .bar-track{background:var(--panel2);border-radius:4px;height:16px;position:relative;overflow:hidden}
-  .bar-fill{height:100%;border-radius:4px;background:var(--accent)}
-  .bar-fill.r{background:var(--red)}.bar-fill.a{background:var(--amber)}.bar-fill.g{background:var(--green)}.bar-fill.p{background:var(--purple)}.bar-fill.o{background:var(--orange)}
-  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
-  .tile{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
-  .tile .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-  .tile .v{font-size:22px;font-weight:600;margin-top:2px}
-  .tile .v small{font-size:12px;color:var(--muted);font-weight:400}
-  .tile.warn .v{color:var(--amber)}
-  pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;margin:0}
-  .out{background:#010409;border:1px solid var(--border);border-radius:6px;padding:10px;max-height:340px;overflow:auto}
-  .out .ev-tool{color:var(--muted);font-size:11px}
-  .out .ev-err{color:var(--red)}
-  .wave{border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:8px;background:var(--panel2);cursor:pointer}
-  .wave:hover{border-color:var(--accent)}
-  .wave .name{font-weight:600}
-  .wave .meta{color:var(--muted);font-size:11px}
-  .wave .deps{color:var(--accent);font-size:10px;font-family:var(--mono)}
-  .drawer{position:fixed;top:0;right:0;height:100vh;width:480px;max-width:92vw;background:var(--panel);border-left:1px solid var(--border);padding:18px;overflow:auto;box-shadow:-8px 0 30px rgba(0,0,0,.4);transform:translateX(100%);transition:transform .2s;z-index:20}
-  .drawer.open{transform:none}
-  .muted{color:var(--muted)}
-  .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-2px}
-  @keyframes sp{to{transform:rotate(360deg)}}
-  .chip{display:inline-flex;align-items:center;gap:4px;background:rgba(47,129,247,.15);border:1px solid var(--accent);border-radius:12px;padding:1px 8px;font-size:11px;color:var(--accent)}
-  .chip .x{cursor:pointer;font-weight:bold}
-  .kbd{font-family:var(--mono);background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-size:10px;color:var(--muted)}
-  .hidden{display:none}
-</style>
+<link rel="stylesheet" href="/assets/app.css"/>
 </head>
 <body>
 <header>
@@ -97,24 +15,42 @@
     <div class="tab" data-tab="inventory">Inventory</div>
     <div class="tab" data-tab="waves">Waves</div>
     <div class="tab" data-tab="copilot">Copilot</div>
+    <div class="tab" data-tab="code">Code &amp; DB</div>
+    <div class="tab" data-tab="business-case">Business Case</div>
+    <div class="tab" data-tab="execution">Execution</div>
+    <div class="tab" data-tab="readiness">Readiness</div>
   </div>
   <div class="stats" id="stats"></div>
   <div class="row">
     <button class="sm" onclick="doIngest()">Ingest</button>
     <button class="sm primary" onclick="doRebuild()">Rebuild</button>
+    <label class="muted" style="white-space:nowrap;font-size:12px">max waves
+      <input id="rebuildMaxWaves" type="number" min="0" step="1" value="0" style="width:64px" title="Hard cap on total waves when rebuilding (0 = no cap). The same guarantee as plan-llm's --max-waves.">
+    </label>
+    <span style="width:14px"></span>
+    <select id="uploadSrc" class="sm" title="source to upload">
+      <option value="servicenow">ServiceNow (.csv)</option>
+      <option value="rvtools">RVTools (.csv/.xlsx)</option>
+      <option value="zabbix">Zabbix (.json)</option>
+      <option value="prometheus">Prometheus (.json)</option>
+    </select>
+    <button class="sm" onclick="$('uploadFile').click()">Upload file…</button>
+    <input type="file" id="uploadFile" style="display:none"
+           onchange="doUpload(this.files[0])">
   </div>
 </header>
 
 <div class="page">
+  <div id="rail" class="rail"><span class="rail-loading">loading flow…</span></div>
   <!-- ===================== DASHBOARD ===================== -->
   <section id="tab-dashboard" class="tabsec">
     <div class="tiles" id="dashTiles"></div>
     <div class="card"><h2>Distribution by role</h2><div class="bars" id="barRole"></div></div>
-    <div class="row" style="gap:14px;align-items:flex-start">
+    <div class="row cols" style="gap:14px;align-items:flex-start">
       <div class="card" style="flex:1"><h2>By Tencent target product</h2><div class="bars" id="barTarget"></div></div>
       <div class="card" style="flex:1"><h2>By OS</h2><div class="bars" id="barOs"></div></div>
     </div>
-    <div class="row" style="gap:14px;align-items:flex-start">
+    <div class="row cols" style="gap:14px;align-items:flex-start">
       <div class="card" style="flex:1"><h2>Match confidence</h2><div class="bars" id="barConf"></div></div>
       <div class="card" style="flex:1"><h2>By region</h2><div class="bars" id="barRegion"></div></div>
     </div>
@@ -140,7 +76,7 @@
     <div class="grid2">
       <div class="card facets" id="facets"><span class="muted">Loading facets…</span></div>
       <div>
-        <div class="scroll"><table id="inv"><thead></thead><tbody></tbody></table></div>
+        <div class="scroll"><table id="inv" class="mcard"><thead></thead><tbody></tbody></table></div>
         <div class="pager">
           <div class="row">
             <button class="sm" onclick="goPage(-1)">‹ prev</button>
@@ -163,9 +99,23 @@
 
   <!-- ===================== WAVES ===================== -->
   <section id="tab-waves" class="tabsec hidden">
-    <div class="row" style="gap:14px;align-items:flex-start">
+    <div class="card">
+      <h2>Plan with LLM <span class="muted">(natural-language wave policy → dry-run; Apply to persist)</span></h2>
+      <div class="row" style="gap:8px;align-items:flex-end">
+        <textarea id="planDemand" rows="2" style="flex:1 1 240px;min-width:160px" placeholder="e.g. put DBs first, keep high-criticality apps in early waves, group by app dependency — or say 最多10个wave"></textarea>
+        <label class="muted" style="white-space:nowrap">max waves
+          <input id="planMaxWaves" type="number" min="1" step="1" style="width:74px" title="Hard cap on total instantiated waves. If the engine produces more, the LLM is re-prompted (up to 2 rounds) to revise. Also auto-parsed from phrases like '最多10个wave' / 'max 8 waves'.">
+        </label>
+        <button class="primary" onclick="proposePlan()">Propose</button>
+      </div>
+      <div class="out" id="planOut" style="margin-top:8px"><span class="muted">Propose a plan from a demand; review the waves + validation, then Apply to save (replaces existing waves).</span></div>
+    </div>
+    <div class="row cols" style="gap:14px;align-items:flex-start">
       <div style="flex:1">
-        <div class="card"><h2>Migration waves <span class="muted">(DAG order)</span></h2><div id="waveList"></div></div>
+        <div class="card"><h2>Migration waves <span class="muted">(DAG order)</span></h2>
+          <div class="row" style="gap:8px;margin-bottom:8px"><button class="sm primary" onclick="reviewPlan()">Review plan (AI red-team)</button><span class="muted" id="reviewHint" style="font-size:12px"></span></div>
+          <div id="planReview" style="margin-bottom:8px"></div>
+          <div id="waveList"></div></div>
       </div>
       <div style="flex:1.4">
         <div class="card"><h2 id="waveMembersTitle">Select a wave</h2>
@@ -173,11 +123,19 @@
         </div>
       </div>
     </div>
+    <div class="card">
+      <h2>Landing Zone archetypes <span class="muted">(F8 — parameterized blueprint + placement gate)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <span class="muted">Per-archetype LZ status (workload waves are gated until their target archetype is finalized):</span>
+        <button class="sm" onclick="loadLzReadiness()">Refresh</button>
+      </div>
+      <div id="lzArchetypes" style="margin-top:8px"><span class="muted">Loading…</span></div>
+    </div>
   </section>
 
   <!-- ===================== COPILOT ===================== -->
   <section id="tab-copilot" class="tabsec hidden">
-    <div class="row" style="gap:14px;align-items:flex-start">
+    <div class="row cols" style="gap:14px;align-items:flex-start">
       <div style="flex:1">
         <div class="card">
           <h2>Ask the copilot <span class="muted">(RAG over inventory)</span></h2>
@@ -203,236 +161,154 @@
     <div class="card"><h2>CLI equivalents</h2>
       <div class="row"><span class="kbd">idc inventory --role db --page 2</span><span class="kbd">idc inventory --conf-max 0.8 --format csv --all</span><span class="kbd">idc ask "…"</span><span class="kbd">idc agent "…" --stream</span><span class="kbd">idc waves</span></div>
     </div>
+    <div class="card">
+      <h2>What-if <span class="muted">(re-price the portfolio without re-running ingest — F3)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <span class="muted">region:</span>
+        <select id="wiRegion" style="flex:0 1 auto"><option value="">(keep)</option><option>ap-shanghai</option><option>ap-beijing</option><option>ap-guangzhou</option><option>ap-nanjing</option><option>ap-chengdu</option></select>
+        <span class="muted">sizing:</span>
+        <select id="wiSizing" style="flex:0 1 auto"><option value="">(keep)</option><option value="as_is">as_is (lift-and-shift)</option><option value="measured">measured (right-size from util)</option></select>
+        <button class="primary" onclick="runWhatIf()">Run what-if</button>
+      </div>
+      <div class="out" id="wiOut" style="margin-top:8px"><span class="muted">Ask: "what if all DBs go to ap-guangzhou?" — pick a region and/or sizing and run. Returns baseline vs alternate cloud yearly + the delta.</span></div>
+    </div>
+  </section>
+
+  <!-- ===================== CODE (external agent executor) ===================== -->
+  <section id="tab-code" class="tabsec hidden">
+    <div class="card">
+      <h2>Trigger executor <span class="muted">(scan / comb / modify an app's repo)</span> <span id="execStatus" class="muted" style="font-size:12px;float:right">checking executor…</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px">
+        <input id="exApp" placeholder="app_id" style="flex:0 1 160px;min-width:120px"/>
+        <input id="exRepo" placeholder="git url" style="flex:1 1 260px;min-width:180px"/>
+        <input id="exBranch" placeholder="branch (opt)" style="flex:0 1 140px;min-width:120px"/>
+        <select id="exAction" onchange="toggleModifyFields()" style="flex:0 1 auto"><option value="scan">scan</option><option value="comb">comb</option><option value="modify">modify</option></select>
+        <select id="exMode" style="flex:0 1 auto"><option value="plan">plan</option><option value="execute">execute</option></select>
+        <button class="primary" onclick="doExecutorScan()">Run</button>
+      </div>
+      <div id="exModifyFields" class="hidden grid2col" style="margin-top:8px">
+        <div>
+          <div class="muted" style="font-size:11px;margin-bottom:3px">scope (categories to change; comma-sep; empty = all)</div>
+          <input id="exScope" placeholder="db_connection,service_discovery" style="width:100%"/>
+        </div>
+        <div>
+          <div class="muted" style="font-size:11px;margin-bottom:3px">overrides — one per line: old=new (e.g. 10.0.4.20=${DB_HOST})</div>
+          <textarea id="exOverrides" rows="2" style="width:100%" placeholder="10.0.4.20:3306=${ORDERS_DB_HOST}:3306&#10;hunter2=${ORDERS_DB_PASSWORD}"></textarea>
+        </div>
+      </div>
+      <div class="out" id="exOut" style="margin-top:8px"><span class="muted">Requires IDC_EXECUTOR_URL. Results arrive async via callback → Rebuild to fold into waves.</span></div>
+    </div>
+    <div class="card">
+      <h2>7R strategy <span class="muted">(AI assigns 6R + rehost-container per app after reconsolidate)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <input id="srApp" placeholder="app_id" style="flex:0 1 200px;min-width:140px" list="srAppList"/>
+        <datalist id="srAppList"></datalist>
+        <label class="muted" style="white-space:nowrap"><input type="checkbox" id="srApply"> apply to profile</label>
+        <button class="primary" onclick="assignStrategy()">Assign 7R</button>
+        <button class="sm" onclick="assignStrategyAll()" title="assign a 7R strategy to every app (one LLM call each — slow)">batch all</button>
+      </div>
+      <div class="out" id="srOut" style="margin-top:8px"><span class="muted">Pick an app (or click 7R on a profile row). The LLM picks one of rehost / rehost-container / replatform / refactor / repurchase / retain / retire, with rationale + target + key changes.</span></div>
+    </div>
+    <div class="card"><h2>Code profiles <span class="muted">(pushed by executor)</span></h2>
+      <div class="xscroll"><table class="tbl mcard" id="codeTbl"><thead><tr>
+        <th>app_id</th><th>pattern</th><th>effort</th><th>readiness</th>
+        <th>code_deps</th><th>blockers</th><th>findings</th><th>scanned</th><th>7R</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>DB conversion profiles <span class="muted">(F5 — executor pushes a grade per DB host)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
+        <input id="dbScanId" placeholder="db hostname" style="flex:0 1 200px;min-width:140px" title="stable DB host identity (hostname) to scan"/>
+        <select id="dbSrcEng" style="flex:0 1 auto" title="source engine"><option value="oracle">oracle</option><option value="sqlserver">sqlserver</option><option value="mysql">mysql</option></select>
+        <span class="muted">→</span>
+        <select id="dbTgtEng" style="flex:0 1 auto" title="target engine"><option value="tdsql">tdsql</option><option value="cdb_mysql">cdb_mysql</option></select>
+        <button class="sm primary" onclick="doDbScan()">Scan DB</button>
+        <span class="muted" style="font-size:12px">executor scans schema/SQL, pushes a profile back; Rebuild folds the grade into the match + wave risk.</span>
+      </div>
+      <div class="xscroll"><table class="tbl mcard" id="dbTbl"><thead><tr>
+        <th>hostname</th><th>conversion</th><th>grade</th><th>man-days</th><th>auto %</th><th>review</th><th>blockers</th><th>rev-repl</th><th>scanned</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Runtime containerize <span class="muted">(F9 — no source repo: infer a Dockerfile scaffold from runtime telemetry)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <input id="rtApp" placeholder="app_id" style="flex:0 1 160px;min-width:120px"/>
+        <input id="rtServer" placeholder="server_id (host)" style="flex:0 1 160px;min-width:120px"/>
+        <input id="rtProc" placeholder="process (e.g. java -jar app.jar)" style="flex:1 1 200px;min-width:160px"/>
+        <input id="rtPort" placeholder="port (e.g. 8080)" style="flex:0 1 90px;min-width:70px"/>
+        <input id="rtSoft" placeholder="software (e.g. openjdk-8)" style="flex:0 1 140px;min-width:100px"/>
+        <select id="rtMode" style="flex:0 1 auto"><option value="plan">plan (dry-run)</option><option value="execute">execute (writes)</option></select>
+        <button class="sm primary" onclick="doRuntimeContainerize()">Infer scaffold</button>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:6px">The executor infers a Dockerfile + pushes a <code>source=runtime-derived</code> CodeProfile (confidence capped at 0.5). <b>execute</b> mode requires operator confirmation (a Question is raised) before the scaffold is written.</div>
+    </div>
+    <div class="card"><h2>Executor jobs</h2>
+      <div class="xscroll"><table class="tbl mcard" id="jobTbl"><thead><tr>
+        <th>id</th><th>app_id</th><th>kind</th><th>status</th><th>summary</th><th>patch_ref</th><th>created</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="card"><h2>Pending questions <span class="muted">(executor blocked — answer to unblock)</span></h2>
+      <div id="qList"><span class="muted">No pending questions. The executor raises one here when it can't resolve a change (e.g. an unknown hardcoded IP).</span></div>
+    </div>
+  </section>
+
+  <!-- ===================== BUSINESS CASE (F2) ===================== -->
+  <section id="tab-business-case" class="tabsec hidden">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h2>Portfolio business case</h2>
+      <div class="row" style="gap:8px">
+        <button class="sm primary" onclick="loadBusinessCase(true)">Refresh + save snapshot</button>
+        <button class="sm" onclick="loadLatestBusinessCase()">Load latest snapshot</button>
+      </div>
+    </div>
+    <div class="tiles" id="bcTiles"></div>
+    <div class="row cols" style="gap:14px;align-items:flex-start">
+      <div class="card" style="flex:1"><h2>By strategy (6R)</h2><div class="bars" id="bcStrategy"></div></div>
+      <div class="card" style="flex:1"><h2>By Tencent product</h2><div class="bars" id="bcProduct"></div></div>
+    </div>
+    <div class="card">
+      <h2>Per-server run cost <span class="muted">(top 50 by yearly $)</span></h2>
+      <div class="xscroll"><table class="tbl" id="bcTbl"><thead><tr>
+        <th>hostname</th><th>app</th><th>product</th><th>region</th><th>strategy</th><th>monthly $</th><th>yearly $</th><th>basis</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- ===================== WAVE EXECUTION (F6/F7) ===================== -->
+  <section id="tab-execution" class="tabsec hidden">
+    <h2>Wave execution <span class="muted">(track-only: operator / external tool performs the migration)</span></h2>
+    <div id="execWaves" class="card"><span class="muted">loading waves…</span></div>
+    <div class="card" id="execDetail" style="margin-top:12px"></div>
+  </section>
+
+  <!-- ===================== READINESS (F10) ===================== -->
+  <section id="tab-readiness" class="tabsec hidden">
+    <h2>Readiness heatmap <span class="muted">(F10 — is each wave safe to cut? red blocks cutover)</span></h2>
+    <div class="row" style="gap:8px;margin-bottom:8px"><button class="sm primary" onclick="loadReadiness()">Refresh</button><span class="muted">six signals per wave: lz / db / code / deps / rehearsal / rollback — rollup = worst case</span></div>
+    <div id="readinessHeatmap" class="card"><span class="muted">loading…</span></div>
   </section>
 </div>
 
+<div class="drawer-backdrop" id="drawerBackdrop" onclick="closeDrawer()"></div>
 <div class="drawer" id="drawer">
-  <div class="row" style="justify-content:space-between"><h3 id="dTitle">Server</h3><button onclick="closeDrawer()">✕</button></div>
+  <div class="row" style="justify-content:space-between"><h3 id="dTitle">Server</h3><button class="close" onclick="closeDrawer()" aria-label="Close">✕</button></div>
   <div id="dBody"></div>
 </div>
 
-<script>
-const API = location.origin + '/api';
-let state = {q:'', filters:{}, page:1, page_size:50, order_by:'hostname', order_dir:'asc', last:null, selected:new Set()};
-let ws = null, searchTimer = null;
-
-const $ = id => document.getElementById(id);
-async function api(path, opts){ const r = await fetch(API+path, opts); if(!r.ok) throw new Error(await r.text()); return r.json(); }
-function fmtUtil(u){ if(!u||(!u.cpu_p95&&!u.mem_p95&&!u.disk_used_pct)) return '-'; return `${u.cpu_p95??'-'}/${u.mem_p95??'-'}/${u.disk_used_pct??'-'}`; }
-function esc(s){ return (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-
-/* ---------- tabs ---------- */
-document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
-  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
-  document.querySelectorAll('.tabsec').forEach(x=>x.classList.add('hidden'));
-  t.classList.add('active'); $('tab-'+t.dataset.tab).classList.remove('hidden');
-  if(t.dataset.tab==='dashboard') loadDashboard();
-  if(t.dataset.tab==='inventory') fetchInv();
-  if(t.dataset.tab==='waves') loadWaves();
-});
-
-/* ---------- header stats ---------- */
-async function loadStats(){
-  try{ const s = await api('/stats');
-    $('stats').innerHTML = `<div class="stat">servers <b>${s.servers}</b></div><div class="stat">matches <b>${s.matches}</b></div><div class="stat">waves <b>${s.waves}</b></div>`;
-  }catch(e){ $('stats').innerHTML='<div class="stat">backend <b>down</b></div>'; }
-}
-
-/* ---------- dashboard ---------- */
-function bars(data, colors){
-  const max = Math.max(1, ...Object.values(data));
-  const cmap = colors || {};
-  return Object.entries(data).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{
-    const cls = cmap[k] ? ' '+cmap[k] : '';
-    return `<div class="bar-row"><div title="${esc(k)}">${esc(k)}</div><div class="bar-track"><div class="bar-fill${cls}" style="width:${(v/max*100).toFixed(1)}%"></div></div><div class="n" style="text-align:right">${v}</div></div>`;
-  }).join('');
-}
-const ROLE_COLORS={db:'p',k8s:'',hadoop:'a',cache:'o',web:'g',monitoring:'',app:''};
-async function loadDashboard(){
-  let a; try{ a = await api('/aggregations'); }catch(e){ return; }
-  const tiles = [
-    {k:'servers', v:a.servers},
-    {k:'total cores', v:a.cores.toLocaleString()},
-    {k:'total RAM', v:a.mem_gb.toLocaleString(), sub:'GB'},
-    {k:'waves', v:a.waves.length},
-    {k:'targets mapped', v:Object.values(a.by_target).reduce((s,x)=>s+x,0)},
-    {k:'high-utilization', v:a.high_utilization, warn:true, sub:'≥80%'},
-    {k:'low-confidence', v:(a.confidence['low(<0.7)']||0)+(a.confidence['medium(0.7-0.85)']||0), warn:true, sub:'<0.85'},
-  ];
-  $('dashTiles').innerHTML = tiles.map(t=>`<div class="tile ${t.warn?'warn':''}"><div class="k">${t.k}</div><div class="v">${t.v}${t.sub?` <small>${t.sub}</small>`:''}</div></div>`).join('');
-  $('barRole').innerHTML = bars(a.by_role, ROLE_COLORS);
-  $('barTarget').innerHTML = bars(a.by_target, {CDB:'p',EMR:'a',TKE:'',CVM:''});
-  $('barOs').innerHTML = bars(a.by_os);
-  $('barConf').innerHTML = bars(a.confidence, {'high(>=0.85)':'g','medium(0.7-0.85)':'a','low(<0.7)':'r'});
-  $('barRegion').innerHTML = bars(a.by_region);
-  $('dashWaves').innerHTML = a.waves.map(w=>`<div class="wave" onclick="document.querySelector('.tab[data-tab=waves]').click(); openWave('${w.id}','${esc(w.name)}')">
-    <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${w.stage.startsWith('1')?'high':w.stage.startsWith('4')?'medium':'low'}">${w.stage}</span><span style="margin-left:auto" class="meta">${w.n} servers</span></div></div>`).join('');
-}
-
-/* ---------- inventory ---------- */
-function debounceSearch(){ clearTimeout(searchTimer); state.page=1; state.q=$('q').value.trim();
-  searchTimer=setTimeout(fetchInv, 250); }
-function resetFilters(){ state.filters={}; state.q=''; state.page=1; $('q').value=''; fetchInv(); }
-function applyQuick(kind){
-  state.filters={};
-  if(kind==='highutil') state.filters.util_mem_min=80;
-  if(kind==='lowconf') state.filters.conf_max=0.79;
-  state.page=1; fetchInv();
-}
-function toggleFacet(dim, val){
-  if(state.filters[dim]===val) delete state.filters[dim];
-  else state.filters[dim]=val;
-  state.page=1; fetchInv();
-}
-function params(extra={}){ const p=new URLSearchParams(); p.set('page',state.page); p.set('page_size',state.page_size);
-  p.set('order_by',state.order_by); p.set('order_dir',state.order_dir);
-  if(state.q) p.set('q',state.q);
-  for(const[k,v]of Object.entries(state.filters)) p.set(k,v);
-  for(const[k,v]of Object.entries(extra)) if(v!=null) p.set(k,v);
-  return p.toString(); }
-async function fetchInv(){
-  let r; try{ r = await api('/servers?'+params()); }catch(e){ return; }
-  state.last = r; renderInv(r);
-}
-function renderInv(r){
-  // facets
-  const fc = r.facets || {};
-  const groups = [
-    ['role','Role',fc.role,{db:'p',k8s:'',hadoop:'a',cache:'o',web:'g',monitoring:'',app:''}],
-    ['env','Env',fc.env,{prod:'r',staging:'a',dev:'g'}],
-    ['os','OS',fc.os],
-    ['source_type','Type',fc.source_type],
-    ['criticality','Criticality',fc.criticality,{high:'r',medium:'a',low:'g'}],
-    ['target_product','Target',fc.target_product,{CDB:'p',EMR:'a',TKE:'',CVM:''}],
-  ];
-  $('facets').innerHTML = groups.map(([dim,label,data,colors])=>{
-    if(!data || !Object.keys(data).length) return '';
-    const rows = Object.entries(data).sort((a,b)=>b[1]-a[1]).map(([k,v])=>{
-      const active = state.filters[dim]===k ? 'active' : '';
-      return `<div class="facet ${active}" onclick="toggleFacet('${dim}','${esc(k)}')"><span>${esc(k)}</span><span class="n">${v}</span></div>`;
-    }).join('');
-    return `<div class="facet-group"><div class="ft">${label}</div>${rows}</div>`;
-  }).join('') || '<span class="muted">no facets</span>';
-  // active chips
-  const chips = [];
-  if(state.q) chips.push(`search:${state.q}`);
-  for(const[k,v]of Object.entries(state.filters)) chips.push(`${k}=${v}`);
-  $('activeChips').innerHTML = chips.map(c=>`<span class="chip">${esc(c)}<span class="x" onclick="resetFilters()">×</span></span>`).join('');
-  // table
-  const cols = [['hostname','Hostname'],['role','Role'],['source_type','Type'],['os','OS'],['cpu_cores','CPU'],['mem_gb','Mem'],['env','Env'],['business_criticality','Crit'],['','Target'],['','Util%'],['confidence','Conf']];
-  const thead = '<tr>'+cols.map(([k,l])=>{
-    if(!k) return `<th>${l}</th>`;
-    const s = state.order_by===k ? 'sorted' : '';
-    const arr = state.order_by===k ? (state.order_dir==='asc'?' ▲':' ▼') : '';
-    return `<th class="${s}" onclick="sortBy('${k}')">${l}${arr}</th>`;
-  }).join('')+'</tr>';
-  const tbody = (r.items||[]).map(s=>{
-    const m=s.match||{};
-    return `<tr onclick="openServer('${s.id}')">
-      <td><input type="checkbox" onclick="event.stopPropagation();toggleSel('${s.id}',this.checked)" ${state.selected.has(s.id)?'checked':''} style="vertical-align:middle;margin-right:4px"/><b>${esc(s.hostname)}</b></td>
-      <td><span class="tag ${s.role}">${s.role||'-'}</span></td>
-      <td>${s.source_type||'-'}</td>
-      <td>${s.os||'-'}</td>
-      <td>${s.cpu_cores}</td>
-      <td>${s.mem_gb}G</td>
-      <td>${s.env||'-'}</td>
-      <td><span class="pill ${s.business_criticality}">${s.business_criticality||'-'}</span></td>
-      <td><b>${m.target?m.target.product:'-'}</b> <span class="muted">${m.target?esc(m.target.spec).slice(0,18):''}</span></td>
-      <td class="conf">${fmtUtil(s.utilization)}</td>
-      <td class="conf">${m.confidence?'_'+m.confidence.toFixed(1):'-'}</td>
-    </tr>`;}).join('');
-  $('inv').innerHTML = `<thead>${thead}</thead><tbody>${tbody}</tbody>`;
-  // pager
-  const pages = Math.max(1, Math.ceil(r.total/state.page_size));
-  $('pageInfo').textContent = `page ${r.page} / ${pages}`;
-  $('totalInfo').textContent = `${r.total} servers`;
-  $('selInfo').textContent = state.selected.size ? `${state.selected.size} selected` : '';
-}
-function sortBy(k){ if(state.order_by===k) state.order_dir = state.order_dir==='asc'?'desc':'asc'; else { state.order_by=k; state.order_dir='asc'; } fetchInv(); }
-function goPage(d){ const p=Math.max(1,state.page+d); state.page=p; fetchInv(); }
-function toggleSel(id,on){ if(on) state.selected.add(id); else state.selected.delete(id); $('selInfo').textContent = state.selected.size?`${state.selected.size} selected`:''; }
-function selAllPage(on){ (state.last?.items||[]).forEach(s=>{ if(on) state.selected.add(s.id); else state.selected.delete(s.id); }); renderInv(state.last); }
-function exportCsv(){ window.open('/api/servers.csv?'+params(), '_blank'); }
-function exportSelected(){ if(!state.selected.size) return; const ids=[...state.selected]; // re-fetch full rows via a narrow q? simplest: open csv with a filter we can't express by id-set; instead fetch each id
-  // pragmatic: download csv of current filter and let user keep selection in UI
-  exportCsv();
-}
-function scopeAgentToFilter(){
-  const p = params(); $('agPrompt').value = `Using the servers matching the current inventory filter (${p}), ` + ($('agPrompt').value || 'summarize what moves and the top risk.');
-}
-
-/* ---------- server drawer ---------- */
-function openServer(id){
-  const s = (state.last?.items||[]).find(x=>x.id===id);
-  // fetch fresh full record
-  fetch(API+'/servers/'+id).then(r=>r.json()).then(s=>{
-    const m=s.match||{};
-    $('dTitle').textContent=s.hostname;
-    $('dBody').innerHTML=`
-      <div class="muted">${s.fqdn||''} · ${s.source_type} · ${s.role}</div>
-      <table style="margin:10px 0"><tbody>
-        <tr><th>OS</th><td>${s.os} ${s.os_version}</td></tr>
-        <tr><th>CPU/RAM</th><td>${s.cpu_cores} vCPU / ${s.mem_gb} GB</td></tr>
-        <tr><th>Disks</th><td>${(s.disks||[]).map(d=>`${d.name} ${d.size_gb}GB ${d.kind} (${d.fs})`).join('<br>')||'-'}</td></tr>
-        <tr><th>Network</th><td>${(s.ips||[]).join(', ')} · ${s.subnet} · ${s.vlan||'-'}</td></tr>
-        <tr><th>Env/Crit</th><td>${s.env} <span class="pill ${s.business_criticality}">${s.business_criticality}</span></td></tr>
-        <tr><th>Apps</th><td>${(s.app_ids||[]).join(', ')||'-'}</td></tr>
-        <tr><th>Tags</th><td>${(s.tags||[]).map(t=>`<span class="tag">${t}</span>`).join(' ')||'-'}</td></tr>
-        <tr><th>Utilization</th><td>cpu ${s.utilization.cpu_p95}% · mem ${s.utilization.mem_p95}% · disk ${s.utilization.disk_used_pct}% <span class="muted">(${s.utilization.source})</span></td></tr>
-        <tr><th>Provenance</th><td>${(s.source_refs||[]).map(r=>`<span class="tag">${r.source}:${r.source_id}</span>`).join(' ')}</td></tr>
-        <tr><th>Target</th><td><b>${m.target?m.target.product:'-'}</b> ${m.target?esc(m.target.spec):''} <span class="muted">@ ${m.target?m.target.region:''}</span></td></tr>
-        <tr><th>Rule</th><td>${m.rationale?esc(m.rationale):'-'}</td></tr>
-      </tbody></table>
-      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">LLM explain match</button><button onclick="rightSize('${s.id}')">right-size</button></div>
-      <pre id="dExplain" style="margin-top:10px"></pre>`;
-    $('drawer').classList.add('open');
-  });
-}
-function closeDrawer(){ $('drawer').classList.remove('open'); }
-async function explainServer(id){ $('dExplain').innerHTML='<span class="spinner"></span>'; try{ const r=await api('/explain',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({server_id:id})}); $('dExplain').textContent=r.explanation; }catch(e){ $('dExplain').textContent='Error: '+e; } }
-async function rightSize(id){ $('dExplain').innerHTML='<span class="spinner"></span>'; try{ const r=await api('/right-size',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({server_id:id})}); $('dExplain').textContent=r.advice; }catch(e){ $('dExplain').textContent='Error: '+e; } }
-
-/* ---------- waves ---------- */
-let WAVES=[];
-async function loadWaves(){ WAVES = await api('/waves'); renderWaves(); }
-function renderWaves(){
-  $('waveList').innerHTML = WAVES.map(w=>`<div class="wave" onclick="openWave('${w.id}','${esc(w.name)}')">
-    <div class="row"><span class="name">${esc(w.name)}</span><span class="pill ${w.stage.startsWith('1')?'high':w.stage.startsWith('4')?'medium':'low'}">${w.stage}</span><span style="margin-left:auto" class="meta">${w.members.length} servers</span></div>
-    <div class="deps">depends_on: ${w.depends_on.join(', ')||'(none)'}</div>
-    <div class="meta">${esc(w.rationale||'')}</div></div>`).join('');
-}
-let waveState={id:null,page:1,page_size:25};
-async function openWave(id,name){
-  waveState={id,page:1,page_size:25};
-  $('waveMembersTitle').textContent = name + ' — members';
-  await fetchWaveMembers();
-}
-async function fetchWaveMembers(){
-  const p=new URLSearchParams({wave_id:waveState.id,page:waveState.page,page_size:waveState.page_size,order_by:'hostname'});
-  const r = await api('/servers?'+p.toString());
-  const rows = (r.items||[]).map(s=>{const m=s.match||{};return `<tr onclick="openServer('${s.id}')"><td><b>${esc(s.hostname)}</b></td><td><span class="tag ${s.role}">${s.role}</span></td><td>${s.cpu_cores}/${s.mem_gb}G</td><td>${s.env}</td><td><b>${m.target?m.target.product:'-'}</b></td><td class="conf">${m.confidence?'_'+m.confidence.toFixed(1):'-'}</td></tr>`;}).join('');
-  const pages=Math.max(1,Math.ceil(r.total/waveState.page_size));
-  $('waveMembers').innerHTML = `<div class="scroll"><table><thead><tr><th>hostname</th><th>role</th><th>cpu/mem</th><th>env</th><th>target</th><th>conf</th></tr></thead><tbody>${rows}</tbody></table></div>
-    <div class="pager"><div class="row"><button class="sm" onclick="waveState.page=Math.max(1,waveState.page-1);fetchWaveMembers()">‹</button><span class="muted">page ${r.page}/${pages} · ${r.total} servers</span><button class="sm" onclick="waveState.page++;fetchWaveMembers()">›</button></div>
-    <button class="sm" onclick="window.open('/api/servers.csv?wave_id=${waveState.id}','_blank')">export wave CSV</button></div>`;
-}
-
-/* ---------- copilot ---------- */
-async function doAsk(){ const q=$('askQ').value.trim(); if(!q)return; $('askOut').innerHTML='<span class="spinner"></span>'; try{const r=await api('/ask',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({question:q})}); $('askOut').innerHTML=`<pre>${esc(r.answer)}</pre>`;}catch(e){ $('askOut').innerHTML='<span class="ev-err">Error: '+e+'</span>'; } }
-function stopAgent(){ if(ws){try{ws.close()}catch(e){}} }
-async function doAgent(){ const prompt=$('agPrompt').value.trim(); if(!prompt)return; const mode=$('agMode').value; const out=$('agOut'); out.innerHTML=''; $('agStatus').textContent='starting…';
-  let tid; try{ const r=await api('/agent',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({prompt,mode,timeout:600})}); tid=r.task_id; }catch(e){ out.innerHTML='<span class="ev-err">Error: '+e+'</span>'; return; }
-  ws=new WebSocket(`${location.origin.replace('http','ws')}/ws/agent/${tid}`); const buf=[];
-  ws.onmessage=m=>{const ev=JSON.parse(m.data); if(ev.kind==='text'){buf.push(ev.text);out.innerHTML=`<pre>${esc(buf.join(''))}</pre>`;out.scrollTop=out.scrollHeight;} else if(ev.kind==='tool')out.insertAdjacentHTML('beforeend',`<div class="ev-tool">${esc(ev.text)}</div>`); else if(ev.kind==='result'){out.insertAdjacentHTML('beforeend',`<div class="muted">[done]</div>`);$('agStatus').textContent='done';} else if(ev.kind==='error'){out.insertAdjacentHTML('beforeend',`<div class="ev-err">${esc(ev.text)}</div>`);$('agStatus').textContent='error';}};
-  ws.onclose=()=>{if(!['done','error'].includes($('agStatus').textContent))$('agStatus').textContent='closed';};
-}
-
-/* ---------- pipeline ops ---------- */
-async function doIngest(){ await api('/ingest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source:'all'})}); await loadStats(); if(!$('tab-dashboard').classList.contains('hidden'))loadDashboard(); if(!$('tab-inventory').classList.contains('hidden'))fetchInv(); }
-async function doRebuild(){ await api('/rebuild',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})}); await loadStats(); if(!$('tab-dashboard').classList.contains('hidden'))loadDashboard(); if(!$('tab-inventory').classList.contains('hidden'))fetchInv(); if(!$('tab-waves').classList.contains('hidden'))loadWaves(); }
-
-/* ---------- init ---------- */
-(async function(){ await loadStats(); loadDashboard(); })();
-</script>
+<!-- core first (shared globals/helpers), then per-page modules, then init -->
+<script src="/assets/app.js"></script>
+<script src="/assets/pages/dashboard.js"></script>
+<script src="/assets/pages/inventory.js"></script>
+<script src="/assets/pages/server-drawer.js"></script>
+<script src="/assets/pages/waves.js"></script>
+<script src="/assets/pages/plan.js"></script>
+<script src="/assets/pages/copilot.js"></script>
+<script src="/assets/pages/code.js"></script>
+<script src="/assets/pages/questions.js"></script>
+<script src="/assets/pages/business-case.js"></script>
+<script src="/assets/pages/wave-execution.js"></script>
+<script src="/assets/pages/readiness.js"></script>
+<script src="/assets/pages/rail.js"></script>
+<script src="/assets/main.js"></script>
 </body>
 </html>

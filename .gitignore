@@ -2,8 +2,5 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-idc_migrate.db
-idc_migrate.db-wal
-idc_migrate.db-shm
 *.log
 .env

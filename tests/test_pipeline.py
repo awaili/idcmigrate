@@ -5,6 +5,7 @@ import tempfile
 import pytest
 
 from idc.config import get_settings, reset_settings
+from idc.core import _offline_settings
 from idc.core.ingest import all_sources, get_adapter
 from idc.core.normalize import normalize, load_workloads, resolve_workloads
 from idc.core.match import match_servers, match_server
@@ -33,6 +34,40 @@ def test_adapter_counts():
         res = get_adapter(src).fetch(s)
         assert len(res.assets) == n, f"{src}: {len(res.assets)} != {n}"
         assert res.mode == "fixture"
+
+
+def test_offline_path_override_reads_uploaded_file():
+    """A path override makes the adapter read that file in fixture mode, even
+    when live API creds are configured (mimics the web upload flow)."""
+    row = ("sys_id,name,hostname,fqdn,ip_address,os,os_version,ram_gb,cpus,"
+           "company,environment,business_criticality,location,virtual,subnet,serial_number\n"
+           "abc,db-mysql-99,db-mysql-99,db-mysql-99.dc1,10.0.0.99,centos 7,7,8,4,"
+           "acme,prod,high,dc1,false,10.0.0.0/24,SN99\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="") as f:
+        f.write(row)
+        path = f.name
+    try:
+        base = get_settings()
+        # pretend live API creds are set — override must still force offline
+        import dataclasses
+        creds = dataclasses.replace(base, sn_base="https://x", sn_token="t")
+        assert creds.has_servicenow()  # sanity: would go online without override
+        s = _offline_settings(creds, SOURCE_SERVICENOW, path)
+        assert not s.has_servicenow()  # override cleared creds → offline
+        assert s.sn_path == path
+        res = get_adapter(SOURCE_SERVICENOW).fetch(s)
+        assert res.ok and res.mode == "fixture"
+        assert len(res.assets) == 1
+        assert res.assets[0].hostname == "db-mysql-99"
+    finally:
+        os.unlink(path)
+
+
+def test_offline_settings_missing_file_reports_error():
+    s = _offline_settings(get_settings(), SOURCE_SERVICENOW, "/no/such/file.csv")
+    res = get_adapter(SOURCE_SERVICENOW).fetch(s)
+    assert not res.ok
+    assert "not found" in res.error
 
 
 def test_normalize_unique_servers(all_assets):
@@ -123,3 +158,23 @@ def test_plan_waves(all_assets):
     by_id = {w.id: w for w in waves}
     assert by_id[data.depends_on[0]].stage == "1_landing_zone"
     assert any(by_id[d].stage == "2_data" for d in cutover.depends_on)
+
+
+def test_plan_waves_max_waves_hard_cap(all_assets):
+    """The deterministic path also honors max_waves (unifies the guarantee with
+    the LLM planner): capped to <= cap, every server still placed once, DAG valid."""
+    from idc.core.llm_plan import validate_plan
+    servers = normalize(all_assets)
+    wls = resolve_workloads(load_workloads(), servers)
+    full = plan_waves(servers, wls)
+    assert len(full) > 2
+    capped = plan_waves(servers, wls, max_waves=2)
+    assert len(capped) == 2
+    # nothing lost, no dups
+    sids = [sid for w in capped for sid in w.server_ids]
+    assert len(sids) == len(set(sids)) == EXPECTED_TOTAL
+    # default (0) = no cap, unchanged
+    assert len(plan_waves(servers, wls, max_waves=0)) == len(full)
+    # capped plan is still a valid DAG
+    val = validate_plan(capped, servers)
+    assert val["ok"]

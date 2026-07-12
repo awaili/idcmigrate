@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from ..config import FIXTURES
 from .models import (
     Disk,
+    NetDep,
     RawAsset,
     Server,
     Utilization,
@@ -231,3 +232,92 @@ def resolve_workloads(workloads: List[Workload], servers: List[Server]) -> List[
                 resolved.append(hid)
         w.server_ids = resolved
     return workloads
+
+
+def merge_network_deps(servers: List[Server], workloads: List[Workload],
+                       netdeps: List[NetDep]) -> tuple:
+    """Fold runtime network edges (F1) into Workload.depends_on + provenance.
+
+    For each NetDep:
+      * resolve dst_ip/hostname -> Server (by ip, then hostname/fqdn);
+      * append a ``source="netdep"`` provenance entry to the src Server's
+        ``source_refs`` (audit trail of observed edges, including unresolved
+        dsts);
+      * if both src+dst servers belong to apps, add dst_app -> src_app's
+        ``depends_on`` (deduped, no self-loops). An edge already present in the
+        static app graph is recorded as ``confirmed`` (not duplicated).
+
+    Dsts that don't resolve to an app (external endpoint, unmanaged host, or
+    infra server with no app) are collected in the ``unresolved`` report
+    rather than dropped — the plan's "don't silently lose signal" rule.
+
+    Returns ``(workloads, report)`` where report = ``{added, confirmed,
+    unresolved}`` (lists of dicts). ``workloads`` is mutated in place.
+    """
+    ip_to_server: Dict[str, Server] = {}
+    host_to_server: Dict[str, Server] = {}
+    for s in servers:
+        for ip in s.ips:
+            if ip:
+                ip_to_server[ip] = s
+        for k in (s.hostname, s.fqdn):
+            if k:
+                host_to_server[k.lower()] = s
+    srv_by_id = {s.id: s for s in servers}
+    app_by_server = {s.id: list(s.app_ids) for s in servers}
+    wl_by_app = {w.app_id: w for w in workloads}
+
+    def resolve_dst(dst: str) -> Optional[Server]:
+        if not dst:
+            return None
+        if dst in ip_to_server:
+            return ip_to_server[dst]
+        return host_to_server.get(dst.lower())
+
+    report = {"added": [], "confirmed": [], "unresolved": []}
+    for nd in netdeps:
+        src_srv = srv_by_id.get(nd.src_server_id)
+        if not src_srv:
+            # src host unknown to the estate — nothing to attach the edge to
+            report["unresolved"].append(
+                {"src": nd.src_host, "dst": f"{nd.dst_ip}:{nd.dst_port}",
+                 "reason": "src host not in estate"})
+            continue
+        dst_srv = resolve_dst(nd.dst_ip)
+        # provenance on the src server (audit trail of every observed edge)
+        src_srv.source_refs.append({
+            "source": "netdep", "source_id": nd.source,
+            "ip": nd.dst_ip,
+            "attrs": {"dst_port": nd.dst_port, "observed_at": nd.observed_at,
+                      "dst_resolved": dst_srv.id if dst_srv else None},
+        })
+        src_apps = app_by_server.get(src_srv.id, [])
+        if not src_apps:
+            report["unresolved"].append(
+                {"src": src_srv.hostname, "dst": f"{nd.dst_ip}:{nd.dst_port}",
+                 "reason": "src server has no app"})
+            continue
+        if not dst_srv:
+            report["unresolved"].append(
+                {"src": src_srv.hostname, "dst": f"{nd.dst_ip}:{nd.dst_port}",
+                 "reason": "dst not in estate (external/unmanaged)"})
+            continue
+        dst_apps = app_by_server.get(dst_srv.id, [])
+        if not dst_apps:
+            report["unresolved"].append(
+                {"src": src_srv.hostname, "dst": dst_srv.hostname,
+                 "reason": "dst server has no app (infra)"})
+            continue
+        for sa in src_apps:
+            w = wl_by_app.get(sa)
+            if not w:
+                continue
+            for da in dst_apps:
+                if sa == da:
+                    continue
+                if da in w.depends_on:
+                    report["confirmed"].append({"src_app": sa, "dst_app": da})
+                else:
+                    w.depends_on.append(da)
+                    report["added"].append({"src_app": sa, "dst_app": da})
+    return workloads, report

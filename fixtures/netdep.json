@@ -1,0 +1,37 @@
+[
+  {
+    "src_host": "app-orders-01",
+    "dst_ip": "10.10.3.11",
+    "dst_port": 3306,
+    "observed_at": "2026-07-12T08:00:00Z",
+    "_note": "orders -> mysql-01 (dst server has no app -> infra, unresolved at app level)"
+  },
+  {
+    "src_host": "app-users-01",
+    "dst_ip": "10.10.3.11",
+    "dst_port": 3306,
+    "observed_at": "2026-07-12T08:00:00Z",
+    "_note": "users -> mysql-01 (infra, unresolved at app level)"
+  },
+  {
+    "src_host": "app-orders-01",
+    "dst_ip": "203.0.113.5",
+    "dst_port": 443,
+    "observed_at": "2026-07-12T08:00:00Z",
+    "_note": "orders -> external payment API (dst not in estate)"
+  },
+  {
+    "src_host": "web-portal-01",
+    "dst_ip": "10.10.1.11",
+    "dst_port": 8080,
+    "observed_at": "2026-07-12T08:00:00Z",
+    "_note": "portal -> orders-01 (confirms existing static app-portal->app-orders dep)"
+  },
+  {
+    "src_host": "mon-grafana-01",
+    "dst_ip": "10.10.1.11",
+    "dst_port": 9100,
+    "observed_at": "2026-07-12T08:00:00Z",
+    "_note": "grafana scrapes orders metrics -> NEW app-observability->app-orders edge"
+  }
+]

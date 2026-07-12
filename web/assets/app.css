@@ -1,0 +1,218 @@
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#30363d;
+    --text:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --green:#3fb950;
+    --amber:#d29922; --red:#f85149; --purple:#a371f7; --orange:#f0883e;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:14px;padding:10px 18px;padding-top:max(10px,env(safe-area-inset-top));border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:0;z-index:6}
+  header h1{font-size:15px;margin:0;font-weight:600}
+  header .sub{color:var(--muted);font-size:12px;margin-left:6px}
+  .tabs{display:flex;gap:2px;margin-left:18px}
+  .tab{padding:6px 14px;cursor:pointer;border-radius:6px 6px 0 0;color:var(--muted);border:1px solid transparent}
+  .tab.active{background:var(--bg);color:var(--text);border:1px solid var(--border);border-bottom:1px solid var(--bg)}
+  .tab:hover{color:var(--text)}
+  .stats{display:flex;gap:8px;margin-left:auto}
+  .stat{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:11px;color:var(--muted)}
+  .stat b{color:var(--accent);font-size:14px}
+  button{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 11px;cursor:pointer;font-size:12px}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.sm{padding:3px 8px;font-size:11px}
+  input,select,textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 9px;font-size:12px;font-family:inherit}
+  textarea{font-family:var(--mono)}
+  .page{padding:14px;max-width:1700px;margin:0 auto}
+  /* ---------- migration flow rail ---------- */
+  .rail{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin-bottom:14px}
+  .rail-title{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-right:4px}
+  .rail-chip{display:flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:14px;padding:3px 10px;cursor:pointer;font-size:12px;white-space:nowrap;transition:border-color .12s}
+  .rail-chip:hover{border-color:var(--accent)}
+  .rail-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+  .rail-label{font-weight:500}
+  .rail-meta{color:var(--muted);font-size:11px;font-family:var(--mono)}
+  .rail-chip.done{border-color:rgba(63,185,80,.4)}
+  .rail-chip.warn{border-color:rgba(210,153,34,.5)}
+  .rail-chip.blocked{border-color:rgba(248,81,73,.55)}
+  .rail-chip.active{border-color:rgba(47,129,247,.55)}
+  .rail-refresh{margin-left:auto}
+  .rail-loading{color:var(--muted);font-size:12px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:14px}
+  .card h2{margin:0 0 10px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .grid2{display:grid;grid-template-columns:200px 1fr;gap:14px}
+  .facets{font-size:12px}
+  .facet-group{margin-bottom:12px}
+  .facet-group .ft{color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.05em;margin-bottom:4px}
+  .facet{display:flex;justify-content:space-between;align-items:center;padding:3px 6px;border-radius:4px;cursor:pointer}
+  .facet:hover{background:var(--panel2)}
+  .facet.active{background:rgba(47,129,247,.18);border:1px solid var(--accent)}
+  .facet .n{color:var(--muted);font-family:var(--mono);font-size:11px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{padding:5px 8px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
+  th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.03em;cursor:pointer;white-space:nowrap;user-select:none}
+  th:hover{color:var(--text)}
+  th.sorted{color:var(--accent)}
+  tbody tr:hover{background:var(--panel2)}
+  .scroll{overflow:auto;border:1px solid var(--border);border-radius:6px;max-height:calc(100vh - 280px)}
+  .tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;background:var(--panel2);border:1px solid var(--border);color:var(--muted)}
+  .tag.db{color:var(--purple)}.tag.k8s{color:var(--accent)}.tag.hadoop{color:var(--amber)}
+  .tag.cache{color:var(--orange)}.tag.web{color:var(--green)}.tag.monitoring{color:var(--muted)}.tag.app{color:#58a6ff}
+  .pill{font-size:10px;padding:1px 6px;border-radius:10px}
+  .pill.high{background:rgba(248,81,73,.15);color:var(--red)}
+  .pill.medium{background:rgba(210,153,34,.15);color:var(--amber)}
+  .pill.low{background:rgba(63,185,80,.15);color:var(--green)}
+  .conf{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .pager{display:flex;gap:8px;align-items:center;margin-top:8px;justify-content:space-between}
+  .bars{display:flex;flex-direction:column;gap:5px}
+  .bar-row{display:grid;grid-template-columns:120px 1fr 50px;align-items:center;gap:8px;font-size:12px}
+  .bar-track{background:var(--panel2);border-radius:4px;height:16px;position:relative;overflow:hidden}
+  .bar-fill{height:100%;border-radius:4px;background:var(--accent)}
+  .bar-fill.r{background:var(--red)}.bar-fill.a{background:var(--amber)}.bar-fill.g{background:var(--green)}.bar-fill.p{background:var(--purple)}.bar-fill.o{background:var(--orange)}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
+  .tile{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+  .tile .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  .tile .v{font-size:22px;font-weight:600;margin-top:2px}
+  .tile .v small{font-size:12px;color:var(--muted);font-weight:400}
+  .tile.warn .v{color:var(--amber)}
+  pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;margin:0}
+  .out{background:#010409;border:1px solid var(--border);border-radius:6px;padding:10px;max-height:340px;overflow:auto}
+  .out .ev-tool{color:var(--muted);font-size:11px}
+  .out .ev-err{color:var(--red)}
+  .wave{border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:8px;background:var(--panel2);cursor:pointer}
+  .wave:hover{border-color:var(--accent)}
+  .wave .name{font-weight:600}
+  .wave .meta{color:var(--muted);font-size:11px}
+  .wave .deps{color:var(--accent);font-size:10px;font-family:var(--mono)}
+  .drawer{position:fixed;top:0;right:0;height:100vh;width:480px;max-width:92vw;background:var(--panel);border-left:1px solid var(--border);padding:18px;overflow:auto;box-shadow:-8px 0 30px rgba(0,0,0,.4);transform:translateX(100%);transition:transform .2s;z-index:20}
+  .drawer.open{transform:none}
+  .drawer .close{min-width:36px;min-height:36px;font-size:16px;line-height:1;padding:0;border-radius:8px}
+  .drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .2s;z-index:19}
+  .drawer-backdrop.open{opacity:1;pointer-events:auto}
+  .muted{color:var(--muted)}
+  .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .chip{display:inline-flex;align-items:center;gap:4px;background:rgba(47,129,247,.15);border:1px solid var(--accent);border-radius:12px;padding:1px 8px;font-size:11px;color:var(--accent)}
+  .chip .x{cursor:pointer;font-weight:bold}
+  .kbd{font-family:var(--mono);background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-size:10px;color:var(--muted)}
+  .hidden{display:none !important}        /* !important so it beats inline display: when toggled via classList */
+  .grid2col{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .xscroll{overflow-x:auto}              /* horizontal-only scroll wrapper for wide tables (code/jobs) */
+  .qcard{margin-bottom:8px;background:var(--panel2)}
+
+  /* key/value list used in server drawer — readable on desktop and stacks on mobile */
+  .kv{display:grid;gap:0;border:1px solid var(--border);border-radius:8px;background:var(--panel2);padding:0;margin:10px 0;overflow:hidden}
+  .kv-row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:8px 12px;border-bottom:1px solid var(--border)}
+  .kv-row:last-child{border-bottom:none}
+  .kv-label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:500;white-space:nowrap;padding-top:1px}
+  .kv-val{text-align:right;word-break:break-word;flex:1}
+
+  /* lightweight toast notifications */
+  .toast-wrap{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:30;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+  .toast{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:6px;padding:10px 14px;box-shadow:0 6px 24px rgba(0,0,0,.4);pointer-events:auto;max-width:420px;min-width:260px;animation:toastIn .2s ease}
+  .toast.ok{border-left-color:var(--green)}
+  .toast.err{border-left-color:var(--red)}
+  .toast.warn{border-left-color:var(--amber)}
+  @keyframes toastIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+
+  /* ---------- responsive ----------
+     Two breakpoints: 900px stacks the inventory facet column (the 200px
+     side rail is too thin below that); 760px is the phone layer that
+     reflows the header, two-column card layouts, and wide tables.
+     Wide tables (.mcard) turn into stacked cards using each cell's
+     data-label — no horizontal scrolling, every field visible at once. */
+  @media (max-width:900px){
+    .grid2{ grid-template-columns:1fr }
+  }
+  @media (max-width:760px){
+    body{ font-size:14px }
+    header{ flex-wrap:wrap; gap:8px; padding:8px 12px; position:static; }
+    header h1{ font-size:15px; flex:1 1 auto; }
+    .tabs{ order:1; width:100%; margin-left:0; overflow-x:auto; -webkit-overflow-scrolling:touch; padding-bottom:2px;
+           scrollbar-width:none; -ms-overflow-style:none; }
+    .tabs::-webkit-scrollbar{ display:none }
+    .tabs::after{ content:''; flex:0 0 12px } /* tiny trailing gap so last tab isn't clipped */
+    .tab{ white-space:nowrap; flex:0 0 auto; font-size:13px; padding:8px 14px }
+    .tab.active{ border-bottom:1px solid var(--bg) }
+    .stats{ order:2; margin-left:0; flex-wrap:wrap }
+    header > .row{ order:3; width:100%; flex-wrap:wrap; gap:6px }
+    header > .row > *{ flex:1 1 auto; min-width:120px }
+    header > .row select, header > .row button{ width:auto }
+    .page{ padding:10px; padding-bottom:max(10px,env(safe-area-inset-bottom)) }
+    .cols > *{ flex:1 1 100% !important }   /* stack two-column card layouts; !important beats inline flex:1/1.4 */
+    .grid2col{ grid-template-columns:1fr } /* stack the modify scope/overrides fields */
+    .pager{ flex-wrap:wrap }               /* pager controls wrap instead of overflowing */
+    .drawer{ width:100vw; max-width:100vw; padding:14px 12px; padding-bottom:max(14px,env(safe-area-inset-bottom)) }
+    .drawer table{ font-size:13px }
+    .card{ padding:12px; border-radius:10px }
+    .card h2{ font-size:13px; margin-bottom:12px }
+    #q{ min-width:0 !important; width:100% }
+
+    /* touch targets: floor interactive elements at ~40px tall (44 is the
+       Apple minimum; we keep 40 to avoid blowing up dense toolbars). */
+    button, .tab, .facet, input, select, textarea, .chip, .tag, .pill, .wave{ min-height:40px }
+    button.sm, .tag, .pill{ min-height:36px; display:inline-flex; align-items:center }
+    .tab{ display:flex; align-items:center }
+    .facet{ padding:6px 8px; gap:8px }
+    .stat{ padding:6px 10px; min-height:34px; display:inline-flex; align-items:center }
+    .chip{ padding:4px 10px; min-height:30px; display:inline-flex; align-items:center }
+    .chip .x{ padding:0 4px; min-width:24px; text-align:center }
+
+    /* dashboard tiles: smaller min so they don't get crushed */
+    .tiles{ grid-template-columns:repeat(auto-fit,minmax(120px,1fr)) }
+    .tile{ padding:12px }
+    .tile .k{ font-size:12px }
+    .tile .v{ font-size:24px }
+
+    /* bar charts: prevent labels from pushing the bar off screen */
+    .bar-row{ grid-template-columns:minmax(80px,100px) 1fr 44px; gap:6px }
+    .bar-row > div:first-child{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+
+    /* card-reflow for wide tables. Each row becomes a card; each cell a
+       label/value line via the data-label attribute. */
+    table.mcard, .drawer table, .card table{ box-shadow:none; width:100% }
+    table.mcard .xscroll, .xscroll:has(> table.mcard), .drawer .xscroll{ overflow:visible }
+    table.mcard thead, .drawer table thead, .card table thead{ display:none }
+    table.mcard tbody tr, .drawer table tbody tr, .card table tbody tr{
+      display:grid; grid-template-columns:1fr; gap:1px;
+      border:1px solid var(--border); border-radius:10px; margin-bottom:10px;
+      padding:10px 12px; background:var(--panel2) }
+    table.mcard tbody tr:hover, .drawer table tbody tr:hover, .card table tbody tr:hover{ background:var(--panel2) }
+    table.mcard td, .drawer table td, .card table td{
+      display:flex; justify-content:space-between; align-items:center;
+      gap:12px; border:none; padding:6px 0; text-align:right; white-space:normal;
+      overflow:hidden; text-overflow:ellipsis; min-height:28px }
+    table.mcard td::before, .drawer table td::before, .card table td::before{
+      content:attr(data-label); color:var(--muted); font-size:11px;
+      text-transform:uppercase; letter-spacing:.04em; font-weight:500; text-align:left;
+      flex:0 0 auto; max-width:45% }
+    /* hide generated label when a cell carries its own visible label */
+    table.mcard td:empty::before, .drawer table td:empty::before{ content:none }
+
+    /* inventory card: hostname row is the card header, not a labeled row */
+    #inv td[data-label="Hostname"]{ display:flex; align-items:center; gap:8px;
+      padding-bottom:8px; margin-bottom:6px; border-bottom:1px solid var(--border) }
+    #inv td[data-label="Hostname"]::before{ content:none }
+    #inv td[data-label="Hostname"] input[type=checkbox]{ width:20px; height:20px; flex:0 0 auto }
+    #inv td[data-label="Hostname"] b{ flex:1 1 auto; word-break:break-word; text-align:left; font-size:15px }
+
+    .scroll{ max-height:none }             /* card rows are short; no inner scroll */
+    .out{ max-height:55vh }                /* give console panes more room on phones */
+    .tag, .pill{ font-size:12px; padding:2px 8px }
+    .kbd{ display:inline-block; margin:2px }   /* CLI-equivalent chips wrap on copilot tab */
+
+    /* make multi-input toolbars friendlier: inputs that are forced to wrap
+       become full-width so they don't end up 60px wide and unusable */
+    .row > input, .row > select, .row > textarea, .row > button{ flex:1 1 auto; min-width:120px }
+    .row > button{ flex:0 1 auto }
+
+    /* toast notifications anchored to the top on phones */
+    .toast-wrap{ left:8px; right:8px; transform:none }
+    .toast{ max-width:none; min-width:0; border-radius:10px }
+  }
+  @media (max-width:380px){
+    .tiles{ grid-template-columns:1fr 1fr }   /* never go below 2 columns so stats stay scannable */
+    .bar-row{ grid-template-columns:minmax(70px,90px) 1fr 40px }
+    .tab{ padding:8px 10px; font-size:12px }
+    header h1 .sub{ display:none }           /* drop the tagline to save header height */
+  }

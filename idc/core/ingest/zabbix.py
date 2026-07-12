@@ -8,9 +8,10 @@ without a live Zabbix.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
-from ...config import FIXTURES, Settings
+from ...config import Settings
 from ..models import RawAsset, SOURCE_ZABBIX
 from .base import Adapter, IngestResult, register
 
@@ -22,11 +23,15 @@ class ZabbixAdapter(Adapter):
     def fetch(self, settings: Settings) -> IngestResult:
         if settings.has_zabbix():
             return self._online(settings)
-        return self._fixture()
+        return self._fixture(settings)
 
-    def _fixture(self) -> IngestResult:
-        path = FIXTURES / "zabbix_hosts.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
+    def _fixture(self, settings: Settings) -> IngestResult:
+        path = settings.zbx_path
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except OSError as e:
+            return IngestResult(assets=[], mode="fixture",
+                                error=f"zabbix file not found: {path} ({e!r})")
         assets: List[RawAsset] = []
         for h in data.get("hosts", []):
             iface = (h.get("interfaces") or [{}])[0]
