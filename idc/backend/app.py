@@ -172,8 +172,12 @@ def list_servers(role: Optional[str] = None, env: Optional[str] = None,
                  warranty_bucket: Optional[str] = None,
                  os_eol_bucket: Optional[str] = None,
                  page: int = 1, page_size: int = 50,
-                 order_by: str = "hostname", order_dir: str = "asc"):
-    """Paginated, filtered, faceted server query (scales to 15K+)."""
+                 order_by: str = "hostname", order_dir: str = "asc",
+                 facets: bool = True):
+    """Paginated, filtered, faceted server query (scales to 15K+).
+
+    ``facets=false`` skips the 6 facet GROUP-BY queries — callers that only
+    need items+total (the wave-members view) use it to stay fast for big waves."""
     f = ServerFilter(role=role, env=env, status=status, source_type=source_type,
                      os=os, criticality=criticality, cluster=cluster, datacenter=datacenter,
                      target_product=target_product, wave_id=wave_id, q=q,
@@ -181,7 +185,8 @@ def list_servers(role: Optional[str] = None, env: Optional[str] = None,
                      util_disk_min=util_disk_min, conf_min=conf_min, conf_max=conf_max,
                      warranty_bucket=warranty_bucket, os_eol_bucket=os_eol_bucket)
     res = STORE.query_servers(f, page=page, page_size=min(page_size, 500),
-                              order_by=order_by, order_dir=order_dir)
+                              order_by=order_by, order_dir=order_dir,
+                              with_facets=facets)
     items = [_server_out(s) for s in res["items"]]
     return {"items": items, "total": res["total"], "page": res["page"],
             "page_size": res["page_size"], "facets": res["facets"]}

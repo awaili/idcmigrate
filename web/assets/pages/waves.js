@@ -69,7 +69,9 @@ async function openWave(id){
   await fetchWaveMembers();
 }
 async function fetchWaveMembers(){
-  const p=new URLSearchParams({wave_id:waveState.id,page:waveState.page,page_size:waveState.page_size,order_by:'hostname'});
+  // facets=false: this view only needs items+total, and skipping the 6 facet
+  // GROUP-BY queries keeps big waves (12K members) fast instead of hanging.
+  const p=new URLSearchParams({wave_id:waveState.id,page:waveState.page,page_size:waveState.page_size,order_by:'hostname',facets:'false'});
   const r = await api('/servers?'+p.toString());
   const rows = (r.items||[]).map(s=>{const m=s.match||{};return `<tr onclick="openServer('${s.id}')">
       <td data-label="Hostname"><b>${esc(s.hostname)}</b></td>

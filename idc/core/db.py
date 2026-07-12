@@ -670,14 +670,20 @@ class Store:
             where.append(f"{cm} >= ?")
             args.append(f.util_disk_min)
         if f.wave_id:
-            # membership stored as a JSON array text in waves.server_ids.
-            # Pass the '%' wildcards as params (a literal % in the SQL breaks
-            # pymysql's mogrify).
-            where.append("EXISTS (SELECT 1 FROM waves WHERE waves.id=? "
-                         "AND waves.server_ids LIKE CONCAT(?, servers.id, ?))")
-            args.append(f.wave_id)
-            args.append('%"')
-            args.append('"%')
+            # membership is a JSON array in waves.server_ids; resolve it once and
+            # filter servers by primary-key IN(...). The old EXISTS+LIKE-on-JSON
+            # was O(servers x wave_size): a 12K-member wave stores a ~180KB
+            # server_ids string that got LIKE-scanned once per server row, which
+            # timed out the wave-members view for big waves. IN on the indexed
+            # servers.id is O(M) and stays sub-second at estate scale.
+            row = self._fetchone("SELECT server_ids FROM waves WHERE id=?",
+                                 (f.wave_id,))
+            ids = loads(row["server_ids"]) if row else None
+            if not ids:
+                where.append("1=0")   # wave missing or has no members -> none
+            else:
+                where.append(f"servers.id IN ({','.join(['?'] * len(ids))})")
+                args.extend(ids)
         # data-gap (gap-actionable) — facet/filter on the persisted derived buckets
         for col, val in (("warranty_bucket", f.warranty_bucket),
                          ("os_eol_bucket", f.os_eol_bucket)):
@@ -696,7 +702,8 @@ class Store:
 
     def query_servers(self, f: "ServerFilter",
                       page: int = 1, page_size: int = 50,
-                      order_by: str = "hostname", order_dir: str = "asc") -> dict:
+                      order_by: str = "hostname", order_dir: str = "asc",
+                      with_facets: bool = True) -> dict:
         where, args, join_matches = self._filters_sql(f)
         join = " LEFT JOIN matches ON matches.server_id=servers.id" if join_matches else ""
         allowed = {"hostname", "cpu_cores", "mem_gb", "env", "role", "os",
@@ -711,7 +718,10 @@ class Store:
             f"ORDER BY servers.{ob} {od} LIMIT ? OFFSET ?",
             args + [page_size, offset])
         items = [self._row_to_server(r) for r in rows]
-        facets = self._facets(where, args, join_matches)
+        # facets are 6 GROUP-BY queries; callers that only need items+total
+        # (e.g. the wave-members view) pass with_facets=False to skip them —
+        # significant for big waves where the filter is a 12K-id IN clause.
+        facets = self._facets(where, args, join_matches) if with_facets else {}
         return {"items": items, "total": total, "page": page,
                 "page_size": page_size, "facets": facets}
 
