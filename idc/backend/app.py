@@ -1778,6 +1778,17 @@ def _index():
                          "api": [r.path for r in app.routes if hasattr(r, "path") and r.path.startswith("/api")]})
 
 
+@app.get("/executor")
+def _executor_spec():
+    """Public, self-contained spec page for the external agent executor — a
+    URL operators can hand to the executor (human or agent) so it knows the
+    contract: actions, endpoints, push callbacks, schemas, auth, quality rules."""
+    p = WEB_DIR / "executor.html"
+    if p.exists():
+        return FileResponse(str(p), media_type="text/html")
+    return JSONResponse({"error": "web/executor.html not built yet"}, status_code=404)
+
+
 @app.on_event("shutdown")
 def _shutdown():
     STORE.close()

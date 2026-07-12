@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Executor contract · idc-migrate</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--green:#3fb950;--amber:#d29922;--red:#f85149;--code:#0d1117}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:980px;margin:0 auto;padding:32px 24px 80px}
+  h1{font-size:28px;margin:0 0 4px}
+  h2{font-size:20px;margin:32px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+  h3{font-size:15px;margin:20px 0 6px;color:var(--accent)}
+  .sub{color:var(--muted);margin:0 0 24px}
+  a{color:var(--accent)}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  code{background:var(--card);border:1px solid var(--border);padding:1px 5px;border-radius:4px;font-size:12.5px}
+  pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:14px;overflow:auto;font-size:12.5px;line-height:1.5}
+  pre code{background:none;border:0;padding:0;font-size:inherit}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}
+  th,td{border:1px solid var(--border);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:var(--card);color:var(--muted);font-weight:600}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin:12px 0}
+  .pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11.5px;font-weight:600;border:1px solid var(--border)}
+  .p-green{color:var(--green);border-color:var(--green)}
+  .p-amber{color:var(--amber);border-color:var(--amber)}
+  .p-red{color:var(--red);border-color:var(--red)}
+  .p-blue{color:var(--accent);border-color:var(--accent)}
+  ul{margin:6px 0;padding-left:22px}
+  li{margin:3px 0}
+  .muted{color:var(--muted)}
+  .tag{display:inline-block;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:0 6px;font-size:11.5px;color:var(--muted);margin:0 2px}
+  .toc{columns:2;column-gap:32px;font-size:13px}
+  .toc a{text-decoration:none}
+  .toc li{break-inside:avoid}
+  .note{border-left:3px solid var(--amber);padding:8px 12px;background:rgba(210,153,34,.08);border-radius:0 6px 6px 0}
+  .ok{border-left-color:var(--green);background:rgba(63,185,80,.08)}
+  hr{border:0;border-top:1px solid var(--border);margin:28px 0}
+  .top{position:fixed;right:24px;bottom:24px;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:6px 10px;text-decoration:none;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>External Agent Executor — Contract &amp; Instructions</h1>
+  <p class="sub">What an executor must implement to work with <b>idc-migrate</b>. Full source contract: <code>docs/agent-executor.md</code>. Reference implementation: <code>idc/executor_mock/app.py</code>.</p>
+
+  <div class="card">
+    <b>In one sentence:</b> an executor is an external HTTP service that idc-migrate outsources code-scan / assessment / modify work to. It receives trigger requests, does the work async, and pushes results back to idc-migrate via callbacks. Results feed reconsolidate, wave planning, and match confidence.
+    <p style="margin:10px 0 0"><span class="pill p-blue">one configured endpoint</span> connect via the <b>Manage executor</b> panel (Code &amp; DB tab) or <code>IDC_EXECUTOR_URL</code> / <code>IDC_EXECUTOR_TOKEN</code> env.</p>
+  </div>
+
+  <h2 id="toc">Contents</h2>
+  <ul class="toc">
+    <li><a href="#auth">Auth &amp; conventions</a></li>
+    <li><a href="#actions">The 5 actions (request direction)</a></li>
+    <li><a href="#push">Push callbacks (executor → idc-migrate)</a></li>
+    <li><a href="#codeprofile">CodeProfile schema</a></li>
+    <li><a href="#dbprofile">DBConversionProfile (F5)</a></li>
+    <li><a href="#changejob">ChangeJob</a></li>
+    <li><a href="#context">Context the executor can pull</a></li>
+    <li><a href="#questions">Questions (don't guess)</a></li>
+    <li><a href="#quality">Quality rules</a></li>
+    <li><a href="#lifecycle">Lifecycle &amp; errors</a></li>
+    <li><a href="#minimal">Minimal viable executor</a></li>
+  </ul>
+
+  <h2 id="auth">Auth &amp; conventions</h2>
+  <ul>
+    <li>Both directions use <code>Authorization: Bearer &lt;token&gt;</code>. The shared secret is <code>IDC_EXECUTOR_TOKEN</code> (idc-migrate validates pushes with it; the executor validates incoming triggers with the same value).</li>
+    <li>Content-Type <code>application/json; charset=utf-8</code>. Timestamps ISO-8601 UTC (<code>...Z</code>).</li>
+    <li>Request direction base = <code>IDC_EXECUTOR_URL</code> (e.g. <code>http://executor.internal:8090</code>). Push direction base = the idc-migrate web URL (e.g. <code>https://mig.zaymuc.com</code>).</li>
+    <li>All triggers are <b>async</b>: respond <code>202 {job_id, status:"pending"}</code> immediately, then call back when done.</li>
+  </ul>
+
+  <h2 id="actions">The 5 actions (idc-migrate → executor)</h2>
+  <p class="muted">These are the endpoints the executor must serve. All bearer-authed, all async (202 + job_id).</p>
+  <table>
+    <tr><th>Endpoint</th><th>Action</th><th>Produces (via callback)</th></tr>
+    <tr><td><code>POST /v1/scan</code></td><td>scan a repo (read-only) → findings</td><td>pushes <code>ChangeJob</code> (done); scan itself does not push a profile</td></tr>
+    <tr><td><code>POST /v1/comb</code></td><td>synthesize a <code>CodeProfile</code> from findings</td><td><code>ChangeJob</code> done + <code>PUT /api/code-profiles/{app_id}</code></td></tr>
+    <tr><td><code>POST /v1/modify</code></td><td>apply a concrete <code>changes[]</code> list (idc-migrate builds it)</td><td><code>ChangeJob</code> done with <code>patch_ref</code></td></tr>
+    <tr><td><code>POST /v1/db-scan</code> <span class="tag">F5</span></td><td>scan a DB host's schema/SQL (Oracle/SQLServer → MySQL)</td><td><code>ChangeJob</code> done + <code>PUT /api/db-profiles/{db_server_id}</code></td></tr>
+    <tr><td><code>POST /v1/runtime-containerize</code> <span class="tag">F9</span></td><td>infer a Dockerfile from runtime inventory (no source repo)</td><td><code>ChangeJob</code> done + <code>PUT /api/code-profiles/{app_id}</code> with <code>source=runtime-derived</code></td></tr>
+    <tr><td><code>GET /v1/jobs/{job_id}</code></td><td>poll a job's status</td><td>returns the <code>ChangeJob</code></td></tr>
+    <tr><td><code>GET /health</code></td><td>liveness + identity</td><td><code>{ok, service, version, ...}</code> — powers the status badge / <code>idc doctor</code></td></tr>
+  </table>
+  <div class="note"><b><code>modify</code> is the only action with side effects.</b> Default <code>mode=plan</code> (dry-run, produce a <code>patch_ref</code> only); <code>mode=execute</code> actually writes to the repo (commit/PR).</div>
+
+  <h3>POST /v1/scan</h3>
+<pre><code>{"app_id": "orders-svc", "repo_url": "git@gitlab:trade/orders-svc.git",
+ "branch": "master", "callback": "https://mig.zaymuc.com/api/code-profiles/orders-svc"}
+→ 202 {"job_id": "cjob-...", "status": "pending"}</code></pre>
+
+  <h3>POST /v1/modify</h3>
+  <p class="muted">The <code>changes</code> array is built by idc-migrate from the app's <code>CodeProfile</code> + operator <code>overrides</code> — it tells the executor <b>exactly which file, which line, which literal (<code>old</code>) → which value (<code>new</code>)</b>. Do not re-scan; do not guess.</p>
+<pre><code>{"app_id": "orders-svc", "repo_url": "git@gitlab:trade/orders-svc.git",
+ "branch": "cloud-ready", "mode": "plan",
+ "scope": ["db_connection", "service_discovery"],
+ "changes": [
+   {"category": "db_connection", "kind": "endpoint",
+    "file": "src/main/resources/application.yml", "line": 12,
+    "title": "Parameterize DB host",
+    "evidence": "url: jdbc:mysql://10.0.4.20:3306/orders",
+    "old": "10.0.4.20:3306", "new": "${ORDERS_DB_HOST}:3306",
+    "effort": "low", "description": "Replace hardcoded 10.0.4.20 with ${DB_HOST}"},
+   {"category": "secrets_in_repo", "kind": "secret",
+    "file": "src/main/resources/application.yml", "line": 13,
+    "title": "Move DB password to secret ref",
+    "evidence": "password: hunter2",
+    "old": "hunter2", "new": "${ORDERS_DB_PASSWORD}",
+    "effort": "low", "description": "Inline password → secret ref"}
+ ],
+ "notes": []}
+→ 202 {"job_id": "cjob-...", "status": "pending"}</code></pre>
+  <div class="note">If a <code>change.old</code> or <code>change.new</code> is empty, idc-migrate couldn't extract the literal. The executor must locate it by <code>file</code>+<code>line</code> itself, <b>or skip it and report <code>ChangeJob.status=error</code></b>. <b>Never invent a replacement value.</b></div>
+
+  <h3>POST /v1/db-scan (F5)</h3>
+<pre><code>{"db_server_id": "db-oracle-01", "source_engine": "oracle",
+ "target_engine": "tdsql", "callback": "https://mig.zaymuc.com/api/db-profiles/db-oracle-01"}
+→ 202 {"job_id": "...", "status": "pending"}</code></pre>
+  <p class="muted"><code>db_server_id</code> is the DB host's <b>stable identity (hostname, lowercase)</b> — not <code>Server.id</code>, which changes every rebuild.</p>
+
+  <h3>POST /v1/runtime-containerize (F9)</h3>
+<pre><code>{"app_id": "legacy-billing", "server_id": "srv-123",
+ "inventory": {"process": "java -jar billing.jar", "port": 8080,
+               "unit": "billing.service", "software": ["openjdk-8"]},
+ "mode": "plan", "callback": "https://mig.zaymuc.com/api/code-profiles/legacy-billing"}
+→ 202 {"job_id": "...", "status": "pending"}</code></pre>
+
+  <h2 id="push">Push callbacks (executor → idc-migrate)</h2>
+  <p class="muted">The executor calls these as it works. All bearer-authed with <code>IDC_EXECUTOR_TOKEN</code>.</p>
+  <table>
+    <tr><th>Endpoint</th><th>When</th></tr>
+    <tr><td><code>POST /api/change-jobs</code></td><td>heartbeat + terminal state — <code>pending→running→done/error</code>. Upsert by <code>id</code>. Use <code>summary</code> for live progress text.</td></tr>
+    <tr><td><code>PUT /api/code-profiles/{app_id}</code></td><td>when comb/scan/runtime-containerize produces a <code>CodeProfile</code> (upsert by <code>app_id</code>)</td></tr>
+    <tr><td><code>PUT /api/db-profiles/{db_server_id}</code></td><td>when db-scan produces a <code>DBConversionProfile</code> (upsert by hostname)</td></tr>
+    <tr><td><code>POST /api/apps/{app_id}/questions</code></td><td>raise a question to the operator when a value can't be resolved (see <a href="#questions">Questions</a>)</td></tr>
+  </table>
+  <div class="note ok"><b>Callback order on completion:</b> <code>POST /api/change-jobs</code> (status=done) <b>first</b>, then the profile PUT (only for comb/scan/db-scan that produce a profile).</div>
+
+  <h2 id="codeprofile">CodeProfile — the assessment (must produce for comb)</h2>
+  <p class="muted">Pushed via <code>PUT /api/code-profiles/{app_id}</code>. Data model: <code>idc/core/models.py::CodeProfile</code>.</p>
+<pre><code>{
+  "app_id": "orders-svc",
+  "repo_url": "git@gitlab:trade/orders-svc.git",
+  "branch": "master",
+  "scan_id": "cjob-1a2b3c4d5e",
+  "scanner": "idc-executor/0.3.0",
+  "scanned_at": "2026-07-12T08:30:00Z",
+  "language": "java", "runtime": "jdk8", "framework": "spring-boot-2.1",
+  "cloud_readiness": 0.42,
+  "migration_pattern": "replatform",
+  "refactor_effort": "medium",
+  "code_deps": ["user-svc", "inventory-svc"],
+  "network_endpoints": ["10.0.4.20:3306", "redis01.dc1:6379"],
+  "required_changes": [
+    {"title": "Parameterize DB host", "category": "db_connection",
+     "file": "src/main/resources/application.yml", "effort": "low",
+     "description": "Replace hardcoded 10.0.4.20 with ${DB_HOST}"}
+  ],
+  "blockers": ["Quartz scheduler assumes host crontab (scheduled_job, blocker)"],
+  "findings": [
+    {"category": "db_connection", "severity": "high",
+     "file": "src/main/resources/application.yml", "line": 12,
+     "message": "hardcoded DB host",
+     "evidence": "url: jdbc:mysql://10.0.4.20:3306/orders",
+     "remediation": "use ${DB_HOST} from env"}
+  ],
+  "summary": "Spring Boot 2.1 on JDK8; rehost blocked by Quartz-on-crontab; needs DB host param + service-discovery swap."
+}</code></pre>
+  <h3>Required fields</h3>
+  <ul>
+    <li><b>cloud_readiness</b> ∈ [0,1] — from findings' severity/count. A <code>blocker</code> finding must push this below 0.5.</li>
+    <li><b>migration_pattern</b> ∈ <code>rehost | replatform | refactor | rewrite</code>.</li>
+    <li><b>refactor_effort</b> ∈ <code>low | medium | high</code>.</li>
+    <li><b>code_deps</b> — app ids <b>actually called</b> in code (HTTP/RPC/message/shared lib). The key signal that back-fills the dependency DAG.</li>
+    <li><b>blockers</b> — hard blockers (human text, goes into match rationale).</li>
+    <li><b>required_changes[]</b> — each <code>{title, category, file, effort, description}</code>.</li>
+    <li><b>findings[]</b> — each <code>{category, severity, file, line, message, evidence, remediation}</code>.</li>
+    <li><b>scanned_at / scanner / scan_id</b>.</li>
+  </ul>
+  <h3>Finding categories (use these)</h3>
+  <p><span class="tag">hardcoded_ip</span><span class="tag">service_discovery</span><span class="tag">db_connection</span><span class="tag">stateful_local</span><span class="tag">scheduled_job</span><span class="tag">secrets_in_repo</span><span class="tag">baremetal_assumption</span><span class="tag">network_dependency</span><span class="tag">os_dependency</span><span class="tag">legacy_runtime</span><span class="tag">config_coupling</span></p>
+  <p class="muted">F5 DB categories: <span class="tag">plsql_compat</span><span class="tag">db_feature_gap</span><span class="tag">db_size_complexity</span>. Severity: <code>low | medium | high | blocker</code>.</p>
+
+  <h2 id="dbprofile">DBConversionProfile (F5 — for db-scan)</h2>
+  <p class="muted">Pushed via <code>PUT /api/db-profiles/{db_server_id}</code>. Keyed by hostname (stable), not <code>Server.id</code>.</p>
+<pre><code>{
+  "db_server_id": "db-oracle-01",
+  "source_engine": "oracle", "target_engine": "tdsql",
+  "difficulty": "C",            // A | B | C  (Ora2Pg A–C / DMS SC grade)
+  "est_man_days": 40.0,
+  "review_objects": ["PKG_ORDERS", "PKG_BILLING", "TRG_AUDIT_LOG"],
+  "blockers": ["PL/SQL packages with no MySQL equivalent (DBMS_LOCK, UTL_FILE)"],
+  "reverse_replication": true,  // keep a reverse channel until cutover finalizes
+  "auto_convert_pct": 0.62,     // 0..1 — share the rule engine can auto-convert
+  "scan_id": "cjob-db1", "scanned_at": "2026-07-12T08:00:00Z",
+  "summary": "Oracle → TDSQL: heavy PL/SQL, hard conversion, reverse replication recommended."
+}</code></pre>
+  <p class="muted"><b>idc-migrate use:</b> <code>C</code> → strong confidence dip + force <code>replatform</code>; <code>B</code> → small dip; <code>A</code> → no dip, just annotated.</p>
+
+  <h2 id="changejob">ChangeJob — the audit/heartbeat record</h2>
+<pre><code>{
+  "id": "cjob-1a2b3c4d5e", "app_id": "orders-svc", "kind": "scan",
+  "repo_url": "git@gitlab:trade/orders-svc.git", "branch": "master",
+  "status": "done",             // pending | running | done | error
+  "patch_ref": "",              // commit/PR/artifact url (modify)
+  "summary": "scanned 1248 files, 12 findings",
+  "error": "",
+  "created_at": "2026-07-12T08:29:00Z", "finished_at": "2026-07-12T08:30:00Z"
+}</code></pre>
+  <p class="muted">Push <code>status=running</code> repeatedly during long work, updating <code>summary</code> for live progress; terminal <code>done</code>/<code>error</code> goes through the same endpoint.</p>
+
+  <h2 id="context">Context the executor can pull (read-only GET, no bearer)</h2>
+  <p>While working, the executor may fetch more context from idc-migrate:</p>
+  <ul>
+    <li><code>GET /api/workloads/{app_id}</code> — the app's <code>tier</code>, <code>depends_on</code>, <code>server_ids</code> (blast radius).</li>
+    <li><code>GET /api/apps/{app_id}/targets</code> — matched Tencent targets for the app's servers <code>{product, spec, region, confidence}</code> (e.g. DB matched to CDB → parameterize JDBC to CDB-style host, not bare IP).</li>
+    <li><code>GET /api/apps/{app_id}/resolve?kind=ip&amp;old=10.0.5.99</code> — "what should this old value become?" → <code>{new, source, confidence}</code>. <code>source ∈ override | match-derived | default | unknown</code>. <b>If <code>source=unknown</code>, the executor MUST ask the operator (next section) — never guess.</b></li>
+    <li><code>GET /api/code-profiles/{app_id}</code> — the app's current profile.</li>
+  </ul>
+
+  <h2 id="questions">Questions — don't guess, ask</h2>
+  <p>When a value can't be resolved (<code>resolve</code> returns <code>unknown</code>, a <code>change.old/new</code> is empty, or a new hardcoded value is found that's not in the profile), the executor raises a question instead of guessing or silently stalling.</p>
+<pre><code>POST /api/apps/{app_id}/questions   (bearer)
+{"job_id": "cjob-...", "kind": "choice",        // value | choice | confirm
+ "prompt": "What should '10.0.4.20:3306' in src/.../application.yml:12 (db_connection) be replaced with?",
+ "options": ["${DB_HOST}:3306"],
+ "context": {"file": "src/main/resources/application.yml", "line": 12,
+             "category": "db_connection", "old": "10.0.4.20:3306", "new": ""}}
+→ {"id": "qst-...", "status": "pending"}</code></pre>
+  <p>Then poll <code>GET /api/questions/{id}</code> until <code>status=answered</code>, read <code>answer</code>, continue. (Operator answers via the UI: <code>POST /api/questions/{id}/answer</code>; <code>/skip</code> to dismiss.)</p>
+
+  <h2 id="quality">Quality rules</h2>
+  <ul>
+    <li><b>Traceable</b> — every finding carries <code>file</code>+<code>line</code>+<code>evidence</code>; no vague claims.</li>
+    <li><b>Deterministic first</b> — rule checks must be reproducible; use MigraQ only for semantic judgment, and always pin its conclusion to an evidence-backed finding.</li>
+    <li><b>Idempotent</b> — same <code>(app_id, repo_url, branch)</code> → upsert by <code>app_id</code>, no duplicates.</li>
+    <li><b>Truncate</b> — <code>evidence</code> ≤ 512 chars; ≤ 500 findings/app (keep top by severity).</li>
+    <li><b>Fail loudly</b> — on error push <code>ChangeJob.status=error</code> + message; never swallow.</li>
+    <li><b>Default read-only</b> — <code>modify</code> is dry-run unless the caller passes <code>mode=execute</code>.</li>
+    <li><b>Don't guess values</b> — ask a Question instead.</li>
+  </ul>
+
+  <h2 id="lifecycle">Lifecycle &amp; errors</h2>
+  <ul>
+    <li>Triggers are async: <code>202 + job_id</code>; results via callback or <code>GET /v1/jobs/{id}</code>.</li>
+    <li>Timeout: <code>IDC_EXECUTOR_TIMEOUT</code> (default 600s) bounds the HTTP connection, not the job — long work is expressed via <code>ChangeJob.status</code>.</li>
+    <li>Concurrency: a new scan for the same <code>app_id</code> overwrites the old profile; same <code>job_id</code> re-push is upsert.</li>
+    <li>Status codes: <code>400</code> schema, <code>401</code> auth, <code>404</code> unknown app, <code>409</code> already-running (optional), <code>422</code> repo unreachable, <code>5xx</code> internal.</li>
+  </ul>
+
+  <h2 id="minimal">Minimal viable executor</h2>
+  <p>The smallest useful executor implements:</p>
+  <ol>
+    <li><code>GET /health</code> → <code>{ok:true, service, version}</code>.</li>
+    <li><code>POST /v1/scan</code> + <code>POST /v1/comb</code> → return <code>202 + job_id</code>, then in the background: <code>POST /api/change-jobs</code> (running → done) and <code>PUT /api/code-profiles/{app_id}</code> with a real <code>CodeProfile</code>.</li>
+    <li><code>POST /v1/modify</code> → apply the given <code>changes[]</code> (literal replace by <code>file</code>+<code>line</code>), produce a <code>patch_ref</code>; <code>mode=plan</code> dry-run only.</li>
+    <li><code>GET /v1/jobs/{id}</code> → return the job record.</li>
+  </ol>
+  <p>db-scan (F5) and runtime-containerize (F9) are optional until you need them.</p>
+  <div class="card"><b>Reference implementation:</b> <code>idc/executor_mock/app.py</code> — ~370 lines, implements the whole contract with in-memory jobs and real callbacks. Run it with <code>idc executor-mock</code> (port 8090), then point idc-migrate at it via the <b>Manage executor</b> panel (<code>http://127.0.0.1:8090</code> + token) and Save &amp; test. A production executor swaps the mock's canned answers for a real scanner (AST/regex rules + optional MigraQ for semantic calls) and a real repo writer (commit/PR for <code>modify</code>).</div>
+
+  <hr/>
+  <p class="muted">idc-migrate · executor contract · <span id="base"></span></p>
+</div>
+<a class="top" href="#toc">↑ top</a>
+<script>document.getElementById('base').textContent = location.origin;</script>
+</body>
+</html>
