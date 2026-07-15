@@ -139,6 +139,33 @@ def os_eol_bucket(s: Server, today_iso: Optional[str] = None) -> str:
     return ACTIVE
 
 
+LONG_TERM_EOL_DAYS = 365  # expired >= this long ago counts as "long-term" EOL/EOS
+
+
+def os_long_term_eol(s: Server, days: int = LONG_TERM_EOL_DAYS,
+                     today_iso: Optional[str] = None) -> bool:
+    """True when the OS is not merely EOL but has been so for a while (>= ``days``
+    past its end-of-support date) — i.e. a "long-term" EOL/EOS OS.
+
+    A recently-expired OS may just need a base-image swap; a long-term EOL OS is
+    a dead image you should not lift-and-shift, so the matcher proposes
+    ``rehost-container`` (containerize onto a supported TKE base image) instead.
+    Unknown OS / not-in-table → False (no false positive).
+    """
+    if os_eol_bucket(s, today_iso=today_iso) != EXPIRED:
+        return False
+    eol = os_eol_date(s)
+    if not eol:
+        return False
+    today = today_iso or _today_iso()
+    try:
+        eol_d = datetime.date.fromisoformat(eol)
+        today_d = datetime.date.fromisoformat(today)
+    except ValueError:
+        return False
+    return (today_d - eol_d).days >= int(days)
+
+
 def runtime_eol_bucket(runtime: str, language: str = "",
                         today_iso: Optional[str] = None) -> str:
     """Runtime support bucket from a CodeProfile.runtime/language string."""
@@ -177,9 +204,10 @@ def runtime_eol_bucket(runtime: str, language: str = "",
 
 
 __all__ = ["OS_EOL_TABLE", "RUNTIME_EOL_TABLE",
-           "os_eol_bucket", "os_eol_date", "runtime_eol_bucket",
+           "os_eol_bucket", "os_eol_date", "os_long_term_eol", "runtime_eol_bucket",
            "apply_os_eol",
-           "EXPIRED", "EXPIRING", "ACTIVE", "UNKNOWN", "EXPIRING_DAYS"]
+           "EXPIRED", "EXPIRING", "ACTIVE", "UNKNOWN", "EXPIRING_DAYS",
+           "LONG_TERM_EOL_DAYS"]
 
 
 # confidence dip on the base rule confidence for an EOL OS — a thinly-fit rule,
@@ -192,26 +220,81 @@ _EOL_NOTE = {
 }
 
 
-def apply_os_eol(match, server: Server, today_iso: Optional[str] = None):
+def _match_escapes_onprem_os(match) -> bool:
+    """True when the match's target already discards the on-prem OS, so flagging
+    EOL on it (confidence dip + "replatform to a supported base image") would be
+    redundant and wrong.
+
+    Escapes the OS via: a managed service product (TencentDB / TKE / EMR /
+    TData …), OR a rehost-container / TKE-node-pool CVM (the workload is
+    re-containerized onto a supported base image). The EOL dip only applies to a
+    plain CVM lift-and-shift that would carry the dead image to the cloud.
+    """
+    if not match or not match.target:
+        return False
+    ex = match.target.extras or {}
+    if ex.get("rehost_container") or ex.get("tke_node_pool"):
+        return True
+    product = (match.target.product or "")
+    if product == "CVM":
+        return False                       # plain lift-and-shift keeps the OS
+    # any non-CVM, non-empty product is a managed/platform target (CDB, TKE,
+    # EMR, TData, TencentDB for *, TencentDB for Redis …) — OS is irrelevant.
+    return bool(product)
+
+
+def apply_os_eol(match, server: Server, today_iso: Optional[str] = None,
+                 disposition=None):
     """Flag a match whose server OS is out of support (the silent-rehost fix).
 
     Mutates ``match`` in place: dips the base rule confidence, annotates the
-    rationale with the EOL status + replatform guidance, and appends a
-    "replatform to supported base image" alternative. No-op when the OS is
-    active/unknown (we don't flag what we don't know). Called by ``rebuild``
-    after ``match_server`` and before ``enrich_match`` so the EOL dip compounds
-    with the F4 coverage scale.
+    rationale with the EOL status, and appends a remediation alternative. No-op
+    when the OS is active/unknown (we don't flag what we don't know). Called by
+    ``rebuild`` after ``match_server`` and before ``enrich_match`` so the EOL
+    dip compounds with the F4 coverage scale.
+
+    No-op too when the match already escapes the on-prem OS (a managed service
+    or a rehost-container / TKE node): the recommendation already handles the
+    EOL image, so the dip + "replatform to a supported base image" note would
+    double-count and mislabel it.
+
+    F7 — when a stored ``LegacyDisposition`` is passed (the executor's
+    containerize/replatform/rewrite/retain call for this host), the rationale +
+    alternative use the disposition's text instead of the fixed "replatform"
+    string, so the recommendation is grounded in the workload. The confidence
+    dip is unchanged (deterministic, from the OS bucket). Falls back to the
+    fixed string when no disposition exists (back-compat).
     """
     bucket = os_eol_bucket(server, today_iso)
     if bucket not in (EXPIRED, EXPIRING):
         return match
-    dip = _EOL_DIP.get(bucket, 1.0)
-    match.confidence = max(0.05, (match.confidence or 0) * dip)
-    note = _EOL_NOTE[bucket]
-    match.rationale = (match.rationale or "") + f" [OS {bucket} — {note}]"
+    # F7 — always fold the executor's disposition (containerize/replatform/retain
+    # …) into the match alternatives so the operator's grounded call is visible,
+    # regardless of whether the match escapes the OS.
     alts = list(match.alternatives or [])
-    replat = "replatform to a supported base image (e.g. TencentOS / Ubuntu)"
-    if replat not in alts:
-        alts.append(replat)
+    has_disp = disposition is not None and bool(getattr(disposition, "disposition", ""))
+    if has_disp:
+        rec = (f"{disposition.disposition}: {disposition.rationale}"
+               if disposition.rationale else disposition.disposition)
+        if rec not in alts:
+            alts.append(rec)
+        if disposition.target_base_image:
+            img = f"target base image: {disposition.target_base_image}"
+            if img not in alts:
+                alts.append(img)
+    # The confidence dip + generic "replatform to a supported base image" note
+    # penalize a SILENT lift-and-shift of a dead OS. Skip both when the match
+    # already escapes the on-prem OS (managed service / rehost-container / TKE
+    # node) — the recommendation already handles the EOL image, so the dip would
+    # double-count and the generic note would mislabel it.
+    if not _match_escapes_onprem_os(match):
+        dip = _EOL_DIP.get(bucket, 1.0)
+        match.confidence = max(0.05, (match.confidence or 0) * dip)
+        note = _EOL_NOTE[bucket]
+        match.rationale = (match.rationale or "") + f" [OS {bucket} — {note}]"
+        if not has_disp:
+            replat = "replatform to a supported base image (e.g. TencentOS / Ubuntu)"
+            if replat not in alts:
+                alts.append(replat)
     match.alternatives = alts
     return match

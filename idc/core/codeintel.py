@@ -32,6 +32,7 @@ from .models import (
     PATTERN_REFACTOR,
     PATTERN_REHOST,
     PATTERN_REHOST_CONTAINER,
+    PATTERN_RELOCATE,
     PATTERN_REPLATFORM,
     PATTERN_REPURCHASE,
     PATTERN_RETAIN,
@@ -85,7 +86,8 @@ def merge_code_deps(workloads: List[Workload],
 # ---------------------------------------------------------------------------
 def non_migrating_servers(servers: List[Server], workloads: List[Workload],
                           profiles: Iterable[CodeProfile],
-                          strategies: Optional[Dict[str, "AppStrategy"]] = None
+                          strategies: Optional[Dict[str, "AppStrategy"]] = None,
+                          legacy_dispositions: Optional[Iterable] = None
                           ) -> Tuple[Set[str], Set[str]]:
     """Return (retain_server_ids, retire_server_ids) — servers whose 7R
     disposition is to stay on-prem (retain) or be decommissioned (retire).
@@ -99,10 +101,21 @@ def non_migrating_servers(servers: List[Server], workloads: List[Workload],
          vocab is {rehost,replatform,refactor,rewrite}, so retain/retire here
          only appear from that legacy path; treated as a fallback.
 
-    Rule: a server is non-migrating only if EVERY app it belongs to is the
-    SAME non-migrating disposition. A server shared by a migrating app and a
-    retain app MIGRATES (the migrating app still needs it). Servers with no
-    app binding are never retain/retire (they go to the General wave).
+    F7 — ``legacy_dispositions`` (a list of ``LegacyDisposition``) adds a
+    *host-level* retain override: an EOL host the executor marked ``retain``
+    (regulated / mainframe) is pulled into ``retain_ids`` regardless of its
+    apps — you don't lift-and-shift a regulated mainframe. The host is then
+    excluded from every app wave (the app migrates with its OTHER hosts; a
+    conflict where the app had ONLY this host surfaces as an empty app wave
+    the operator resolves). ``rewrite``/``replatform``/``containerize``
+    dispositions do NOT exclude (rewrite is a migrating pattern already ranked
+    last by ``pattern_rank``; the 7R strategy stays the app-level authority).
+
+    Rule (7R app-level): a server is non-migrating only if EVERY app it
+    belongs to is the SAME non-migrating disposition. A server shared by a
+    migrating app and a retain app MIGRATES (the migrating app still needs
+    it) — UNLESS the host itself is retain-dispositioned (F7 host override).
+    Servers with no app binding are never retain/retire (General wave).
     """
     pidx = index_profiles(profiles)
     retain_apps: Set[str] = set()
@@ -145,10 +158,37 @@ def non_migrating_servers(servers: List[Server], workloads: List[Workload],
         elif apps <= retire_apps:
             retire_ids.add(s.id)
         elif apps <= non_mig:
-            # all apps non-migrating but mixed retain+retire -> decommission
-            # (do NOT migrate a host whose every app is staying or retiring)
-            retire_ids.add(s.id)
+            # all apps non-migrating but mixed retain+retire -> KEEP the host
+            # on-prem (retain). A retain app must stay on-prem; decommissioning
+            # its host would destroy it. The retire app's data is retired by
+            # the operator separately. (Previously this decommissioned the
+            # shared host, breaking the retain app.)
+            retain_ids.add(s.id)
         # else: has at least one migrating app -> migrates
+    # F7 — host-level non-migrating override from legacy dispositions (an EOL
+    # host the executor said to keep on-prem, e.g. regulated/mainframe; OR an
+    # operator disposition set from the inventory host drawer). Match the
+    # disposition's stable key (hostname lowercased) to the server id. This
+    # ADDS to retain_ids / retire_ids even when a migrating app claims the host
+    # — the host is excluded from app waves, the app migrates with its other
+    # hosts. retain keeps the host on-prem; retire decommissions it.
+    if legacy_dispositions:
+        from .models import LD_RETAIN, LD_RETIRE
+        host_to_id: Dict[str, str] = {}
+        for s in servers:
+            for k in (s.hostname.lower().strip(), getattr(s, "identity_key", ""), s.id):
+                if k:
+                    host_to_id.setdefault(k, s.id)
+        for d in legacy_dispositions:
+            disp = getattr(d, "disposition", "")
+            if disp in (LD_RETAIN, LD_RETIRE) and getattr(d, "server_id", ""):
+                sid = host_to_id.get(d.server_id.lower().strip())
+                if not sid:
+                    continue
+                if disp == LD_RETAIN:
+                    retain_ids.add(sid)
+                else:
+                    retire_ids.add(sid)
     return retain_ids, retire_ids
 
 
@@ -180,12 +220,13 @@ _EFFORT_RANK = {"low": 0, "medium": 1, "high": 2}
 # real code change). repurchase ~ refactor effort (integration work).
 _PATTERN_RANK = {
     PATTERN_REHOST: 0,
+    PATTERN_RELOCATE: 0,           # no schema/code change — as cheap as rehost
     PATTERN_REHOST_CONTAINER: 1,
     PATTERN_REPLATFORM: 2,
     PATTERN_REFACTOR: 3,
     PATTERN_REWRITE: 4,            # legacy; heavier than refactor
     PATTERN_REPURCHASE: 3,
-    PATTERN_RETAIN: 10,           # not migrated — last
+    PATTERN_RETAIN: 10,           # not migrated — last (keep-on-prem disposition)
     PATTERN_RETIRE: 11,           # decommission — last
 }
 
@@ -196,6 +237,43 @@ def effort_rank(p: Optional[CodeProfile]) -> int:
 
 def pattern_rank(p: Optional[CodeProfile]) -> int:
     return _PATTERN_RANK.get((p.migration_pattern if p else ""), 0)
+
+
+# ---------------------------------------------------------------------------
+# business criticality (F3) — a first-class wave-ordering key
+# ---------------------------------------------------------------------------
+# High-crit apps should NOT be buried in late waves: they release dependents
+# early and get an earlier cutover slot. This is a tiebreaker WITHIN a topo
+# level (the DAG still wins), ordered high -> medium -> low. Unknown defaults
+# to medium (neutral — no reordering vs the prior effort/pattern-only sort) so
+# estates that don't declare criticality behave exactly as before.
+CRIT_HIGH = "high"
+CRIT_MEDIUM = "medium"
+CRIT_LOW = "low"
+CRIT_RANK = {CRIT_HIGH: 0, CRIT_MEDIUM: 1, CRIT_LOW: 2}   # public (consumed by plan.py)
+_CRIT_RANK = CRIT_RANK   # back-compat alias for any internal caller
+
+# map an app_id -> the highest criticality among its servers. "" / unknown
+# collapse to medium so undeclared estates sort neutrally.
+def app_criticality_rank(app_id: str, servers: Sequence["Server"],
+                         workloads: Sequence["Workload"]) -> int:
+    """Highest criticality among the app's servers (high < medium < low).
+
+    Unknown -> medium (rank 1) so it never reorders an estate that doesn't
+    declare criticality. A workload with no discoverable servers is medium.
+    """
+    w = next((x for x in workloads if x.app_id == app_id), None)
+    srvs = [s for s in servers if app_id in (s.app_ids or [])]
+    if not srvs and w is not None:
+        srvs = [s for s in servers if s.id in set(w.server_ids)]
+    if not srvs:
+        return 1  # medium — no discoverable servers stay neutral
+    best = 2  # start at worst (low); min pulls the highest criticality up
+    for s in srvs:
+        c = (getattr(s, "business_criticality", "") or "").strip().lower()
+        r = _CRIT_RANK.get(c, 1)   # unknown -> medium (1)
+        best = min(best, r)   # high (0) wins over medium/low
+    return best
 
 
 def order_apps_for_waves(app_ids: Sequence[str],
@@ -385,8 +463,9 @@ def enrich_match(match: Match, profile: Optional[CodeProfile],
         match.confidence = max(0.05, match.confidence - 0.15)
         notes.append(f"low cloud readiness ({profile.cloud_readiness:.2f})")
     # call out anything beyond a plain rehost (rehost-container is still mostly
-    # packaging, so only flag the genuinely code-changing strategies)
-    if pat and pat not in (PATTERN_REHOST, PATTERN_REHOST_CONTAINER) \
+    # packaging, so only flag the genuinely code-changing strategies). relocate
+    # is also a no-code-change move (like rehost) — don't flag it.
+    if pat and pat not in (PATTERN_REHOST, PATTERN_REHOST_CONTAINER, PATTERN_RELOCATE) \
             and pat not in NON_MIGRATING_PATTERNS:
         notes.append(f"requires {pat}")
     # F4 — scale by data-coverage confidence (identity when 1.0 / no signal).
@@ -454,6 +533,45 @@ _DB_DIFFICULTY_DIP = {
 _DB_DIFFICULTY_RANK = {DB_DIFFICULTY_A: 0, DB_DIFFICULTY_B: 1, DB_DIFFICULTY_C: 2}
 
 
+# ---------------------------------------------------------------------------
+# 7R confidence ceiling (F2)
+# ---------------------------------------------------------------------------
+# The 7R LLM emits a ``confidence`` it trusts wholesale (``client.py:729`` used
+# to do ``float(obj.get("confidence", 0.5))``). That lets an over-confident
+# model stamp a high confidence on a thinly-known app with hard blockers. This
+# is the deterministic ceiling: the LLM may express *less* confidence (it sees
+# nuance the formula can't), but never *more* than the signals warrant — so
+# ``min(llm_confidence, seven_r_confidence(...))`` is the final value.
+#
+# Inputs (the executor's own prior assessment + data-coverage):
+#   cloud_readiness  — the CodeProfile 0..1 (executor's read on the app)
+#   blocker_count    — hard blockers from CodeProfile.blockers
+#   refactor_effort  — "low"|"medium"|"high" from CodeProfile
+#   data_coverage    — mean assessment_confidence_of the app's servers
+#                      (how well we actually know this app); a thin estate trims
+#                      the ceiling even when the executor was optimistic.
+_EFFORT_PENALTY = {"low": 0.0, "medium": 0.0, "high": 0.15}
+
+
+def seven_r_confidence(cloud_readiness: float, blocker_count: int = 0,
+                       refactor_effort: str = "medium",
+                       data_coverage: float = 1.0) -> float:
+    """Deterministic 7R confidence *ceiling* in [0.05, 0.95].
+
+    The LLM's emitted confidence is clamped to this (``min``): it can lower,
+    never raise above what the signals support. Base is the executor's own
+    ``cloud_readiness``; hard blockers and high refactor effort trim it, and a
+    thinly-characterized estate (low ``data_coverage``) trims it further so a
+    confident model can't stamp 0.9 on an app we barely know.
+    """
+    base = max(0.0, min(1.0, float(cloud_readiness or 0.0)))
+    blocker_pen = 0.15 * min(int(blocker_count or 0), 3)
+    effort_pen = _EFFORT_PENALTY.get((refactor_effort or "medium").lower(), 0.05)
+    data_pen = max(0.0, 0.25 - float(data_coverage or 0.0)) * 0.4
+    ceiling = base - blocker_pen - effort_pen - data_pen
+    return max(0.05, min(0.95, ceiling))
+
+
 def db_difficulty_rank(d: Optional[DBConversionProfile]) -> int:
     """0/1/2 for A/B/C (None / unknown = 0). Used by wave risk + ordering."""
     if not d or not d.difficulty:
@@ -500,6 +618,90 @@ def enrich_match_db(match: Match, db_profile: Optional[DBConversionProfile]) -> 
         tag = f"[db] {'. '.join(notes)}"
         match.rationale = (match.rationale + " " + tag).strip() if match.rationale else tag
     return match
+
+
+def db_conversion_summary(profile: Optional[DBConversionProfile]) -> str:
+    """F6 — markdown compatibility-report summary for a DB profile.
+
+    Returns "" when there is no conversion artifact (assess-mode profile or no
+    profile). Otherwise returns the executor-supplied ``report_md`` (or a
+    synthesized one from the per-object outcomes when the executor omitted the
+    markdown). Pure; safe to call on any profile."""
+    if not profile or not profile.conversion:
+        return ""
+    conv = profile.conversion
+    if conv.report_md:
+        return conv.report_md
+    objs = conv.objects or []
+    if not objs:
+        return ""
+    auto = sum(1 for o in objs if o.status == "auto_converted")
+    review = sum(1 for o in objs if o.status == "manual_review")
+    blocked = sum(1 for o in objs if o.status == "blocked")
+    lines = [f"# DB conversion compatibility report (→ {conv.target_engine})",
+             "", f"- {len(objs)} objects: {auto} auto, {review} review, {blocked} blocked",
+             f"- auto-convert: {round(auto/len(objs)*100)}%", "", "## Objects", "",
+             "| Object | Kind | Status | Issue | Effort (d) |",
+             "|---|---|---|---|---|"]
+    for o in objs:
+        lines.append(f"| {o.name} | {o.kind} | {o.status} | {o.issue or '—'} | "
+                     f"{o.effort_days} |")
+    return "\n".join(lines)
+
+
+def db_conversion_blocked_count(profile: Optional[DBConversionProfile]) -> int:
+    """F6 — number of blocked objects (no engine equivalent). Drives the
+    cutover gate: a db-kind wave with blocked objects can't reach ``finalized``
+    until the operator acks (reuse the Question channel)."""
+    if not profile or not profile.conversion:
+        return 0
+    return sum(1 for o in (profile.conversion.objects or [])
+               if o.status == "blocked")
+
+
+# ---------------------------------------------------------------------------
+# F5 — IaC guardrail gate (Well-Architected checks → launch gate)
+# ---------------------------------------------------------------------------
+# A guardrail fail at severity >= medium blocks the LZ placement gate so a
+# workload wave can't launch against an archetype whose LZ IaC violates a
+# guardrail (e.g. a public CLB in the corp/intranet VPC, a missing required
+# tag). This replaces the operator-flag-only gate with a real evaluation.
+_BLOCKING_SEVERITIES = {"high", "medium"}
+
+
+def check_iac_guardrails(artifact: Optional["IaCArtifact"]) -> Dict[str, Any]:
+    """Aggregate an IaCArtifact's guardrail checks into a gate verdict (F5).
+
+    Returns ``{ok, failing[], warning_count}``. ``ok=False`` when any check has
+    ``status=fail`` at severity >= medium (the blocking threshold). ``None``
+    artifact → ``ok=True, no_artifact=True`` (no IaC emitted yet → don't block;
+    the finalized-flag check still applies, so this only adds a gate, never
+    weakens the existing one). Pure over the artifact.
+    """
+    if not artifact:
+        return {"ok": True, "failing": [], "warning_count": 0, "no_artifact": True}
+    failing = []
+    warns = 0
+    for g in (artifact.guardrails or []):
+        if g.status == "fail" and (g.severity or "").lower() in _BLOCKING_SEVERITIES:
+            failing.append(g)
+        elif g.status == "warn":
+            warns += 1
+    return {"ok": not failing, "failing": failing, "warning_count": warns,
+            "no_artifact": False}
+
+
+def iac_guardrail_summary(artifact: Optional["IaCArtifact"]) -> str:
+    """F5 — one-line guardrail summary for the web/CLI: pass / N failing / no
+    artifact. Empty string for a None artifact (so callers can show "not
+    emitted yet")."""
+    if not artifact:
+        return ""
+    v = check_iac_guardrails(artifact)
+    if v["no_artifact"]:
+        return "no IaC emitted"
+    n = len(v["failing"])
+    return "guardrails PASS" if v["ok"] else f"{n} guardrail fail(s)"
 
 
 # ---------------------------------------------------------------------------
@@ -803,7 +1005,13 @@ def build_change_spec(profile: Optional[CodeProfile],
         # try to attach evidence + a better line from a matching finding
         f = findings_by_loc.get((file, line))
         if f is None and no_loc_findings:
-            f = next((x for x in no_loc_findings if x.category == cat), None)
+            # borrow the first no-location finding of this category, then
+            # consume it so the NEXT required_change of the same category
+            # doesn't reuse the same evidence (and the same derived `old`).
+            for i, x in enumerate(no_loc_findings):
+                if x.category == cat:
+                    f = no_loc_findings.pop(i)
+                    break
         evidence = f.evidence if f else ""
         if not line and f:
             line = f.line

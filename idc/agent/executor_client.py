@@ -79,14 +79,22 @@ class ExecutorClient:
             "callback": callback})
 
     def db_scan(self, db_server_id: str, source_engine: str = "",
-                target_engine: str = "", callback: str = "") -> Dict[str, Any]:
-        """Trigger a heterogeneous DB-scan (F5). ``db_server_id`` is the DB
+                target_engine: str = "", callback: str = "",
+                mode: str = "assess") -> Dict[str, Any]:
+        """Trigger a heterogeneous DB-scan (F5/F6). ``db_server_id`` is the DB
         host's stable identity (hostname). The executor scans the DB schema/SQL
         and pushes a ``DBConversionProfile`` back to
-        ``PUT /api/db-profiles/{db_server_id}``. Returns ``{job_id, status}``."""
+        ``PUT /api/db-profiles/{db_server_id}``.
+
+        ``mode``:
+          * ``assess`` (default) — grade-only (A/B/C + man-days + blockers),
+            back-compat with existing executors.
+          * ``convert`` — also emit the converted DDL + a per-object
+            compatibility report in ``DBConversionProfile.conversion`` (F6).
+        Returns ``{job_id, status}``."""
         return self._request("POST", "/v1/db-scan", {
             "db_server_id": db_server_id, "source_engine": source_engine,
-            "target_engine": target_engine, "callback": callback})
+            "target_engine": target_engine, "mode": mode, "callback": callback})
 
     def runtime_containerize(self, app_id: str, server_id: str,
                              inventory: Optional[dict] = None,
@@ -126,6 +134,95 @@ class ExecutorClient:
     def get_job(self, job_id: str) -> Dict[str, Any]:
         """Poll a job's status on the executor."""
         return self._request("GET", f"/v1/jobs/{job_id}")
+
+    def legacy_disposition(self, server_id: str, context: dict,
+                           callback: str = "") -> Dict[str, Any]:
+        """Trigger a legacy/unsupported-OS disposition analysis (F7).
+
+        ``context`` is the workload shape the executor needs to choose
+        containerize vs re-platform vs rewrite vs retain: the host's OS + EOL
+        bucket, runtime, role, criticality, whether a source repo exists, the
+        runtime inventory (process/port/software), and the code-profile summary.
+        The executor pushes a ``LegacyDisposition`` back to
+        ``PUT /api/legacy-dispositions/{server_id}``. Returns ``{job_id, status}``.
+        """
+        return self._request("POST", "/v1/legacy-disposition", {
+            "server_id": server_id, "context": context, "callback": callback})
+
+    def cutover_playbook(self, wave_id: str, context: dict,
+                         callback: str = "") -> Dict[str, Any]:
+        """Trigger a per-wave cutover-playbook generation (F9). ``context`` is
+        the wave's members (server/role/target/ports/deps), the downtime window,
+        and the deterministic risk basis. The executor pushes a ``DocArtifact``
+        (markdown) back to ``PUT /api/docs/cutover/{wave_id}``. Returns
+        ``{job_id, status}``."""
+        return self._request("POST", "/v1/cutover-playbook", {
+            "wave_id": wave_id, "context": context, "callback": callback})
+
+    def as_built(self, wave_id: str, context: dict,
+                 callback: str = "") -> Dict[str, Any]:
+        """Trigger a per-wave as-built doc generation (F9). ``context`` is the
+        executed wave's stage_history, gate results, change jobs, and targets.
+        The executor pushes a ``DocArtifact`` (markdown) back to
+        ``PUT /api/docs/as-built/{wave_id}``. Returns ``{job_id, status}``."""
+        return self._request("POST", "/v1/as-built", {
+            "wave_id": wave_id, "context": context, "callback": callback})
+
+    def iac_emit(self, scope: str, scope_id: str, context: dict,
+                 callback: str = "") -> Dict[str, Any]:
+        """Trigger IaC generation + Well-Architected guardrail checks (F5).
+
+        ``scope`` is ``landing_zone`` (``scope_id`` = ``lz:<archetype>``, with
+        the blueprint) or ``workload`` (``scope_id`` = ``wl:<server_id>``, with
+        the match). The executor emits Terraform modules + runs the guardrail
+        checks and pushes an ``IaCArtifact`` back to
+        ``PUT /api/iac-artifacts/{scope_id}``. Returns ``{job_id, status}``.
+        """
+        return self._request("POST", "/v1/iac-emit", {
+            "scope": scope, "scope_id": scope_id, "context": context,
+            "callback": callback})
+
+    def postmig_optimize(self, server_id: str, context: dict,
+                         callback: str = "") -> Dict[str, Any]:
+        """Trigger post-migration optimization analysis (F10). ``context`` is
+        the host's cloud target + spec + a metrics window (or idc-migrate
+        forwards Prometheus data). The executor pulls post-mig cloud metrics,
+        detects anomalies, and pushes ``PostMigRecommendation`` records back to
+        ``PUT /api/postmig-recs/{server_id}/{kind}`` (one per kind). Returns
+        ``{job_id, status}``.
+        """
+        return self._request("POST", "/v1/postmig-optimize", {
+            "server_id": server_id, "context": context, "callback": callback})
+
+    def test_gen(self, app_id: str, context: dict,
+                 callback: str = "") -> Dict[str, Any]:
+        """Trigger test-case generation (F11). ``context`` is the app's
+        CodeProfile + workload shape. The executor pushes TestCase records back
+        to ``PUT /api/test-cases/{app_id}`` (a list). Returns ``{job_id, status}``.
+        """
+        return self._request("POST", "/v1/test-gen", {
+            "app_id": app_id, "context": context, "callback": callback})
+
+    def test_run(self, app_id: str, phase: str, target: str, context: dict,
+                 callback: str = "") -> Dict[str, Any]:
+        """Trigger a test run (F11). ``phase`` = pre (baseline before cutover)
+        or post (after cutover); ``target`` is the endpoint base to hit. The
+        executor pushes a TestRun back to ``PUT /api/test-runs/{run_id}``.
+        Returns ``{job_id, status}``.
+        """
+        return self._request("POST", "/v1/test-run", {
+            "app_id": app_id, "phase": phase, "target": target,
+            "context": context, "callback": callback})
+
+    def test_compare(self, app_id: str, pre_run_id: str, post_run_id: str,
+                     callback: str = "") -> Dict[str, Any]:
+        """Trigger a pre-vs-post test comparison (F11). The executor pushes a
+        TestDiff back to ``PUT /api/test-diffs/{app_id}``. Returns
+        ``{job_id, status}``.
+        """
+        return self._request("POST", "/v1/test-compare", {
+            "app_id": app_id, "pre_run_id": pre_run_id,
+            "post_run_id": post_run_id, "callback": callback})
 
 
 def get_executor_client(settings: Settings) -> ExecutorClient:

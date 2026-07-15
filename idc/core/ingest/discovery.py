@@ -45,6 +45,17 @@ def _read_records(path: str) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+def _as_list(v: Any) -> List[Any]:
+    """Coerce a discovery field to a list. Some sources emit a scalar (e.g.
+    ``"ips": "10.0.1.5"``) where a list is expected; iterating the bare string
+    would yield single-char keys. Wrap scalars, pass lists through, drop None."""
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    return [v]
+
+
 def _keys(r: Dict[str, Any]) -> List[str]:
     """All lowercased identity keys for a discovery record (hostname/fqdn/ips)."""
     out: List[str] = []
@@ -52,7 +63,7 @@ def _keys(r: Dict[str, Any]) -> List[str]:
         v = (r.get(k) or "").strip().lower()
         if v:
             out.append(v)
-    for ip in (r.get("ips") or []):
+    for ip in _as_list(r.get("ips")):
         ip = str(ip).strip().lower()
         if ip:
             out.append(ip)
@@ -107,7 +118,7 @@ def discover_drift(settings, servers: List[Server]) -> Dict[str, Any]:
         if match_s is None:
             unknown.append({
                 "hostname": r.get("hostname") or r.get("fqdn") or "",
-                "fqdn": r.get("fqdn") or "", "ips": r.get("ips") or [],
+                "fqdn": r.get("fqdn") or "", "ips": _as_list(r.get("ips")),
                 "source": r.get("source") or "discovery",
                 "role": r.get("role") or "", "os": r.get("os") or "",
                 "reason": "no CMDB match (hostname/fqdn/ip)",

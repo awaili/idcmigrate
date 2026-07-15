@@ -148,19 +148,37 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     if not text or text == UNAVAILABLE:
         return None
     text = text.strip()
-    # strip ```json ... ``` fences
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1)
-    # find the first balanced { ... }
+    # 1) the common case: the whole reply (or the fenced block) is the object.
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    candidates = [text, fenced.group(1)] if fenced else [text]
+    for c in candidates:
+        try:
+            return json.loads(c)
+        except json.JSONDecodeError:
+            pass
+    # 2) brace counting that skips string literals so a "}" inside a string
+    #    value doesn't prematurely close the object.
     start = text.find("{")
     if start < 0:
         return None
     depth = 0
+    in_str = False
+    esc = False
     for i in range(start, len(text)):
-        if text[i] == "{":
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
             depth += 1
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 try:
@@ -216,10 +234,18 @@ class Planner:
             f"Estate summary (JSON):\n{json.dumps(summary, ensure_ascii=False)}\n\n"
             "Produce the wave policy JSON now."
         )
-        raw = self.llm.chat([
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": user},
-        ])
+        try:
+            raw = self.llm.chat([
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": user},
+            ])
+        except Exception as e:
+            # chat() raises on gateway/network error (raise_for_status) — degrade
+            # gracefully to the documented error shape instead of a raw 500.
+            return {"policy": None, "waves": None, "raw": "",
+                    "errors": [f"MigraQ error: {e!r}"], "warnings": [],
+                    "summary": summary, "waves_count": None,
+                    "revisions": [], "max_waves": cap, "engine_capped": False}
         obj = _extract_json(raw)
         if obj is None:
             return {"policy": None, "waves": None, "raw": raw,
@@ -364,10 +390,13 @@ class Planner:
             "stages, group_by=\"none\", larger or zero max_per_wave, batch apps into "
             "one stage. Output ONLY the revised policy JSON (same schema)."
         )
-        raw = self.llm.chat([
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": user},
-        ])
+        try:
+            raw = self.llm.chat([
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": user},
+            ])
+        except Exception as e:
+            return None, "", [f"MigraQ error: {e!r}"]
         if not raw or raw == UNAVAILABLE:
             return None, raw or "", ["MigraQ unavailable; cannot revise policy."]
         obj = _extract_json(raw)

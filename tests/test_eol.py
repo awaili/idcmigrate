@@ -61,15 +61,18 @@ def test_runtime_eol_jdk_and_python():
 
 
 # -- apply_os_eol (the silent-rehost fix) ----------------------------------
-def test_apply_os_eol_dips_confidence_and_notes_for_expired():
+def test_apply_os_eol_noop_when_match_already_escapes_eol():
+    # a long-term EOL app host is rehost-container (already escapes the dead OS),
+    # so apply_os_eol must NOT dip confidence or add the generic replatform note.
     s = _srv("centos", "7")
-    m = match_server(s)  # CVM rehost, confidence 0.85
+    m = match_server(s)
+    assert m.target.extras.get("rehost_container") is True
     base_conf = m.confidence
     apply_os_eol(m, s, today_iso=TODAY)
-    assert m.confidence < base_conf                       # dipped
-    assert m.confidence >= 0.05
-    assert "OS expired" in m.rationale
-    assert "replatform" in (m.alternatives[-1].lower())   # replatform alt added
+    assert m.confidence == base_conf                  # not dipped (already escaped)
+    assert "OS expired" not in m.rationale             # no redundant note
+    assert not any("replatform to a supported base image" in a
+                   for a in (m.alternatives or []))
 
 
 def test_apply_os_eol_expiring_smaller_dip():

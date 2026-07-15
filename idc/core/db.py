@@ -23,9 +23,16 @@ from .models import (
     CodeProfile,
     CostEstimate,
     DBConversionProfile,
+    DocArtifact,
+    IaCArtifact,
     IngestRun,
+    LegacyDisposition,
+    LZDesign,
     Match,
     MigrationJob,
+    NetworkDesign,
+    PostMigRecommendation,
+    TestCase, TestDiff, TestDiffItem, TestRun, TestResult,
     ScanFinding,
     Server,
     Target,
@@ -58,6 +65,7 @@ class ServerFilter:
     conf_max: Optional[float] = None
     warranty_bucket: Optional[str] = None
     os_eol_bucket: Optional[str] = None
+    app_id: Optional[str] = None       # match servers whose app_ids JSON array contains this app
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +158,8 @@ CREATE TABLE IF NOT EXISTS waves (
     server_ids  JSON,
     depends_on  JSON,
     rationale   TEXT,
-    status      VARCHAR(32)
+    status      VARCHAR(32),
+    downtime_window JSON   -- F3 — operator-declared cutover/maintenance window
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS ingest_runs (
@@ -310,6 +319,54 @@ CREATE TABLE IF NOT EXISTS lz_status (
     updated_by  VARCHAR(64)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
+-- F8 (Phase A) — operator-authored LZ designs (LLM-driven LZ design). The
+-- active row (is_active=1, at most one, enforced by set_active_lz_design)
+-- is the source of truth for /api/lz/archetypes, lz_context, iac-emit,
+-- lz_readiness and check_lz_gate. When no active row exists, the built-in
+-- LZ_BLUEPRINTS is the default design. archetypes/requirements/conversation/
+-- onprem_cidrs ride JSON columns (same shape as LZ_BLUEPRINTS[arch]).
+CREATE TABLE IF NOT EXISTS lz_designs (
+    design_id    VARCHAR(64) PRIMARY KEY,
+    name         VARCHAR(128) NOT NULL,
+    archetypes   JSON,
+    requirements JSON,
+    conversation JSON,
+    onprem_cidrs JSON,
+    is_active    BOOLEAN DEFAULT FALSE,
+    created_at   VARCHAR(40),
+    updated_at   VARCHAR(40),
+    updated_by   VARCHAR(64)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- scale tier (small/medium/large) this LZ design was authored for — drives the
+-- default strategy (LZ_SCALE_TIERS). Added in place, pre-scale rows stay empty.
+ALTER TABLE lz_designs ADD COLUMN IF NOT EXISTS scale VARCHAR(16) DEFAULT '';
+
+-- one-line AI description (MigraQ authors it during the LZ interview, surfaced
+-- in the Saved designs table). Added in place, pre-AI rows stay empty.
+ALTER TABLE lz_designs ADD COLUMN IF NOT EXISTS summary VARCHAR(512) DEFAULT '';
+
+-- F8 (Phase B+) — network designs (VPC + subnets per account + server placement).
+-- The active row (is_active=1, at most one) drives /api/lz/network/design. Built
+-- on top of the active LZ design's per-archetype VPC cidrs. Placements are keyed
+-- by stable hostname (survive rebuild). accounts/vpcs/placements/policy/overrides
+-- ride JSON columns.
+CREATE TABLE IF NOT EXISTS network_designs (
+    design_id    VARCHAR(64) PRIMARY KEY,
+    name         VARCHAR(128) NOT NULL,
+    accounts     JSON,
+    vpcs         JSON,
+    placements   JSON,
+    policy       JSON,
+    overrides    JSON,
+    onprem_cidrs JSON,
+    validation   JSON,
+    is_active    BOOLEAN DEFAULT FALSE,
+    created_at   VARCHAR(40),
+    updated_at   VARCHAR(40),
+    updated_by   VARCHAR(64)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
 -- data-gap (Gap1) — latest shadow-IT / CMDB-drift discovery snapshot. Single
 -- row (id='latest') upserted by POST /api/discovery/scan so the web tab shows
 -- the last scan without re-running. Payload is the full discover_drift dict.
@@ -335,6 +392,140 @@ ALTER TABLE servers ADD COLUMN IF NOT EXISTS warranty_status VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS hardware_eol VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS warranty_bucket VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS os_eol_bucket VARCHAR(16);
+
+-- F6 — db_profiles conversion artifact (None for assess-mode profiles). JSON
+-- so the whole DBConversion (ddl[] + objects[] + report_md) rides one column.
+ALTER TABLE db_profiles ADD COLUMN IF NOT EXISTS conversion JSON;
+
+-- F3 — waves downtime window (operator-declared cutover/maintenance slot).
+-- Added via ALTER for existing DBs (the waves table predates this field).
+ALTER TABLE waves ADD COLUMN IF NOT EXISTS downtime_window JSON;
+
+-- F8 (Phase B+) — per-server VPC (archetype) override, riding the network design
+-- alongside the subnet overrides. Same JSON-column-on-existing-table pattern as
+-- the waves downtime_window above. ADD COLUMN IF NOT EXISTS tolerates re-runs.
+ALTER TABLE network_designs ADD COLUMN IF NOT EXISTS archetype_overrides JSON;
+
+-- F8 (Phase B+) — per-server account override (reattribute a server to a
+-- different account WITHOUT moving its VPC). Same pattern as archetype_overrides.
+ALTER TABLE network_designs ADD COLUMN IF NOT EXISTS account_overrides JSON;
+
+-- one-line AI description of the carving policy (MigraQ authors it as the
+-- policy ``notes``, surfaced in the Saved network designs table). Pre-AI / default
+-- rows stay empty.
+ALTER TABLE network_designs ADD COLUMN IF NOT EXISTS summary VARCHAR(512) DEFAULT '';
+
+-- F7 — legacy / unsupported-OS disposition (one row per EOL host, keyed by the
+-- stable hostname). The executor's containerize/replatform/rewrite/retain call
+-- replaces eol.apply_os_eol's fixed "replatform" string with a real rec.
+CREATE TABLE IF NOT EXISTS legacy_dispositions (
+    server_id        VARCHAR(64) PRIMARY KEY,   -- hostname lowercased (stable)
+    disposition      VARCHAR(16),               -- containerize/replatform/rewrite/retain
+    rationale        TEXT,
+    confidence       DOUBLE,
+    target_base_image VARCHAR(64),
+    effort_days      DOUBLE,
+    prereqs          JSON,
+    scan_id          VARCHAR(64),
+    scanned_at       VARCHAR(40),
+    summary          TEXT,
+    updated_at       VARCHAR(40)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- F9 — generated doc artifacts (cutover playbook / as-built / persisted runbook).
+-- One row per (doc_type, scope_id). scope_id is a wave id. Pushed by the
+-- executor, rendered/exported by the web. LONGTEXT for the markdown body.
+CREATE TABLE IF NOT EXISTS doc_artifacts (
+    doc_type         VARCHAR(16) NOT NULL,      -- runbook / cutover / as_built
+    scope_id         VARCHAR(64) NOT NULL,      -- wave id (or other scope key)
+    doc_md           LONGTEXT,
+    scan_id          VARCHAR(64),
+    scanned_at       VARCHAR(40),
+    summary          TEXT,
+    updated_at       VARCHAR(40),
+    PRIMARY KEY (doc_type, scope_id)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- F5 — generated IaC artifacts (landing-zone / workload Terraform + guardrail
+-- checks). One row per scope_id (lz:<arch> | wl:<server_id>). The guardrails
+-- JSON + guardrail_pass flag drive check_lz_gate (block launch until pass).
+CREATE TABLE IF NOT EXISTS iac_artifacts (
+    scope_id         VARCHAR(64) PRIMARY KEY,
+    scope            VARCHAR(16),               -- landing_zone / workload
+    modules          JSON,                      -- [{path, content}]
+    guardrails       JSON,                      -- [{pillar, rule, status, finding, severity}]
+    guardrail_pass   BOOLEAN,
+    plan_summary     TEXT,
+    target           JSON,                      -- {cloud, region}
+    scan_id          VARCHAR(64),
+    scanned_at       VARCHAR(40),
+    summary          TEXT,
+    updated_at       VARCHAR(40)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- F10 — post-migration optimization recommendations (right_size/reserved/
+-- anomaly/perf). One row per (server_id, kind) so a host carries at most one
+-- rec of each kind. Pushed by the executor after a host is finalized, and the
+-- right_size/reserved savings roll into the cost module savings estimate.
+CREATE TABLE IF NOT EXISTS postmig_recs (
+    server_id        VARCHAR(64) NOT NULL,      -- hostname lowercased (stable)
+    kind             VARCHAR(16) NOT NULL,      -- right_size/reserved/anomaly/perf
+    from_spec        VARCHAR(64),
+    to_spec          VARCHAR(64),
+    reason           TEXT,
+    monthly_saving_usd DOUBLE,
+    confidence       DOUBLE,
+    severity         VARCHAR(16),
+    detail           TEXT,
+    scan_id          VARCHAR(64),
+    scanned_at       VARCHAR(40),
+    summary          TEXT,
+    updated_at       VARCHAR(40),
+    PRIMARY KEY (server_id, kind)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- F11 — automated testing. test_cases: generated cases per app (keyed by
+-- app_id+name). test_runs: one execution per run id (results JSON, phase
+-- pre/post). test_diffs: latest pre-vs-post comparison per app (regressions
+-- count drives the test_regression cutover gate).
+CREATE TABLE IF NOT EXISTS test_cases (
+    app_id           VARCHAR(64) NOT NULL,
+    name             VARCHAR(128) NOT NULL,
+    kind             VARCHAR(16),
+    endpoint         VARCHAR(255),
+    method           VARCHAR(16),
+    request          JSON,
+    expected         JSON,
+    setup            TEXT,
+    scan_id          VARCHAR(64),
+    updated_at       VARCHAR(40),
+    PRIMARY KEY (app_id, name)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS test_runs (
+    id               VARCHAR(64) PRIMARY KEY,
+    app_id           VARCHAR(64),
+    phase            VARCHAR(8),               -- pre / post
+    target           VARCHAR(255),
+    results          JSON,                    -- [{case, status, duration_ms, ...}]
+    passed           INT,
+    failed           INT,
+    errors           INT,
+    run_at           VARCHAR(40),
+    scan_id          VARCHAR(64)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS test_diffs (
+    app_id           VARCHAR(64) PRIMARY KEY,
+    pre_run_id       VARCHAR(64),
+    post_run_id      VARCHAR(64),
+    diff             JSON,                    -- [{case, pre_status, post_status, verdict, detail}]
+    regressions      INT,
+    scan_id          VARCHAR(64),
+    scanned_at       VARCHAR(40),
+    summary          TEXT,
+    updated_at       VARCHAR(40)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 """
 
 
@@ -724,6 +915,13 @@ class Store:
                          ("os_eol_bucket", f.os_eol_bucket)):
             if val:
                 where.append(f"servers.{col}=?"); args.append(val)
+        # app membership — servers.app_ids is a JSON array (e.g. ["APP_0069"]);
+        # match the quoted element so APP_006 doesn't bleed into APP_0069.
+        # MariaDB 10.5 has no JSON_TABLE/JSON_CONTAINS path, so a bounded LIKE
+        # on the quoted array element is the portable precise filter.
+        if f.app_id:
+            where.append("servers.app_ids LIKE ?")
+            args.append(f'%"{f.app_id}"%')
         if join_matches:
             if f.target_product:
                 jq = self._jq("json_extract(matches.target,'$.product')")
@@ -820,10 +1018,40 @@ class Store:
                  for r in self._fetchall(
             f"SELECT id, name, stage, COALESCE({self._json_array_len('server_ids')},0) AS n "
             "FROM waves ORDER BY stage, name")]
+        # per-application rollup: servers / cores / mem grouped by app_id (the
+        # JSON array in servers.app_ids, expanded in Python — MariaDB 10.5 lacks
+        # JSON_TABLE), enriched with app name/tier/env (workloads) + 7R strategy
+        # + target product (app_strategies). Sorted by server count desc so the
+        # dashboard's "By application" card shows the biggest apps first.
+        app_acc: Dict[str, list] = {}
+        for r in self._fetchall("SELECT app_ids, cpu_cores, mem_gb FROM servers"):
+            ids = loads(r["app_ids"]) if r["app_ids"] else None
+            if not ids:
+                continue
+            cpu = r["cpu_cores"] or 0
+            mem = r["mem_gb"] or 0
+            for aid in ids:
+                a = app_acc.setdefault(aid, [0, 0, 0])
+                a[0] += 1; a[1] += cpu; a[2] += mem
+        wl = {r["app_id"]: r for r in self._fetchall(
+            "SELECT app_id, name, tier, env FROM workloads")}
+        st = {r["app_id"]: r for r in self._fetchall(
+            "SELECT app_id, strategy, target FROM app_strategies")}
+        by_app = []
+        for aid, (cnt, cores_a, mem_a) in sorted(app_acc.items(),
+                                                 key=lambda kv: kv[1][0], reverse=True):
+            w = wl.get(aid, {})
+            s = st.get(aid, {})
+            by_app.append({"app_id": aid, "name": w.get("name") or aid,
+                           "tier": w.get("tier") or "", "env": w.get("env") or "",
+                           "strategy": s.get("strategy") or "",
+                           "target": s.get("target") or "", "servers": cnt,
+                           "cores": int(cores_a or 0), "mem_gb": int(mem_a or 0)})
         return {"servers": n, "cores": cores, "mem_gb": mem,
                 "by_role": by_role, "by_env": by_env, "by_os": by_os,
                 "by_target": by_target, "by_region": by_region,
-                "confidence": conf, "high_utilization": high_util, "waves": waves}
+                "confidence": conf, "high_utilization": high_util, "waves": waves,
+                "by_app": by_app}
 
     def stream_servers_csv(self, f: "ServerFilter", order_by: str = "hostname"):
         """Yield CSV rows lazily for streaming export (no full load).
@@ -991,6 +1219,7 @@ class Store:
             d = dict(r)
             d["server_ids"] = loads(d.get("server_ids")) or []
             d["depends_on"] = loads(d.get("depends_on")) or []
+            d["downtime_window"] = loads(d.get("downtime_window")) or {}
             out.append(Wave.from_dict(d))
         return out
 
@@ -998,13 +1227,14 @@ class Store:
         """Atomically replace all waves: DELETE + inserts in one transaction."""
         sql = self._upsert_sql("waves",
                                ["id", "name", "stage", "server_ids", "depends_on",
-                                "rationale", "status"], "id")
+                                "rationale", "status", "downtime_window"], "id")
         with self.tx() as cur:
             cur.execute(self._x("DELETE FROM waves"))
             for w in waves:
                 cur.execute(self._x(sql),
                             (w.id, w.name, w.stage, dumps(w.server_ids),
-                             dumps(w.depends_on), w.rationale, w.status))
+                             dumps(w.depends_on), w.rationale, w.status,
+                             dumps(w.downtime_window or {})))
 
     # -- ingest runs -------------------------------------------------------
     def record_ingest(self, run: IngestRun) -> None:
@@ -1110,16 +1340,17 @@ class Store:
     _DBP_COLS = ["db_server_id", "source_engine", "target_engine", "difficulty",
                  "est_man_days", "review_objects", "blockers",
                  "reverse_replication", "auto_convert_pct", "scan_id",
-                 "scanned_at", "summary", "updated_at"]
+                 "scanned_at", "summary", "conversion", "updated_at"]
 
     def upsert_db_profile(self, d: DBConversionProfile) -> None:
         sql = self._upsert_sql("db_profiles", self._DBP_COLS, "db_server_id")
+        conv = dumps(d.conversion.to_dict()) if d.conversion else None
         with self.tx() as cur:
             cur.execute(self._x(sql), (
                 d.db_server_id, d.source_engine, d.target_engine, d.difficulty,
                 d.est_man_days, dumps(d.review_objects), dumps(d.blockers),
                 bool(d.reverse_replication), d.auto_convert_pct, d.scan_id,
-                d.scanned_at, d.summary, d.updated_at))
+                d.scanned_at, d.summary, conv, d.updated_at))
 
     def _row_to_db_profile(self, d: Dict[str, Any]) -> DBConversionProfile:
         d = dict(d)
@@ -1128,6 +1359,12 @@ class Store:
         # MariaDB stores BOOLEAN as TINYINT (0/1); coerce back to a real bool
         # so the model stays typed regardless of driver.
         d["reverse_replication"] = bool(d.get("reverse_replication"))
+        conv = d.get("conversion")
+        if isinstance(conv, str) and conv:
+            from ..core.models import DBConversion
+            d["conversion"] = DBConversion.from_dict(loads(conv))
+        elif conv is None:
+            d["conversion"] = None
         return DBConversionProfile.from_dict(d)
 
     def list_db_profiles(self) -> List[DBConversionProfile]:
@@ -1141,6 +1378,296 @@ class Store:
     def delete_db_profile(self, db_server_id: str) -> None:
         with self.tx() as cur:
             cur.execute(self._x("DELETE FROM db_profiles WHERE db_server_id=?"), (db_server_id,))
+
+    # -- Legacy / unsupported-OS disposition (F7) ------------------------------
+    _LD_COLS = ["server_id", "disposition", "rationale", "confidence",
+                "target_base_image", "effort_days", "prereqs", "scan_id",
+                "scanned_at", "summary", "updated_at"]
+
+    def upsert_legacy_disposition(self, d: LegacyDisposition) -> None:
+        sql = self._upsert_sql("legacy_dispositions", self._LD_COLS, "server_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                d.server_id, d.disposition, d.rationale, d.confidence,
+                d.target_base_image, d.effort_days, dumps(d.prereqs),
+                d.scan_id, d.scanned_at, d.summary, d.updated_at))
+
+    def _row_to_legacy_disposition(self, d: Dict[str, Any]) -> LegacyDisposition:
+        d = dict(d)
+        d["prereqs"] = loads(d.get("prereqs")) or []
+        return LegacyDisposition.from_dict(d)
+
+    def list_legacy_dispositions(self) -> List[LegacyDisposition]:
+        return [self._row_to_legacy_disposition(r) for r in
+                self._fetchall("SELECT * FROM legacy_dispositions ORDER BY updated_at DESC")]
+
+    def get_legacy_disposition(self, server_id: str) -> Optional[LegacyDisposition]:
+        r = self._fetchone("SELECT * FROM legacy_dispositions WHERE server_id=?",
+                           (server_id,))
+        return self._row_to_legacy_disposition(r) if r else None
+
+    def delete_legacy_disposition(self, server_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM legacy_dispositions WHERE server_id=?"),
+                         (server_id,))
+
+    # -- Doc artifacts (F9 — cutover playbook / as-built / persisted runbook) -
+    _DOC_COLS = ["doc_type", "scope_id", "doc_md", "scan_id", "scanned_at",
+                 "summary", "updated_at"]
+
+    def upsert_doc_artifact(self, d: DocArtifact) -> None:
+        # composite primary key (doc_type, scope_id) — build the upsert by hand
+        # so the ON DUPLICATE KEY UPDATE clause excludes the PK columns.
+        sql = ("INSERT INTO doc_artifacts (doc_type, scope_id, doc_md, scan_id, "
+               "scanned_at, summary, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+               "ON DUPLICATE KEY UPDATE doc_md=VALUES(doc_md), "
+               "scan_id=VALUES(scan_id), scanned_at=VALUES(scanned_at), "
+               "summary=VALUES(summary), updated_at=VALUES(updated_at)")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                d.doc_type, d.scope_id, d.doc_md, d.scan_id, d.scanned_at,
+                d.summary, d.updated_at))
+
+    def _row_to_doc_artifact(self, d: Dict[str, Any]) -> DocArtifact:
+        return DocArtifact.from_dict(dict(d))
+
+    def list_doc_artifacts(self,
+                           doc_type: Optional[str] = None) -> List[DocArtifact]:
+        if doc_type:
+            rows = self._fetchall(
+                "SELECT * FROM doc_artifacts WHERE doc_type=? ORDER BY updated_at DESC",
+                (doc_type,))
+        else:
+            rows = self._fetchall("SELECT * FROM doc_artifacts ORDER BY updated_at DESC")
+        return [self._row_to_doc_artifact(r) for r in rows]
+
+    def get_doc_artifact(self, doc_type: str, scope_id: str) -> Optional[DocArtifact]:
+        r = self._fetchone(
+            "SELECT * FROM doc_artifacts WHERE doc_type=? AND scope_id=?",
+            (doc_type, scope_id))
+        return self._row_to_doc_artifact(r) if r else None
+
+    def delete_doc_artifact(self, doc_type: str, scope_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x(
+                "DELETE FROM doc_artifacts WHERE doc_type=? AND scope_id=?"),
+                (doc_type, scope_id))
+
+    # -- IaC artifacts (F5 — landing-zone/workload Terraform + guardrails) ----
+    _IAC_COLS = ["scope_id", "scope", "modules", "guardrails", "guardrail_pass",
+                 "plan_summary", "target", "scan_id", "scanned_at", "summary",
+                 "updated_at"]
+
+    def upsert_iac_artifact(self, a: IaCArtifact) -> None:
+        sql = self._upsert_sql("iac_artifacts", self._IAC_COLS, "scope_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                a.scope_id, a.scope, dumps(a.modules),
+                dumps([g.to_dict() for g in a.guardrails]),
+                bool(a.guardrail_pass), a.plan_summary, dumps(a.target),
+                a.scan_id, a.scanned_at, a.summary, a.updated_at))
+
+    def _row_to_iac_artifact(self, d: Dict[str, Any]) -> IaCArtifact:
+        d = dict(d)
+        d["modules"] = loads(d.get("modules")) or []
+        d["target"] = loads(d.get("target")) or {}
+        gr_raw = loads(d.get("guardrails")) or []
+        from ..core.models import GuardrailCheck
+        d["guardrails"] = [GuardrailCheck.from_dict(g) for g in gr_raw]
+        d["guardrail_pass"] = bool(d.get("guardrail_pass"))
+        return IaCArtifact.from_dict(d)
+
+    def list_iac_artifacts(self, scope: Optional[str] = None) -> List[IaCArtifact]:
+        if scope:
+            rows = self._fetchall(
+                "SELECT * FROM iac_artifacts WHERE scope=? ORDER BY updated_at DESC",
+                (scope,))
+        else:
+            rows = self._fetchall("SELECT * FROM iac_artifacts ORDER BY updated_at DESC")
+        return [self._row_to_iac_artifact(r) for r in rows]
+
+    def get_iac_artifact(self, scope_id: str) -> Optional[IaCArtifact]:
+        r = self._fetchone("SELECT * FROM iac_artifacts WHERE scope_id=?",
+                           (scope_id,))
+        return self._row_to_iac_artifact(r) if r else None
+
+    def delete_iac_artifact(self, scope_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM iac_artifacts WHERE scope_id=?"),
+                         (scope_id,))
+
+    # -- Post-mig optimization recs (F10 — right_size/reserved/anomaly/perf) -
+    _PM_COLS = ["server_id", "kind", "from_spec", "to_spec", "reason",
+                "monthly_saving_usd", "confidence", "severity", "detail",
+                "scan_id", "scanned_at", "summary", "updated_at"]
+
+    def upsert_postmig_rec(self, r: PostMigRecommendation) -> None:
+        # composite PK (server_id, kind) — build the upsert by hand so the ON
+        # DUPLICATE KEY UPDATE clause excludes the PK columns.
+        sql = ("INSERT INTO postmig_recs (server_id, kind, from_spec, to_spec, "
+               "reason, monthly_saving_usd, confidence, severity, detail, "
+               "scan_id, scanned_at, summary, updated_at) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+               "ON DUPLICATE KEY UPDATE from_spec=VALUES(from_spec), "
+               "to_spec=VALUES(to_spec), reason=VALUES(reason), "
+               "monthly_saving_usd=VALUES(monthly_saving_usd), "
+               "confidence=VALUES(confidence), severity=VALUES(severity), "
+               "detail=VALUES(detail), scan_id=VALUES(scan_id), "
+               "scanned_at=VALUES(scanned_at), summary=VALUES(summary), "
+               "updated_at=VALUES(updated_at)")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                r.server_id, r.kind, r.from_spec, r.to_spec, r.reason,
+                r.monthly_saving_usd, r.confidence, r.severity, r.detail,
+                r.scan_id, r.scanned_at, r.summary, r.updated_at))
+
+    def _row_to_postmig_rec(self, d: Dict[str, Any]) -> PostMigRecommendation:
+        return PostMigRecommendation.from_dict(dict(d))
+
+    def list_postmig_recs(self,
+                         server_id: Optional[str] = None) -> List[PostMigRecommendation]:
+        if server_id:
+            rows = self._fetchall(
+                "SELECT * FROM postmig_recs WHERE server_id=? ORDER BY kind",
+                (server_id,))
+        else:
+            rows = self._fetchall("SELECT * FROM postmig_recs ORDER BY updated_at DESC")
+        return [self._row_to_postmig_rec(r) for r in rows]
+
+    def get_postmig_rec(self, server_id: str,
+                        kind: str) -> Optional[PostMigRecommendation]:
+        r = self._fetchone(
+            "SELECT * FROM postmig_recs WHERE server_id=? AND kind=?",
+            (server_id, kind))
+        return self._row_to_postmig_rec(r) if r else None
+
+    def delete_postmig_recs(self, server_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM postmig_recs WHERE server_id=?"),
+                         (server_id,))
+
+    # -- Automated testing (F11 — cases / runs / diffs) ----------------------
+    def _upsert_test_case_sql(self, c: TestCase):
+        """Return (sql, params) for a test_case upsert. Exposed so a caller can
+        run the INSERT inside its OWN transaction (atomic clear + re-insert)."""
+        sql = ("INSERT INTO test_cases (app_id, name, kind, endpoint, method, "
+               "request, expected, setup, scan_id, updated_at) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+               "ON DUPLICATE KEY UPDATE kind=VALUES(kind), endpoint=VALUES(endpoint), "
+               "method=VALUES(method), request=VALUES(request), "
+               "expected=VALUES(expected), setup=VALUES(setup), "
+               "scan_id=VALUES(scan_id), updated_at=VALUES(updated_at)")
+        return self._x(sql), (
+            c.app_id, c.name, c.kind, c.endpoint, c.method,
+            dumps(c.request), dumps(c.expected), c.setup, c.scan_id,
+            c.updated_at)
+
+    def upsert_test_case(self, c: TestCase) -> None:
+        # composite PK (app_id, name) — write the ON DUPLICATE KEY UPDATE
+        # clause by hand so it excludes the PK columns.
+        sql, params = self._upsert_test_case_sql(c)
+        with self.tx() as cur:
+            cur.execute(sql, params)
+
+    def list_test_cases(self, app_id: Optional[str] = None) -> List[TestCase]:
+        if app_id:
+            rows = self._fetchall("SELECT * FROM test_cases WHERE app_id=? ORDER BY name",
+                                  (app_id,))
+        else:
+            rows = self._fetchall("SELECT * FROM test_cases ORDER BY app_id, name")
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["request"] = loads(d.get("request")) or {}
+            d["expected"] = loads(d.get("expected")) or {}
+            out.append(TestCase.from_dict(d))
+        return out
+
+    def get_test_case(self, app_id: str, name: str) -> Optional[TestCase]:
+        r = self._fetchone("SELECT * FROM test_cases WHERE app_id=? AND name=?",
+                           (app_id, name))
+        if not r:
+            return None
+        d = dict(r)
+        d["request"] = loads(d.get("request")) or {}
+        d["expected"] = loads(d.get("expected")) or {}
+        return TestCase.from_dict(d)
+
+    def delete_test_cases(self, app_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM test_cases WHERE app_id=?"), (app_id,))
+
+    _TRUN_COLS = ["id", "app_id", "phase", "target", "results", "passed",
+                  "failed", "errors", "run_at", "scan_id"]
+
+    def upsert_test_run(self, r: TestRun) -> None:
+        sql = self._upsert_sql("test_runs", self._TRUN_COLS, "id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                r.id, r.app_id, r.phase, r.target,
+                dumps([x.to_dict() for x in r.results]),
+                r.passed, r.failed, r.errors, r.run_at, r.scan_id))
+
+    def _row_to_test_run(self, d: Dict[str, Any]) -> TestRun:
+        d = dict(d)
+        res_raw = loads(d.get("results")) or []
+        d["results"] = [TestResult.from_dict(x) for x in res_raw]
+        return TestRun.from_dict(d)
+
+    def list_test_runs(self, app_id: Optional[str] = None) -> List[TestRun]:
+        if app_id:
+            rows = self._fetchall("SELECT * FROM test_runs WHERE app_id=? ORDER BY run_at DESC",
+                                  (app_id,))
+        else:
+            rows = self._fetchall("SELECT * FROM test_runs ORDER BY run_at DESC")
+        return [self._row_to_test_run(r) for r in rows]
+
+    def get_test_run(self, run_id: str) -> Optional[TestRun]:
+        r = self._fetchone("SELECT * FROM test_runs WHERE id=?", (run_id,))
+        return self._row_to_test_run(r) if r else None
+
+    def latest_test_run(self, app_id: str, phase: str) -> Optional[TestRun]:
+        r = self._fetchone(
+            "SELECT * FROM test_runs WHERE app_id=? AND phase=? "
+            "ORDER BY run_at DESC LIMIT 1", (app_id, phase))
+        return self._row_to_test_run(r) if r else None
+
+    def delete_test_runs(self, app_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM test_runs WHERE app_id=?"), (app_id,))
+
+    def upsert_test_diff(self, d: TestDiff) -> None:
+        sql = ("INSERT INTO test_diffs (app_id, pre_run_id, post_run_id, diff, "
+               "regressions, scan_id, scanned_at, summary, updated_at) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+               "ON DUPLICATE KEY UPDATE pre_run_id=VALUES(pre_run_id), "
+               "post_run_id=VALUES(post_run_id), diff=VALUES(diff), "
+               "regressions=VALUES(regressions), scan_id=VALUES(scan_id), "
+               "scanned_at=VALUES(scanned_at), summary=VALUES(summary), "
+               "updated_at=VALUES(updated_at)")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                d.app_id, d.pre_run_id, d.post_run_id,
+                dumps([x.to_dict() for x in d.diff]), d.regressions,
+                d.scan_id, d.scanned_at, d.summary, d.updated_at))
+
+    def _row_to_test_diff(self, d: Dict[str, Any]) -> TestDiff:
+        d = dict(d)
+        items = loads(d.get("diff")) or []
+        d["diff"] = [TestDiffItem.from_dict(x) for x in items]
+        return TestDiff.from_dict(d)
+
+    def list_test_diffs(self) -> List[TestDiff]:
+        return [self._row_to_test_diff(r) for r in
+                self._fetchall("SELECT * FROM test_diffs ORDER BY updated_at DESC")]
+
+    def get_test_diff(self, app_id: str) -> Optional[TestDiff]:
+        r = self._fetchone("SELECT * FROM test_diffs WHERE app_id=?", (app_id,))
+        return self._row_to_test_diff(r) if r else None
+
+    def delete_test_diff(self, app_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM test_diffs WHERE app_id=?"), (app_id,))
 
     # -- LZ archetype status (F8 — Landing Zone placement gate) --
     def set_lz_status(self, archetype: str, status: str,
@@ -1164,6 +1691,125 @@ class Store:
     def delete_lz_status(self, archetype: str) -> None:
         with self.tx() as cur:
             cur.execute(self._x("DELETE FROM lz_status WHERE archetype=?"), (archetype,))
+
+    # -- LZ designs (F8 Phase A — operator-authored, LLM-driven LZ design) --
+    _LZ_DESIGN_COLS = ["design_id", "name", "summary", "archetypes", "requirements",
+                       "conversation", "onprem_cidrs", "is_active", "scale",
+                       "created_at", "updated_at", "updated_by"]
+
+    def upsert_lz_design(self, d: LZDesign) -> None:
+        """Insert or update an LZ design row (JSON columns for the structured
+        fields). Does NOT touch is_active of other rows — activation is a
+        separate atomic step (``set_active_lz_design``)."""
+        sql = self._upsert_sql("lz_designs", self._LZ_DESIGN_COLS, "design_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                d.design_id, d.name, d.summary or "", dumps(d.archetypes),
+                dumps(d.requirements), dumps(d.conversation), dumps(d.onprem_cidrs),
+                bool(d.is_active), d.scale or "", d.created_at, d.updated_at,
+                d.updated_by))
+
+    def _row_to_lz_design(self, d: Dict[str, Any]) -> LZDesign:
+        d = dict(d)
+        for k in ("archetypes", "requirements", "conversation", "onprem_cidrs"):
+            d[k] = loads(d.get(k)) or ({} if k not in ("conversation", "onprem_cidrs")
+                                       else [])
+        d["is_active"] = bool(d.get("is_active"))
+        return LZDesign.from_dict(d)
+
+    def get_lz_design(self, design_id: str) -> Optional[LZDesign]:
+        r = self._fetchone("SELECT * FROM lz_designs WHERE design_id=?", (design_id,))
+        return self._row_to_lz_design(r) if r else None
+
+    def list_lz_designs(self) -> List[LZDesign]:
+        return [self._row_to_lz_design(r) for r in self._fetchall(
+            "SELECT * FROM lz_designs ORDER BY updated_at DESC")]
+
+    def get_active_lz_design(self) -> Optional[LZDesign]:
+        """The single active design (is_active=1), or None — callers fall back
+        to the built-in LZ_BLUEPRINTS via ``idc.core.lz.default_lz_design``."""
+        r = self._fetchone("SELECT * FROM lz_designs WHERE is_active=1 LIMIT 1")
+        return self._row_to_lz_design(r) if r else None
+
+    def set_active_lz_design(self, design_id: str, updated_by: str = "operator"
+                              ) -> None:
+        """Atomically make ``design_id`` the sole active design: clear every
+        other row's is_active, set this one's, in one transaction. The single-
+        active invariant is enforced here, not by a DB constraint (many rows
+        may be is_active=0)."""
+        with self.tx() as cur:
+            cur.execute(self._x("UPDATE lz_designs SET is_active=0"))
+            cur.execute(self._x(
+                "UPDATE lz_designs SET is_active=1, updated_at=?, updated_by=? "
+                "WHERE design_id=?"), (_now(), updated_by, design_id))
+
+    def delete_lz_design(self, design_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM lz_designs WHERE design_id=?"),
+                         (design_id,))
+
+    # -- network designs (F8 Phase B+ — VPC + subnets + server placement) --
+    _NETWORK_DESIGN_COLS = ["design_id", "name", "summary", "accounts", "vpcs",
+                            "placements", "policy", "overrides", "archetype_overrides",
+                            "account_overrides", "onprem_cidrs", "validation",
+                            "is_active", "created_at", "updated_at", "updated_by"]
+
+    def upsert_network_design(self, nd: NetworkDesign) -> None:
+        """Insert or update a network design row (JSON columns for the structured
+        fields). Does NOT touch is_active of other rows — activation is a
+        separate atomic step (``set_active_network_design``)."""
+        sql = self._upsert_sql("network_designs", self._NETWORK_DESIGN_COLS,
+                               "design_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                nd.design_id, nd.name, nd.summary or "", dumps(nd.accounts),
+                dumps(nd.vpcs), dumps(nd.placements), dumps(nd.policy),
+                dumps(nd.overrides), dumps(nd.archetype_overrides),
+                dumps(nd.account_overrides), dumps(nd.onprem_cidrs),
+                dumps(nd.validation), bool(nd.is_active), nd.created_at,
+                nd.updated_at, nd.updated_by))
+
+    def _row_to_network_design(self, d: Dict[str, Any]) -> NetworkDesign:
+        d = dict(d)
+        # JSON columns come back as strings; coerce to the right type per key.
+        # vpcs + onprem_cidrs are LISTS — a naive ``loads(v) or {}`` would turn an
+        # empty ``[]`` into ``{}`` (wrong type). Use per-key defaults.
+        list_keys = ("vpcs", "onprem_cidrs")
+        for k in ("accounts", "vpcs", "placements", "policy", "overrides",
+                  "archetype_overrides", "account_overrides", "onprem_cidrs",
+                  "validation"):
+            v = d.get(k)
+            d[k] = loads(v) or ([] if k in list_keys else {})
+        d["is_active"] = bool(d.get("is_active"))
+        return NetworkDesign.from_dict(d)
+
+    def get_network_design(self, design_id: str) -> Optional[NetworkDesign]:
+        r = self._fetchone("SELECT * FROM network_designs WHERE design_id=?",
+                           (design_id,))
+        return self._row_to_network_design(r) if r else None
+
+    def list_network_designs(self) -> List[NetworkDesign]:
+        return [self._row_to_network_design(r) for r in self._fetchall(
+            "SELECT * FROM network_designs ORDER BY updated_at DESC")]
+
+    def get_active_network_design(self) -> Optional[NetworkDesign]:
+        r = self._fetchone("SELECT * FROM network_designs WHERE is_active=1 LIMIT 1")
+        return self._row_to_network_design(r) if r else None
+
+    def set_active_network_design(self, design_id: str,
+                                   updated_by: str = "operator") -> None:
+        """Atomically make ``design_id`` the sole active network design."""
+        with self.tx() as cur:
+            cur.execute(self._x("UPDATE network_designs SET is_active=0"))
+            cur.execute(self._x(
+                "UPDATE network_designs SET is_active=1, updated_at=?, "
+                "updated_by=? WHERE design_id=?"),
+                (_now(), updated_by, design_id))
+
+    def delete_network_design(self, design_id: str) -> None:
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM network_designs WHERE design_id=?"),
+                         (design_id,))
 
     # -- discovery snapshots (Gap1 — shadow-IT / CMDB-drift diff) --
     def save_discovery(self, payload: Dict[str, Any], created_at: str = "") -> None:

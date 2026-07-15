@@ -25,6 +25,12 @@ async function loadCode(){
     dbs.forEach(d=>{
       const rev = d.reverse_replication ? '<span style="color:var(--green)">✓</span>' : '<span class="muted">✗</span>';
       const auto = (d.auto_convert_pct!=null) ? (d.auto_convert_pct*100).toFixed(0)+'%' : '-';
+      const hasConv = d.conversion && (d.conversion.objects||[]).length;
+      const blocked = hasConv ? (d.conversion.objects||[]).filter(o=>o.status==='blocked').length : 0;
+      const convTag = hasConv
+        ? `<span style="color:${blocked?'var(--red)':'var(--green)'}" title="${blocked} blocked object(s)">${blocked?'⚠ '+blocked+' blocked':'✓ '+hasConv+' obj'}</span>`
+        : '<span class="muted">—</span>';
+      const convBtn = hasConv ? `<button class="sm" onclick="showDbConv('${attr(d.db_server_id)}')">report</button>` : '';
       dbt.insertAdjacentHTML('beforeend', `<tr>
         <td data-label="hostname">${esc(d.db_server_id||'-')}</td>
         <td data-label="conversion">${esc(d.source_engine||'-')} → ${esc(d.target_engine||'-')}</td>
@@ -34,10 +40,11 @@ async function loadCode(){
         <td data-label="review">${(d.review_objects||[]).length}</td>
         <td data-label="blockers">${(d.blockers||[]).length}</td>
         <td data-label="rev-repl">${rev}</td>
+        <td data-label="conv?">${convTag} ${convBtn}</td>
         <td data-label="scanned">${esc(d.scanned_at||'-')}</td></tr>`);
     });
-    if(!dbs.length) dbt.insertAdjacentHTML('beforeend', `<tr><td colspan="9" class="muted">no DB profiles yet — trigger a DB scan, or wait for the executor to push one.</td></tr>`);
-  }catch(e){ $('dbTbl').querySelector('tbody').innerHTML = `<tr><td colspan="9" class="ev-err">${esc(e)}</td></tr>`; }
+    if(!dbs.length) dbt.insertAdjacentHTML('beforeend', `<tr><td colspan="10" class="muted">no DB profiles yet — trigger a DB scan, or wait for the executor to push one.</td></tr>`);
+  }catch(e){ $('dbTbl').querySelector('tbody').innerHTML = `<tr><td colspan="10" class="ev-err">${esc(e)}</td></tr>`; }
   try{
     const jobs = await api('/change-jobs');
     const jb = $('jobTbl').querySelector('tbody'); jb.innerHTML='';
@@ -49,6 +56,8 @@ async function loadCode(){
   }catch(e){ $('jobTbl').querySelector('tbody').innerHTML = `<tr><td colspan="7" class="ev-err">${esc(e)}</td></tr>`; }
   loadQuestions();   // refresh the pending-questions queue alongside jobs
   startQuestionPolling();
+  loadIacArtifacts();
+  loadLegacyDispositions();
 }
 async function doExecutorScan(){
   const action = $('exAction').value;
@@ -83,7 +92,7 @@ function toggleModifyFields(){
 
 /* ---------- 7R strategy (AI assigns 6R + rehost-container per app) ---------- */
 const _7R_COLORS = {
-  'rehost':'var(--green)','rehost-container':'var(--green)',
+  'rehost':'var(--green)','rehost-container':'var(--green)','relocate':'var(--green)',
   'replatform':'#3b8eea','refactor':'var(--amber)','repurchase':'#a06bff',
   'retain':'#888','retire':'#e5484d'
 };
@@ -251,17 +260,37 @@ async function testExecConfig(){
   }catch(e){ out.innerHTML=`<span class="ev-err">test failed: ${esc(e)}</span>`; }
 }
 
-/* ---------- F5 — DB conversion profiles ---------- */
+/* ---------- F5/F6 — DB conversion profiles + convert mode ---------- */
 function _gradeColor(g){ return g==='A'?'var(--green)':g==='B'?'var(--amber)':g==='C'?'var(--red)':'var(--fg)'; }
-async function doDbScan(){
+async function doDbScan(mode){
   const db_server_id = $('dbScanId').value.trim();
   if(!db_server_id){ toast('enter a db hostname first','warn'); return; }
-  const body = { db_server_id, source_engine:$('dbSrcEng').value, target_engine:$('dbTgtEng').value };
+  const body = { db_server_id, source_engine:$('dbSrcEng').value, target_engine:$('dbTgtEng').value,
+                 mode: mode || 'assess' };
   try{
     await api('/db-scan', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
-    toast('DB scan requested — profile arrives via callback; Rebuild folds the grade in.', 'ok');
+    toast(`DB ${body.mode} requested — profile arrives via callback; Rebuild folds the grade in.`, 'ok');
     setTimeout(loadCode, 1500);
   }catch(e){ toast('DB scan failed: '+e, 'err'); }
+}
+async function showDbConv(dbServerId){
+  const el = $('dbConvDetail');
+  el.classList.remove('hidden');
+  el.innerHTML = '<span class="spinner"></span>';
+  try{
+    const d = await api('/db-profiles/'+encodeURIComponent(dbServerId));
+    if(!d.conversion){ el.innerHTML = '<span class="muted">no conversion artifact (run Convert).</span>'; return; }
+    const c = d.conversion;
+    const rows = (c.objects||[]).map(o=>{
+      const col = o.status==='auto_converted'?'var(--green)':o.status==='manual_review'?'var(--amber)':o.status==='blocked'?'var(--red)':'var(--fg)';
+      return `<tr><td>${esc(o.name)}</td><td>${esc(o.kind||'-')}</td><td style="color:${col};font-weight:600">${esc(o.status)}</td><td>${esc(o.issue||'—')}</td><td>${o.effort_days!=null?o.effort_days:'-'}</td></tr>`;
+    }).join('');
+    const ddl = (c.ddl||[]).length ? `<details class="mcard" style="margin-top:6px"><summary class="muted">converted DDL (${c.ddl.length} statement(s))</summary><pre>${esc((c.ddl||[]).join('\n'))}</pre></details>` : '';
+    el.innerHTML = `<div><b>${esc(d.db_server_id)}</b> → ${esc(c.target_engine||'?')}  ·  ${(c.auto_convert_pct!=null?(c.auto_convert_pct*100).toFixed(0):'?')}% auto</div>
+      <div class="xscroll" style="margin-top:6px"><table class="tbl mcard"><thead><tr><th>object</th><th>kind</th><th>status</th><th>issue</th><th>effort(d)</th></tr></thead><tbody>${rows}</tbody></table></div>
+      ${ddl}
+      ${c.report_md?`<details class="mcard" style="margin-top:6px"><summary class="muted">compatibility report (markdown)</summary><pre>${esc(c.report_md)}</pre></details>`:''}`;
+  }catch(e){ el.innerHTML = '<span class="ev-err">'+esc(e)+'</span>'; }
 }
 
 /* ---------- F9 — runtime containerization (no-source path) ---------- */
@@ -292,4 +321,85 @@ async function doRuntimeContainerize(){
     toast('Runtime containerize requested — profile arrives via callback (source=runtime-derived).', 'ok');
     setTimeout(loadCode, 1500);
   }catch(e){ toast('runtime-containerize failed: '+e, 'err'); }
+}
+
+/* ---------- F5 — IaC + Well-Architected guardrails ---------- */
+async function loadIacArtifacts(){
+  const tb = $('iacTbl'); if(!tb) return;
+  const body = tb.querySelector('tbody'); body.innerHTML='';
+  try{
+    const arts = await api('/iac-artifacts');
+    arts.forEach(a=>{
+      const fail = (a.guardrails||[]).filter(g=>g.status==='fail' && (g.severity==='high'||g.severity==='medium')).length;
+      const pass = a.guardrail_pass;
+      const tag = pass ? `<span style="color:var(--green)">✓ pass</span>`
+                       : `<span style="color:var(--red)">✗ ${fail} blocking fail(s)</span>`;
+      body.insertAdjacentHTML('beforeend', `<tr>
+        <td data-label="scope_id">${esc(a.scope_id||'-')}</td>
+        <td data-label="scope">${esc(a.scope||'-')}</td>
+        <td data-label="guardrails">${tag} (${(a.guardrails||[]).length})</td>
+        <td data-label="modules">${(a.modules||[]).length}</td>
+        <td data-label="scanned">${esc(a.scanned_at||'-')}</td>
+        <td data-label="show"><button class="sm" onclick="showIac('${attr(a.scope_id)}')">show</button></td></tr>`);
+    });
+    if(!arts.length) body.insertAdjacentHTML('beforeend', `<tr><td colspan="6" class="muted">no IaC artifacts yet — emit one (e.g. scope=landing_zone, id=lz:corp).</td></tr>`);
+  }catch(e){ body.innerHTML = `<tr><td colspan="6" class="ev-err">${esc(e)}</td></tr>`; }
+}
+async function doIacEmit(){
+  const scope = $('iacScope').value;
+  const scope_id = $('iacScopeId').value.trim();
+  if(!scope_id){ toast('enter a scope_id (lz:corp or wl:<server_id>)','warn'); return; }
+  try{
+    await api('/iac-emit', {method:'POST', headers:{'content-type':'application/json'},
+            body:JSON.stringify({scope, scope_id, context:{}})});
+    toast('IaC emit requested — artifact + guardrails arrive via callback.', 'ok');
+    setTimeout(loadIacArtifacts, 1500);
+  }catch(e){ toast('iac-emit failed: '+e, 'err'); }
+}
+async function showIac(scopeId){
+  const el = $('iacDetail'); el.classList.remove('hidden'); el.innerHTML='<span class="spinner"></span>';
+  try{
+    const a = await api('/iac-artifacts/'+encodeURIComponent(scopeId));
+    const gr = (a.guardrails||[]).map(g=>{
+      const c = g.status==='pass'?'var(--green)':g.status==='fail'?'var(--red)':'var(--amber)';
+      return `<tr><td style="color:${c};font-weight:600">${esc(g.status)}</td><td>${esc(g.pillar||'-')}</td><td>${esc(g.rule||'-')}</td><td>${esc(g.finding||'—')}</td><td>${esc(g.severity||'-')}</td></tr>`;
+    }).join('');
+    const mods = (a.modules||[]).map(m=>`<details class="mcard"><summary>${esc(m.path)}</summary><pre>${esc(m.content||'')}</pre></details>`).join('');
+    el.innerHTML = `<div><b>${esc(a.scope_id)}</b>  ·  ${a.guardrail_pass?'<span style="color:var(--green)">guardrails PASS</span>':'<span style="color:var(--red)">guardrails FAIL</span>'}  ·  ${esc(a.plan_summary||'')}</div>
+      <div class="xscroll" style="margin-top:6px"><table class="tbl mcard"><thead><tr><th>status</th><th>pillar</th><th>rule</th><th>finding</th><th>severity</th></tr></thead><tbody>${gr}</tbody></table></div>
+      <div style="margin-top:6px">${mods||'<span class="muted">no modules</span>'}</div>`;
+  }catch(e){ el.innerHTML='<span class="ev-err">'+esc(e)+'</span>'; }
+}
+
+/* ---------- F7 — legacy / unsupported-OS disposition ---------- */
+const _LD_COLOR = {containerize:'var(--green)', replatform:'#3b8eea', rewrite:'var(--amber)', retain:'#888', retire:'#e5484d'};
+async function loadLegacyDispositions(){
+  const tb = $('ldTbl'); if(!tb) return;
+  const body = tb.querySelector('tbody'); body.innerHTML='';
+  try{
+    const ds = await api('/legacy-dispositions');
+    ds.forEach(d=>{
+      body.insertAdjacentHTML('beforeend', `<tr>
+        <td data-label="server_id">${esc(d.server_id||'-')}</td>
+        <td data-label="disposition"><span style="color:${_LD_COLOR[d.disposition]||'var(--fg)'};font-weight:600">${esc(d.disposition||'-')}</span></td>
+        <td data-label="confidence">${d.confidence!=null?d.confidence.toFixed(2):'-'}</td>
+        <td data-label="effort">${d.effort_days!=null?d.effort_days:'-'}</td>
+        <td data-label="base_image">${esc(d.target_base_image||'-')}</td>
+        <td data-label="rationale" class="conf" title="${esc(d.rationale||'')}">${esc((d.rationale||'-').slice(0,60))}</td>
+        <td data-label="scanned">${esc(d.scanned_at||'-')}</td></tr>`);
+    });
+    if(!ds.length) body.insertAdjacentHTML('beforeend', `<tr><td colspan="7" class="muted">no dispositions yet — analyze an EOL host (e.g. role=app, os=centos 6, no repo → containerize).</td></tr>`);
+  }catch(e){ body.innerHTML = `<tr><td colspan="7" class="ev-err">${esc(e)}</td></tr>`; }
+}
+async function doLegacyAnalyze(){
+  const server_id = $('ldServer').value.trim();
+  if(!server_id){ toast('enter a server_id first','warn'); return; }
+  const ctx = { role:$('ldRole').value, os:$('ldOs').value.trim(),
+                runtime:$('ldRuntime').value.trim(),
+                has_source_repo:$('ldHasRepo').checked, os_eol_bucket:'expired' };
+  try{
+    await api('/legacy-disposition', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({server_id, context:ctx})});
+    toast('Legacy-disposition analysis requested — arrives via callback.', 'ok');
+    setTimeout(loadLegacyDispositions, 1500);
+  }catch(e){ toast('legacy-disposition failed: '+e, 'err'); }
 }

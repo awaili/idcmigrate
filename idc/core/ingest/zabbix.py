@@ -23,6 +23,8 @@ class ZabbixAdapter(Adapter):
     def fetch(self, settings: Settings) -> IngestResult:
         if settings.has_zabbix():
             return self._online(settings)
+        if not settings.allow_fixture_fallback:
+            return self._fixture_disabled(settings)
         return self._fixture(settings)
 
     def _fixture(self, settings: Settings) -> IngestResult:
@@ -54,13 +56,14 @@ class ZabbixAdapter(Adapter):
 
         url = settings.zbx_url
         rid = 1
+        token = settings.zbx_token  # local copy — do NOT mutate shared Settings
 
         def call(method: str, params: Dict[str, Any]) -> Any:
-            nonlocal rid
+            nonlocal rid, token
             payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": rid}
             rid += 1
-            if settings.zbx_token:
-                payload["auth"] = settings.zbx_token
+            if token:
+                payload["auth"] = token
             r = httpx.post(url, json=payload, timeout=60)
             r.raise_for_status()
             j = r.json()
@@ -70,11 +73,9 @@ class ZabbixAdapter(Adapter):
 
         try:
             # token login only needed for user-based auth; token already set as auth
-            if not settings.zbx_token:
+            if not token:
                 token = call("user.login", {
                     "username": settings.zbx_user, "password": settings.zbx_password})
-                # re-issue calls with auth token by wrapping: simplest is to set env
-                settings.zbx_token = token  # type: ignore[assignment]
             hosts = call("host.get", {
                 "output": ["hostid", "host", "name"],
                 "selectInterfaces": ["ip", "dns", "type"],
@@ -82,6 +83,12 @@ class ZabbixAdapter(Adapter):
                 "selectTags": ["tag", "value"],
             })
         except Exception as e:
+            if not settings.allow_fixture_fallback:
+                # never pull dummy fixture data over a real (creds-configured)
+                # live deployment on a transient API failure — that would inject
+                # phantom hosts into the real inventory.
+                return IngestResult(assets=[], mode="error",
+                                    error=f"zabbix online failed ({e!r}); fixture fallback disabled")
             fix = self._fixture(settings)
             return IngestResult(assets=fix.assets, mode="fixture",
                                 error=f"zabbix online failed ({e!r}); used fixture")
@@ -91,7 +98,7 @@ class ZabbixAdapter(Adapter):
             iface = (h.get("interfaces") or [{}])[0]
             tags = {t.get("tag"): t.get("value") for t in h.get("tags", [])}
             assets.append(RawAsset(
-                source=SOURCE_ZABBIX, source_id=str(h.get("hostid")),
+                source=SOURCE_ZABBIX, source_id=str(h.get("hostid") or h.get("host") or ""),
                 hostname=h.get("host", ""), fqdn=(iface.get("dns") or ""),
                 ip=iface.get("ip", ""),
                 attrs={"name": h.get("name"),
@@ -121,7 +128,11 @@ class ZabbixAdapter(Adapter):
                 util: Dict[str, Any] = {}
                 for it in items:
                     key = it.get("key_", "")
-                    field = _KEY_MAP.get(key)
+                    # Zabbix item keys carry a [...] parameter suffix
+                    # (e.g. system.cpu.util[all]); strip it before the exact
+                    # map lookup, or every online host loses its utilization.
+                    key_base = key.split("[", 1)[0]
+                    field = _KEY_MAP.get(key_base)
                     if not field:
                         continue
                     hist = call("history.get", {"itemids": it["itemid"], "history": 0,

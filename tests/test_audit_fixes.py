@@ -31,7 +31,7 @@ def test_baremetal_non_hadoop_not_routed_to_emr():
                  cpu_cores=8, mem_gb=32, tags=["oracle-db"])
     m = match_server(bm_db)
     assert m.target.product != "EMR"
-    assert m.target.product == "CVM"  # Oracle BYOL lift-and-shift
+    assert m.target.product == "TData"  # Oracle → Replatform to TData
 
     bm_web = _srv(hostname="bm-web-01", source_type="baremetal", role="web",
                   cpu_cores=4, mem_gb=8)
@@ -208,7 +208,9 @@ def test_validate_schema_rejects_cyclic_policy():
 # -- codeintel.py -----------------------------------------------------------
 def test_retain_plus_retire_mix_does_not_migrate():
     """M2: a host whose apps are all non-migrating (one retain, one retire) is
-    decommissioned, not migrated."""
+    NOT migrated AND NOT decommissioned — it is retained on-prem. A retain app
+    must stay on its host; decommissioning the shared host would destroy the
+    retain app. The retire app is retired at the app layer separately."""
     from idc.core.models import AppStrategy, PATTERN_RETAIN, PATTERN_RETIRE
     s = _srv(id="srv-1", hostname="h-1", app_ids=["keep", "drop"])
     workloads = [
@@ -218,8 +220,8 @@ def test_retain_plus_retire_mix_does_not_migrate():
     strategies = {"keep": AppStrategy(app_id="keep", strategy=PATTERN_RETAIN),
                   "drop": AppStrategy(app_id="drop", strategy=PATTERN_RETIRE)}
     retain, retire = non_migrating_servers([s], workloads, [], strategies=strategies)
-    assert "srv-1" in retire
-    assert "srv-1" not in retain
+    assert "srv-1" in retain
+    assert "srv-1" not in retire
 
 
 # -- config.py --------------------------------------------------------------

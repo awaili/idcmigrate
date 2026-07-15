@@ -13,7 +13,7 @@ import os
 import secrets
 import time
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -28,6 +28,12 @@ from ..core import open_store, rebuild, run_ingest
 from ..core.db import ServerFilter
 from ..core.ingest import all_sources
 from ..core.models import (ALL_QUESTION_KINDS, ChangeJob, CodeProfile, DBConversionProfile,
+                           DocArtifact, DOC_TYPES, IaCArtifact, IAC_SCOPES,
+                           LegacyDisposition, LEGACY_DISPOSITIONS,
+                           LD_RETAIN, LD_RETIRE,
+                           PostMigRecommendation, PM_KINDS,
+                           TestCase, TestDiff, TestDiffItem, TestRun, TestResult,
+                           TEST_KINDS, TEST_PHASES, TV_VERDICTS,
                            Question, ScanFinding, _now)
 from ..llm import get_client
 from ..agent import ExecutorError, build_context, get_executor_client, run_agent
@@ -124,7 +130,14 @@ _PUBLIC_PATHS = {"/login", "/logout", "/executor", "/favicon.ico"}
 # /api/ requires a browser session — so a leaked bearer can't change the
 # password, rewrite executor config, trigger scans, or drive migration jobs.
 _BEARER_PREFIXES = ("/api/code-profiles", "/api/db-profiles", "/api/change-jobs",
-                    "/api/workloads/", "/api/apps/", "/api/questions")
+                    "/api/workloads/", "/api/apps/", "/api/questions",
+                    # F5/F7/F9/F10/F11 executor push-back callbacks (PUT scoped).
+                    # Trailing slash keeps the list (GET) endpoints session-only
+                    # for the browser while letting the executor's bearer auth
+                    # through on the scoped PUT routes it pushes to.
+                    "/api/legacy-dispositions/", "/api/docs/", "/api/iac-artifacts/",
+                    "/api/postmig-recs/", "/api/test-cases/", "/api/test-runs/",
+                    "/api/test-diffs/")
 
 
 async def _auth_dispatch(request: Request, call_next):
@@ -155,6 +168,23 @@ app.add_middleware(BaseHTTPMiddleware, dispatch=_auth_dispatch)
 app.add_middleware(SessionMiddleware, secret_key=_SESSION_SECRET,
                    session_cookie="idc_sess", same_site="lax", https_only=False,
                    max_age=60 * 60 * 24 * 30)
+
+
+async def _nocache_assets(request, call_next):
+    """Force browsers to revalidate /assets/* (JS/CSS). StaticFiles sends only
+    Last-Modified/ETag, no Cache-Control, so browsers heuristically cache the
+    old copy and skip revalidation — which means a freshly-edited page module
+    (e.g. business-case.js) stays invisible until a hard reload. no-cache +
+    must-revalidate keeps a 304 path when unchanged but always fetches fresh
+    bytes the moment a file changes. Auth-gated API routes are untouched."""
+    resp = await call_next(request)
+    if request.url.path.startswith("/assets/") or \
+       resp.headers.get("content-type", "").startswith("text/html"):
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return resp
+
+
+app.add_middleware(BaseHTTPMiddleware, dispatch=_nocache_assets)
 
 # ---------------------------------------------------------------------------
 # Live executor config — operator-editable at runtime via /api/executor/config
@@ -265,7 +295,42 @@ def _server_out(s, profiles_by_app=None, strategies_by_app=None):
     # and does not load all profiles per row.
     if profiles_by_app is not None:
         d["code"] = _server_code_summary(s, profiles_by_app, strategies_by_app)
+        # operator / executor host disposition (retain / retire / "") — only on
+        # the detail path (the drawer shows + edits it); a legacy_disposition
+        # lookup is a DB round-trip, so skip it for the paginated list. Keyed by
+        # the host's stable identity (hostname lowercased), survives a Rebuild.
+        d["disposition"] = _host_disposition(s)
+    else:
+        d["disposition"] = ""
     return d
+
+
+def _first_code_profile(s):
+    """The first code profile attached to one of the server's apps, or None.
+    Shared by the drawer's LLM actions (explain / right-size / audit) so they
+    reason over the app's runtime / framework / blockers, not just the host."""
+    if not s.app_ids:
+        return None
+    pmap = {p.app_id: p for p in STORE.list_code_profiles()}
+    return next((pmap[a] for a in s.app_ids if a in pmap), None)
+
+
+def _host_disposition_keys(s) -> List[str]:
+    """The stable-identity keys a host disposition is stored under (hostname
+    lowercased, identity_key, server id) — the same keys ``non_migrating_servers``
+    matches legacy dispositions by, so the drawer reads the SAME row the planner
+    honors. First non-empty wins as the lookup key."""
+    return [k for k in (s.hostname.lower().strip(), getattr(s, "identity_key", ""),
+                        s.id) if k]
+
+
+def _host_disposition(s) -> str:
+    """Current retain/retire disposition for a host, or "" (migrate)."""
+    for k in _host_disposition_keys(s):
+        d = STORE.get_legacy_disposition(k)
+        if d and d.disposition in (LD_RETAIN, LD_RETIRE):
+            return d.disposition
+    return ""
 
 
 def _server_code_summary(s, profiles_by_app, strategies_by_app=None):
@@ -332,6 +397,7 @@ def list_servers(role: Optional[str] = None, env: Optional[str] = None,
                  conf_min: Optional[float] = None, conf_max: Optional[float] = None,
                  warranty_bucket: Optional[str] = None,
                  os_eol_bucket: Optional[str] = None,
+                 app_id: Optional[str] = None,
                  page: int = 1, page_size: int = 50,
                  order_by: str = "hostname", order_dir: str = "asc",
                  facets: bool = True):
@@ -344,7 +410,8 @@ def list_servers(role: Optional[str] = None, env: Optional[str] = None,
                      target_product=target_product, wave_id=wave_id, q=q,
                      util_cpu_min=util_cpu_min, util_mem_min=util_mem_min,
                      util_disk_min=util_disk_min, conf_min=conf_min, conf_max=conf_max,
-                     warranty_bucket=warranty_bucket, os_eol_bucket=os_eol_bucket)
+                     warranty_bucket=warranty_bucket, os_eol_bucket=os_eol_bucket,
+                     app_id=app_id)
     res = STORE.query_servers(f, page=page, page_size=min(page_size, 500),
                               order_by=order_by, order_dir=order_dir,
                               with_facets=facets)
@@ -416,6 +483,42 @@ def put_server_warranty(sid: str, body: dict):
     return {"server_id": sid, "warranty_status": s.warranty_status,
             "hardware_eol": s.hardware_eol, "warranty_bucket": s.warranty_bucket,
             "updated": True}
+
+
+@app.put("/api/servers/{sid}/disposition")
+def put_server_disposition(sid: str, body: dict):
+    """Operator per-host disposition: retain (keep on-prem) or retire
+    (decommission), or "" to clear (migrate with the waves). Set from the
+    inventory host drawer.
+
+    Stored as a ``LegacyDisposition`` keyed by the host's STABLE identity
+    (hostname lowercased) — the SAME store the executor's EOL analysis pushes
+    to and the SAME row ``non_migrating_servers`` reads, so the operator's call
+    survives a Rebuild (separate table) and drives the trailing Retain / Retire
+    waves on the next plan. No executor bearer — this is a browser-session
+    operator action, like the warranty override.
+
+    A host-level disposition overrides the app-level 7R rule: a retain/retire
+    host is pulled out of every app wave even when a migrating app claims it
+    (the app migrates with its OTHER hosts). Hosts with no app binding are also
+    eligible (a standalone host can be retired)."""
+    s = STORE.get_server(sid)
+    if not s:
+        raise HTTPException(404, "server not found")
+    disp = (body.get("disposition") or "").strip().lower()
+    if disp and disp not in (LD_RETAIN, LD_RETIRE):
+        raise HTTPException(400, f"disposition must be '{LD_RETAIN}' or '{LD_RETIRE}' or empty")
+    key = _host_disposition_keys(s)[0] if _host_disposition_keys(s) else sid
+    if not disp:
+        STORE.delete_legacy_disposition(key)
+        return {"server_id": sid, "disposition": "", "cleared": True}
+    d = LegacyDisposition(
+        server_id=key, disposition=disp,
+        rationale=(body.get("rationale") or "operator override").strip(),
+        confidence=1.0, summary=f"operator {disp} from inventory host drawer",
+    )
+    STORE.upsert_legacy_disposition(d)
+    return {"server_id": sid, "disposition": disp, "key": key, "updated": True}
 
 
 @app.get("/api/workloads")
@@ -844,6 +947,561 @@ def delete_db_profile(db_server_id: str, authorization: Optional[str] = Header(N
     return {"db_server_id": db_server_id, "deleted": True}
 
 
+# ---------------------------------------------------------------------------
+# F7 — legacy / unsupported-OS dispositions (executor pushes; UI / agent reads)
+# ---------------------------------------------------------------------------
+@app.get("/api/legacy-dispositions")
+def list_legacy_dispositions():
+    """List all legacy-OS dispositions (read-only; keyed by stable host identity)."""
+    return [d.to_dict() for d in STORE.list_legacy_dispositions()]
+
+
+@app.get("/api/legacy-dispositions/{server_id}")
+def get_legacy_disposition(server_id: str):
+    d = STORE.get_legacy_disposition(server_id)
+    if not d:
+        raise HTTPException(404, f"no legacy disposition for {server_id}")
+    return d.to_dict()
+
+
+@app.put("/api/legacy-dispositions/{server_id}")
+def put_legacy_disposition(server_id: str, body: dict,
+                           authorization: Optional[str] = Header(None)):
+    """Executor pushes/overwrites a LegacyDisposition for an EOL host (F7).
+
+    ``server_id`` is the host's STABLE identity (hostname lowercased), like
+    db-profiles. Bearer auth, same as the other push endpoints."""
+    _check_executor_auth(authorization)
+    if body.get("server_id") and body["server_id"] != server_id:
+        raise HTTPException(400, "server_id in body must match path")
+    body["server_id"] = server_id
+    if body.get("disposition") and body["disposition"] not in LEGACY_DISPOSITIONS:
+        raise HTTPException(400, f"disposition must be one of {LEGACY_DISPOSITIONS}")
+    try:
+        d = LegacyDisposition.from_dict(body)
+    except Exception as e:
+        raise HTTPException(400, f"invalid LegacyDisposition: {e!r}")
+    STORE.upsert_legacy_disposition(d)
+    return {"server_id": server_id, "updated": True}
+
+
+@app.delete("/api/legacy-dispositions/{server_id}")
+def delete_legacy_disposition(server_id: str, authorization: Optional[str] = Header(None)):
+    _check_executor_auth(authorization)
+    STORE.delete_legacy_disposition(server_id)
+    return {"server_id": server_id, "deleted": True}
+
+
+class LegacyDispositionReq(BaseModel):
+    server_id: str
+    context: Dict[str, Any] = {}
+
+
+@app.post("/api/legacy-disposition")
+def legacy_disposition_trigger(req: LegacyDispositionReq):
+    """Ask the external executor to analyze an EOL/unsupported-OS host and
+    recommend containerize / re-platform / rewrite / retain (F7). The executor
+    pushes a LegacyDisposition back to PUT /api/legacy-dispositions/{server_id};
+    the next rebuild folds it into the host's match via apply_os_eol."""
+    if not _executor_settings().executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(_executor_settings())
+    if not ec.configured:
+        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    try:
+        return ec.legacy_disposition(req.server_id, req.context)
+    except ExecutorError as e:
+        raise HTTPException(502, f"executor error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# F9 — generated doc artifacts: cutover playbook + as-built (+ runbook)
+# ---------------------------------------------------------------------------
+# doc_type is normalized so the path can be "as-built" (URL-friendly) while the
+# stored doc_type is "as_built" (matches DOC_TYPES).
+_DOC_SLUG_MAP = {"as-built": "as_built", "cutover": "cutover", "runbook": "runbook"}
+_DOC_SLUG_REV = {v: k for k, v in _DOC_SLUG_MAP.items()}
+
+
+def _doc_type_from_slug(slug: str) -> Optional[str]:
+    return _DOC_SLUG_MAP.get(slug)
+
+
+@app.get("/api/docs")
+def list_doc_artifacts(doc_type: Optional[str] = None):
+    """List generated doc artifacts (optionally filtered by doc_type)."""
+    return [d.to_dict() for d in STORE.list_doc_artifacts(doc_type=doc_type)]
+
+
+@app.get("/api/docs/{doc_type}/{scope_id}")
+def get_doc_artifact(doc_type: str, scope_id: str):
+    real = _doc_type_from_slug(doc_type) or doc_type
+    d = STORE.get_doc_artifact(real, scope_id)
+    if not d:
+        raise HTTPException(404, f"no {doc_type} doc for {scope_id}")
+    return d.to_dict()
+
+
+@app.put("/api/docs/{doc_type}/{scope_id}")
+def put_doc_artifact(doc_type: str, scope_id: str, body: dict,
+                     authorization: Optional[str] = Header(None)):
+    """Executor pushes/overwrites a generated DocArtifact (F9). Bearer auth."""
+    _check_executor_auth(authorization)
+    real = _doc_type_from_slug(doc_type) or doc_type
+    if real not in DOC_TYPES:
+        raise HTTPException(400, f"doc_type must be one of {DOC_TYPES}")
+    body["doc_type"] = real
+    body["scope_id"] = scope_id
+    try:
+        d = DocArtifact.from_dict(body)
+    except Exception as e:
+        raise HTTPException(400, f"invalid DocArtifact: {e!r}")
+    STORE.upsert_doc_artifact(d)
+    return {"doc_type": real, "scope_id": scope_id, "updated": True}
+
+
+@app.delete("/api/docs/{doc_type}/{scope_id}")
+def delete_doc_artifact(doc_type: str, scope_id: str,
+                        authorization: Optional[str] = Header(None)):
+    _check_executor_auth(authorization)
+    real = _doc_type_from_slug(doc_type) or doc_type
+    STORE.delete_doc_artifact(real, scope_id)
+    return {"doc_type": real, "scope_id": scope_id, "deleted": True}
+
+
+class DocGenReq(BaseModel):
+    wave_id: str
+    context: Dict[str, Any] = {}
+
+
+def _wave_doc_context(wave_id: str) -> Dict[str, Any]:
+    """Assemble the real wave data the doc generators need (F9). The executor
+    builds the markdown from THIS context — sending an empty context would
+    produce an empty doc, so the backend (which has the store) builds it:
+    members (server/role/target/ports/deps/reverse_replication), the downtime
+    window, the deterministic risk basis, and the execution data (stage
+    history, gate results, change jobs, final targets). Pure reads, no LLM.
+    """
+    from ..core.codeintel import wave_risk_basis
+    wave = next((w for w in STORE.list_waves() if w.id == wave_id), None)
+    if wave is None:
+        return {"wave_id": wave_id, "members": [], "risk_basis": {}, "targets": []}
+    servers = {s.id: s for s in STORE.list_all_servers()}
+    matches = {m.server_id: m for m in STORE.list_matches()}
+    workloads = STORE.list_workloads()
+    profiles = STORE.list_code_profiles()
+    db_profiles = STORE.list_db_profiles()
+    srv_to_app = {}
+    for w in workloads:
+        for sid in (w.server_ids or []):
+            srv_to_app.setdefault(sid, w.app_id)
+    members = []
+    for sid in (wave.server_ids or []):
+        s = servers.get(sid)
+        m = matches.get(sid)
+        if not s:
+            continue
+        role = s.role or ""
+        tgt = (m.target.product + " " + m.target.spec) if m and m.target else ""
+        ports = []
+        if m and m.target:
+            p = m.target.extras.get("port")
+            if p:
+                ports.append(int(p))
+        reverse_replication = False
+        if role == "db":
+            for k in (s.hostname.lower().strip(), getattr(s, "identity_key", ""), s.id):
+                dbp = next((d for d in db_profiles if d.db_server_id == k), None)
+                if dbp:
+                    reverse_replication = bool(dbp.reverse_replication)
+                    break
+        members.append({"server_id": sid, "hostname": s.hostname, "role": role,
+                        "target": tgt, "ports": ports, "deps": [],
+                        "app_id": srv_to_app.get(sid, ""),
+                        "reverse_replication": reverse_replication})
+    risk = wave_risk_basis(wave, list(servers.values()), list(matches.values()),
+                           profiles, db_profiles)
+    return {"wave_id": wave_id, "members": members,
+            "downtime_window": dict(wave.downtime_window or {}),
+            "risk_basis": risk, "targets": [],
+            "stage_history": [], "gate_results": [], "change_jobs": []}
+
+
+def _wave_as_built_context(wave_id: str) -> Dict[str, Any]:
+    """Execution data for the as-built doc (F9): per-server stage history,
+    validation-gate results, change-job patch refs, and final matched
+    targets. Layered on top of _wave_doc_context."""
+    ctx = _wave_doc_context(wave_id)
+    jobs = STORE.list_migration_jobs(wave_id=wave_id)
+    stage_history, gate_results = [], []
+    for j in jobs:
+        for st in (j.stage_history or []):
+            stage_history.append({"server_id": j.server_id, **st})
+        for g in (j.validation_gates or []):
+            gate_results.append({"server_id": j.server_id,
+                                 "name": g.get("name"), "kind": g.get("kind"),
+                                 "status": g.get("result"), "detail": g.get("detail")})
+    change_jobs = [{"app_id": c.get("app_id"), "patch_ref": c.get("patch_ref"),
+                    "status": c.get("status")}
+                   for c in STORE.list_change_jobs(limit=500)
+                   if c.get("kind") in ("modify", "comb")]
+    # final targets (post-migration) from the matches
+    servers = {s.id: s for s in STORE.list_all_servers()}
+    matches = {m.server_id: m for m in STORE.list_matches()}
+    tgt = []
+    wv = next((w for w in STORE.list_waves() if w.id == wave_id), None)
+    for sid in ((wv.server_ids if wv else []) or []):
+        m = matches.get(sid)
+        s = servers.get(sid)
+        if m and m.target and s:
+            tgt.append({"server_id": sid, "role": s.role or "",
+                        "product": m.target.product, "spec": m.target.spec})
+    ctx.update({"stage_history": stage_history, "gate_results": gate_results,
+                "change_jobs": change_jobs, "targets": tgt})
+    return ctx
+
+
+@app.post("/api/cutover-playbook")
+def cutover_playbook_trigger(req: DocGenReq):
+    """Ask the executor to generate a per-wave cutover playbook (F9). The
+    executor pushes a DocArtifact back to PUT /api/docs/cutover/{wave_id}."""
+    if not _executor_settings().executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(_executor_settings())
+    if not ec.configured:
+        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    # F9 — the backend builds the real wave context (members / risk / downtime
+    # window) so the executor's doc is grounded, not empty.
+    ctx = req.context or _wave_doc_context(req.wave_id)
+    try:
+        return ec.cutover_playbook(req.wave_id, ctx)
+    except ExecutorError as e:
+        raise HTTPException(502, f"executor error: {e}")
+
+
+@app.post("/api/as-built")
+def as_built_trigger(req: DocGenReq):
+    """Ask the executor to generate a per-wave as-built doc (F9). The executor
+    pushes a DocArtifact back to PUT /api/docs/as-built/{wave_id}."""
+    if not _executor_settings().executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(_executor_settings())
+    if not ec.configured:
+        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    ctx = req.context or _wave_as_built_context(req.wave_id)
+    try:
+        return ec.as_built(req.wave_id, ctx)
+    except ExecutorError as e:
+        raise HTTPException(502, f"executor error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# F5 — IaC artifacts (landing-zone/workload Terraform + guardrail checks)
+# ---------------------------------------------------------------------------
+@app.get("/api/iac-artifacts")
+def list_iac_artifacts(scope: Optional[str] = None):
+    """List stored IaC artifacts (optionally filtered by scope)."""
+    return [a.to_dict() for a in STORE.list_iac_artifacts(scope=scope)]
+
+
+@app.get("/api/iac-artifacts/{scope_id}")
+def get_iac_artifact(scope_id: str):
+    a = STORE.get_iac_artifact(scope_id)
+    if not a:
+        raise HTTPException(404, f"no IaC artifact for {scope_id}")
+    return a.to_dict()
+
+
+@app.put("/api/iac-artifacts/{scope_id}")
+def put_iac_artifact(scope_id: str, body: dict,
+                     authorization: Optional[str] = Header(None)):
+    """Executor pushes/overwrites an IaCArtifact (F5). Bearer auth."""
+    _check_executor_auth(authorization)
+    if body.get("scope_id") and body["scope_id"] != scope_id:
+        raise HTTPException(400, "scope_id in body must match path")
+    body["scope_id"] = scope_id
+    if body.get("scope") and body["scope"] not in IAC_SCOPES:
+        raise HTTPException(400, f"scope must be one of {IAC_SCOPES}")
+    try:
+        a = IaCArtifact.from_dict(body)
+    except Exception as e:
+        raise HTTPException(400, f"invalid IaCArtifact: {e!r}")
+    STORE.upsert_iac_artifact(a)
+    return {"scope_id": scope_id, "updated": True, "guardrail_pass": a.guardrail_pass}
+
+
+@app.delete("/api/iac-artifacts/{scope_id}")
+def delete_iac_artifact(scope_id: str,
+                        authorization: Optional[str] = Header(None)):
+    _check_executor_auth(authorization)
+    STORE.delete_iac_artifact(scope_id)
+    return {"scope_id": scope_id, "deleted": True}
+
+
+class IacEmitReq(BaseModel):
+    scope: str
+    scope_id: str
+    context: Dict[str, Any] = {}
+
+
+@app.post("/api/iac-emit")
+def iac_emit_trigger(req: IacEmitReq):
+    """Ask the executor to emit IaC + run guardrail checks (F5). ``scope`` is
+    landing_zone (scope_id = lz:<arch>, context = blueprint) or workload
+    (scope_id = wl:<server_id>, context = match). The executor pushes an
+    IaCArtifact back to PUT /api/iac-artifacts/{scope_id}; check_lz_gate then
+    blocks workload launch until guardrails pass."""
+    if not _executor_settings().executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(_executor_settings())
+    if not ec.configured:
+        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    if req.scope not in IAC_SCOPES:
+        raise HTTPException(400, f"scope must be one of {IAC_SCOPES}")
+    try:
+        return ec.iac_emit(req.scope, req.scope_id, req.context)
+    except ExecutorError as e:
+        raise HTTPException(502, f"executor error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# F10 — post-migration optimization recs (right_size/reserved/anomaly/perf)
+# ---------------------------------------------------------------------------
+@app.get("/api/postmig-recs")
+def list_postmig_recs(server_id: Optional[str] = None):
+    """List post-mig recommendations (optionally filtered by server)."""
+    return [r.to_dict() for r in STORE.list_postmig_recs(server_id=server_id)]
+
+
+@app.get("/api/postmig-recs/{server_id}/{kind}")
+def get_postmig_rec(server_id: str, kind: str):
+    r = STORE.get_postmig_rec(server_id, kind)
+    if not r:
+        raise HTTPException(404, f"no {kind} rec for {server_id}")
+    return r.to_dict()
+
+
+@app.put("/api/postmig-recs/{server_id}/{kind}")
+def put_postmig_rec(server_id: str, kind: str, body: dict,
+                    authorization: Optional[str] = Header(None)):
+    """Executor pushes/overwrites a PostMigRecommendation (F10). Bearer auth."""
+    _check_executor_auth(authorization)
+    if kind not in PM_KINDS:
+        raise HTTPException(400, f"kind must be one of {PM_KINDS}")
+    body["server_id"] = server_id
+    body["kind"] = kind
+    try:
+        r = PostMigRecommendation.from_dict(body)
+    except Exception as e:
+        raise HTTPException(400, f"invalid PostMigRecommendation: {e!r}")
+    STORE.upsert_postmig_rec(r)
+    return {"server_id": server_id, "kind": kind, "updated": True}
+
+
+@app.delete("/api/postmig-recs/{server_id}")
+def delete_postmig_recs(server_id: str,
+                        authorization: Optional[str] = Header(None)):
+    _check_executor_auth(authorization)
+    STORE.delete_postmig_recs(server_id)
+    return {"server_id": server_id, "deleted": True}
+
+
+@app.get("/api/postmig-savings")
+def postmig_savings():
+    """Total realized monthly/yearly savings across all post-mig recs (F10)."""
+    from ..core.cost import postmig_savings as _sum
+    return _sum(STORE.list_postmig_recs())
+
+
+class PostMigReq(BaseModel):
+    server_id: str
+    context: Dict[str, Any] = {}
+
+
+@app.post("/api/postmig-optimize")
+def postmig_optimize_trigger(req: PostMigReq):
+    """Ask the executor to analyze a finalized host's post-mig metrics (F10).
+    The executor pushes PostMigRecommendation records back to
+    PUT /api/postmig-recs/{server_id}/{kind}."""
+    if not _executor_settings().executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(_executor_settings())
+    if not ec.configured:
+        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    try:
+        return ec.postmig_optimize(req.server_id, req.context)
+    except ExecutorError as e:
+        raise HTTPException(502, f"executor error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# F11 — automated testing (test cases / runs / diffs + triggers)
+# ---------------------------------------------------------------------------
+@app.get("/api/test-cases")
+def list_test_cases(app_id: Optional[str] = None):
+    return [c.to_dict() for c in STORE.list_test_cases(app_id=app_id)]
+
+
+@app.get("/api/test-cases/{app_id}")
+def get_test_cases(app_id: str):
+    return [c.to_dict() for c in STORE.list_test_cases(app_id=app_id)]
+
+
+@app.put("/api/test-cases/{app_id}")
+def put_test_cases(app_id: str, body: dict,
+                   authorization: Optional[str] = Header(None)):
+    """Executor pushes a LIST of TestCase records for an app (F11). Bearer auth.
+    Replaces the app's cases with the pushed list (gen is a full re-gen)."""
+    _check_executor_auth(authorization)
+    cases = body.get("cases") or []
+    # validate BEFORE the tx so a bad record doesn't leave a partial state
+    parsed: list = []
+    for c in cases:
+        c["app_id"] = app_id
+        try:
+            tc = TestCase.from_dict(c)
+        except Exception as e:
+            raise HTTPException(400, f"invalid TestCase: {e!r}")
+        if tc.kind and tc.kind not in TEST_KINDS:
+            raise HTTPException(400, f"kind must be one of {TEST_KINDS}")
+        parsed.append(tc)
+    out = []
+    # clear + re-insert atomically: the whole swap is one transaction so a crash
+    # mid-loop can't delete an app's cases and only partially re-add them.
+    with STORE.tx() as cur:
+        cur.execute(STORE._x("DELETE FROM test_cases WHERE app_id=?"), (app_id,))
+        for tc in parsed:
+            cur.execute(*STORE._upsert_test_case_sql(tc))
+            out.append(tc.name)
+    return {"app_id": app_id, "cases": out, "updated": True}
+
+
+@app.get("/api/test-runs")
+def list_test_runs(app_id: Optional[str] = None):
+    return [r.to_dict() for r in STORE.list_test_runs(app_id=app_id)]
+
+
+@app.get("/api/test-runs/{run_id}")
+def get_test_run(run_id: str):
+    r = STORE.get_test_run(run_id)
+    if not r:
+        raise HTTPException(404, f"no test run {run_id}")
+    return r.to_dict()
+
+
+@app.put("/api/test-runs/{run_id}")
+def put_test_run(run_id: str, body: dict,
+                authorization: Optional[str] = Header(None)):
+    """Executor pushes a TestRun (F11). Bearer auth."""
+    _check_executor_auth(authorization)
+    body["id"] = run_id
+    if body.get("phase") and body["phase"] not in TEST_PHASES:
+        raise HTTPException(400, f"phase must be one of {TEST_PHASES}")
+    try:
+        r = TestRun.from_dict(body)
+    except Exception as e:
+        raise HTTPException(400, f"invalid TestRun: {e!r}")
+    STORE.upsert_test_run(r)
+    return {"run_id": run_id, "updated": True}
+
+
+@app.get("/api/test-diffs")
+def list_test_diffs():
+    return [d.to_dict() for d in STORE.list_test_diffs()]
+
+
+@app.get("/api/test-diffs/{app_id}")
+def get_test_diff(app_id: str):
+    d = STORE.get_test_diff(app_id)
+    if not d:
+        raise HTTPException(404, f"no test diff for {app_id}")
+    return d.to_dict()
+
+
+@app.put("/api/test-diffs/{app_id}")
+def put_test_diff(app_id: str, body: dict,
+                  authorization: Optional[str] = Header(None)):
+    """Executor pushes a TestDiff (F11). Bearer auth. Drives the
+    test_regression cutover gate (regressions > 0 blocks finalize)."""
+    _check_executor_auth(authorization)
+    body["app_id"] = app_id
+    try:
+        d = TestDiff.from_dict(body)
+    except Exception as e:
+        raise HTTPException(400, f"invalid TestDiff: {e!r}")
+    STORE.upsert_test_diff(d)
+    return {"app_id": app_id, "regressions": d.regressions, "updated": True}
+
+
+class TestGenReqAPI(BaseModel):
+    app_id: str
+    context: Dict[str, Any] = {}
+
+
+@app.post("/api/test-gen")
+def test_gen_trigger(req: TestGenReqAPI):
+    """Ask the executor to generate test cases (F11). The executor pushes the
+    cases back to PUT /api/test-cases/{app_id}."""
+    if not _executor_settings().executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(_executor_settings())
+    if not ec.configured:
+        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    try:
+        return ec.test_gen(req.app_id, req.context)
+    except ExecutorError as e:
+        raise HTTPException(502, f"executor error: {e}")
+
+
+class TestRunReqAPI(BaseModel):
+    app_id: str
+    phase: str
+    target: str
+    context: Dict[str, Any] = {}
+
+
+@app.post("/api/test-run")
+def test_run_trigger(req: TestRunReqAPI):
+    """Ask the executor to run the app's tests against a target (F11). phase =
+    pre (baseline) / post (after cutover). The executor pushes a TestRun back to
+    PUT /api/test-runs/{run_id}."""
+    if not _executor_settings().executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(_executor_settings())
+    if not ec.configured:
+        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    if req.phase not in TEST_PHASES:
+        raise HTTPException(400, f"phase must be one of {TEST_PHASES}")
+    from ..core.models import _new_id
+    run_id = _new_id("trun")
+    try:
+        return ec.test_run(req.app_id, req.phase, req.target, req.context)
+    except ExecutorError as e:
+        raise HTTPException(502, f"executor error: {e}")
+
+
+class TestCompareReqAPI(BaseModel):
+    app_id: str
+    pre_run_id: str
+    post_run_id: str
+
+
+@app.post("/api/test-compare")
+def test_compare_trigger(req: TestCompareReqAPI):
+    """Ask the executor to diff pre vs post (F11). The executor pushes a
+    TestDiff back to PUT /api/test-diffs/{app_id}; the test_regression gate
+    then blocks finalize on regressions."""
+    if not _executor_settings().executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(_executor_settings())
+    if not ec.configured:
+        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    try:
+        return ec.test_compare(req.app_id, req.pre_run_id, req.post_run_id)
+    except ExecutorError as e:
+        raise HTTPException(502, f"executor error: {e}")
+
+
 @app.get("/api/change-jobs")
 def list_change_jobs():
     return STORE.list_change_jobs()
@@ -985,14 +1643,26 @@ def executor_trigger(req: ExecutorScanReq):
             # before the executor writes the inferred scaffold. In plan mode the
             # scaffold is previewed freely; in execute mode the confirm-gate fires
             # (a Question is raised; the operator answers, then re-triggers).
-            from ..core.codeintel import is_runtime_derived, runtime_confirm_question
+            from ..core.codeintel import is_runtime_derived, runtime_confirm_question, SOURCE_RUNTIME
             if is_runtime_derived(profile) and req.mode == "execute":
-                q = runtime_confirm_question(req.app_id, profile)
-                if q is not None:
-                    STORE.upsert_question(q)
-                    raise HTTPException(409, f"runtime-derived scaffold requires "
-                                               f"operator confirmation (question {q.id}); "
-                                               f"answer it then re-trigger modify")
+                # The confirm-gate is a one-shot: once the operator has answered
+                # "confirmed — proceed with modify" we must NOT raise 409 again
+                # (otherwise every re-trigger mints a new question and the
+                # operator can never reach ec.modify()).
+                already_confirmed = any(
+                    q.app_id == req.app_id
+                    and (q.context or {}).get("source") == SOURCE_RUNTIME
+                    and q.status == "answered"
+                    and str(q.answer or "").lower().startswith("confirmed")
+                    for q in STORE.list_questions(app_id=req.app_id)
+                )
+                if not already_confirmed:
+                    q = runtime_confirm_question(req.app_id, profile)
+                    if q is not None:
+                        STORE.upsert_question(q)
+                        raise HTTPException(409, f"runtime-derived scaffold requires "
+                                                   f"operator confirmation (question {q.id}); "
+                                                   f"answer it then re-trigger modify")
             spec = build_change_spec(profile, scope=req.scope,
                                      overrides=req.overrides)
             res = ec.modify(req.app_id, req.repo_url, req.branch,
@@ -1014,7 +1684,8 @@ def executor_trigger(req: ExecutorScanReq):
 class DBScanReq(BaseModel):
     db_server_id: str          # stable DB host identity (hostname)
     source_engine: str = ""    # oracle / sqlserver / mysql
-    target_engine: str = ""   # tdsql / cdb_mysql
+    target_engine: str = ""   # tdsql / cdb_mysql / postgresql
+    mode: Literal["assess", "convert"] = "assess"   # F6 — convert also emits DDL + report
 
 
 @app.post("/api/db-scan")
@@ -1031,7 +1702,8 @@ def db_scan_trigger(req: DBScanReq):
     if not ec.configured:
         raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
     try:
-        return ec.db_scan(req.db_server_id, req.source_engine, req.target_engine)
+        return ec.db_scan(req.db_server_id, req.source_engine, req.target_engine,
+                          mode=req.mode)
     except ExecutorError as e:
         raise HTTPException(502, f"executor error: {e}")
 
@@ -1177,7 +1849,7 @@ def rebuild_derived(req: RebuildReq):
 # REST: LLM
 # ---------------------------------------------------------------------------
 @app.post("/api/ask")
-async def ask(req: AskReq):
+def ask(req: AskReq):
     """Grounded estate Q&A: classify the question -> run a deterministic estate
     query -> narrate. The graph/aggregate answer is computed by the engine
     (no hallucination); the LLM only classifies + narrates. Falls back to the
@@ -1207,7 +1879,7 @@ def explain(req: ExplainReq):
     m = STORE.get_match(req.server_id)
     if not m:
         raise HTTPException(404, "no match for server")
-    return {"server_id": req.server_id, "explanation": LLM.explain_match(s, m),
+    return {"server_id": req.server_id, "explanation": LLM.explain_match(s, m, _first_code_profile(s)),
             "rule_rationale": m.rationale}
 
 
@@ -1219,7 +1891,7 @@ def right_size(req: ExplainReq):
     m = STORE.get_match(req.server_id)
     if not m:
         raise HTTPException(404, "no match for server")
-    return {"server_id": req.server_id, "advice": LLM.right_size(s, m)}
+    return {"server_id": req.server_id, "advice": LLM.right_size(s, m, _first_code_profile(s))}
 
 
 @app.post("/api/wave/assess")
@@ -1258,11 +1930,7 @@ def match_audit(req: ExplainReq):
     m = STORE.get_match(req.server_id)
     if not m:
         raise HTTPException(404, "no match for server")
-    prof = None
-    if s.app_ids:
-        pmap = {p.app_id: p for p in STORE.list_code_profiles()}
-        prof = next((pmap[a] for a in s.app_ids if a in pmap), None)
-    res = LLM.audit_match(s, m, prof)
+    res = LLM.audit_match(s, m, _first_code_profile(s))
     res["server_id"] = req.server_id
     res["rule_target"] = {"product": m.target.product, "spec": m.target.spec,
                           "confidence": m.confidence}
@@ -1433,13 +2101,56 @@ def business_case(req: BusinessCaseReq):
     return payload
 
 
+def _business_case_stale(payload: Dict[str, Any]) -> bool:
+    """True when a saved business-case snapshot no longer describes the current
+    estate, so serving it would show data from a *previous* estate (e.g. the
+    old demo/scale fixture's ``db-``/``app-``/``web-`` hosts after the real
+    ``inventory_draft`` was loaded, or any snapshot left over from before a
+    Rebuild). A snapshot's ``per_server`` list carries one row per matched
+    server, so its length is the matched-server count at save time; compare it
+    to the live ``matches`` count. A mismatch means the estate changed
+    underneath the snapshot and it must be recomputed before display."""
+    if not isinstance(payload, dict):
+        return True
+    # one per_server row per matched server -> its length is the matched-server
+    # count at save time; the live matches count is its current counterpart.
+    snap_n = len(payload.get("per_server") or [])
+    live_n = int(STORE.stats().get("matches") or 0)
+    if snap_n != live_n:
+        return True
+    # priced+unpriced is the same matched-server count, tallied at save time;
+    # double-check it as a guard against a hand-edited/corrupt payload.
+    tally = int(payload.get("priced_servers") or 0) + int(payload.get("unpriced_servers") or 0)
+    if tally and tally != live_n:
+        return True
+    return False
+
+
 @app.get("/api/business-case")
 def latest_business_case():
-    """Return the most recently saved business-case snapshot, or 404."""
+    """Return the most recently saved business-case snapshot, or 404.
+
+    A snapshot is immutable, so once the estate changes (new inventory load /
+    Rebuild) it goes stale and would display a *previous* estate's per-server
+    list. Detect that by comparing the snapshot's matched-server count to the
+    live ``matches`` count and, when stale, recompute from the current estate
+    in place (without persisting — the Refresh button saves a fresh snapshot).
+    This keeps the UI from ever serving a stale demo-fixture snapshot."""
     snaps = STORE.list_business_cases(limit=1)
     if not snaps:
         raise HTTPException(404, "no saved business case; POST /api/business-case first")
     snap = STORE.get_business_case(snaps[0]["id"])
+    payload = snap["payload"]
+    if _business_case_stale(payload):
+        from ..core.cost import estimate_portfolio, load_pricebook
+        servers, matches, strategies = _portfolio_inputs()
+        book = load_pricebook(settings)
+        payload = estimate_portfolio(servers, matches, book, strategies=strategies)
+        # keep the saved snapshot's id for reference, and flag that this response
+        # was recomputed live (not a saved snapshot) so the UI can hint a save.
+        payload["snapshot_id"] = snap["id"]
+        payload["recomputed"] = True
+        snap = {"id": snap["id"], "created_at": snap["created_at"], "payload": payload}
     return snap
 
 
@@ -1624,7 +2335,7 @@ def validate_migration_job(job_id: str):
     j = STORE.get_migration_job(job_id)
     if not j:
         raise HTTPException(404, "no such migration job")
-    ok, _ = run_validation_gates(j, settings)
+    ok, _ = run_validation_gates(j, settings, store=STORE)
     STORE.upsert_migration_job(j)
     return {"job_id": job_id, "all_must_pass_ok": ok, "gates": j.validation_gates}
 
@@ -1697,20 +2408,51 @@ def wave_handoff_csv(wave_id: str):
 @app.get("/api/lz/archetypes")
 def lz_archetypes():
     """The LZ archetype blueprints (corp/online/dmz → Tencent VPC/CAM/SG/tag
-    policy) + per-server classification over the current estate (F8)."""
-    from ..core.lz import LZ_ARCHETYPES, LZ_BLUEPRINTS, archetypes_for_servers
+    policy) + per-server classification over the current estate (F8).
+
+    The archetype SET + blueprints come from the active LZ design — the
+    operator's authored design if one is active, else the built-in
+    ``LZ_BLUEPRINTS`` default. The web forwards ``archetypes[<arch>]`` as the
+    ``context`` to ``POST /api/iac-emit``, so emitting IaC for an archetype
+    always uses the active design's blueprint (Phase A)."""
+    from ..core.lz import (active_lz_archetypes, archetypes_for_servers,
+                           resolve_all_archetype_blueprints, get_active_lz_design,
+                           active_classifier)
     servers = STORE.list_all_servers()
     matches = STORE.list_matches()
-    cls = archetypes_for_servers(servers, matches)
-    counts = {a: 0 for a in LZ_ARCHETYPES}
+    archetypes = active_lz_archetypes(STORE)
+    blueprints = resolve_all_archetype_blueprints(STORE)
+    classifier = active_classifier(STORE)
+    cls = archetypes_for_servers(servers, matches, classifier)
+    # the active network design's placements (keyed by stable identity_key) so
+    # the per-server rows can carry their VPC/subnet/IP without the UI having to
+    # join by hostname (which would miss fqdn-only servers — identity_key is
+    # fqdn-or-hostname).
+    nd = STORE.get_active_network_design()
+    placements = (nd.placements or {}) if nd else {}
+    arch_overrides = (nd.archetype_overrides or {}) if nd else {}
+    counts = {a: 0 for a in archetypes}
     per_server = []
     for s in servers:
-        a = cls.get(s.id, "corp")
+        key = s.identity_key or f"id:{s.id}"
+        # a VPC pin (archetype override) reclassifies the server for placement —
+        # overlay it here so the Estate classification archetype column agrees
+        # with the VPC column (which comes from the placement below).
+        a = arch_overrides.get(key) or cls.get(s.id, archetypes[0] if archetypes else "corp")
         counts[a] = counts.get(a, 0) + 1
         per_server.append({"server_id": s.id, "hostname": s.hostname,
-                           "role": s.role, "archetype": a})
-    return {"archetypes": {a: LZ_BLUEPRINTS[a] for a in LZ_ARCHETYPES},
-            "counts": counts, "per_server": per_server}
+                           "identity_key": key, "role": s.role, "archetype": a,
+                           "app_ids": list(s.app_ids or []),
+                           "placement": placements.get(key)})
+    design = get_active_lz_design(STORE)
+    return {"archetypes": {a: blueprints[a] for a in archetypes},
+            "counts": counts, "per_server": per_server,
+            "design": {"design_id": design.design_id, "name": design.name,
+                       "is_active": design.is_active,
+                       "is_builtin": design.design_id.startswith("builtin"),
+                       "onprem_cidrs": design.onprem_cidrs,
+                       "has_classifier": classifier is not None},
+            "network_active": nd is not None}
 
 
 @app.get("/api/lz/readiness")
@@ -1732,12 +2474,14 @@ class LZStatusReq(BaseModel):
 @app.post("/api/lz/{archetype}/status")
 def set_lz_status(archetype: str, req: LZStatusReq):
     """Mark an LZ archetype's lifecycle status (F8). ``finalized`` unblocks
-    workload waves targeting that archetype (the placement gate)."""
-    from ..core.lz import LZ_STATUSES
+    workload waves targeting that archetype (the placement gate). The
+    archetype must exist in the active LZ design (built-in corp/online/dmz or
+    an operator-authored design's archetype set)."""
+    from ..core.lz import LZ_STATUSES, active_lz_archetypes
     if req.status not in LZ_STATUSES:
         raise HTTPException(400, f"status must be one of {LZ_STATUSES}")
-    if archetype not in ("corp", "online", "dmz"):
-        raise HTTPException(400, "archetype must be corp / online / dmz")
+    if archetype not in active_lz_archetypes(STORE):
+        raise HTTPException(400, f"archetype {archetype!r} not in the active LZ design")
     STORE.set_lz_status(archetype, req.status, updated_by=req.by)
     return {"archetype": archetype, "status": req.status, "updated": True}
 
@@ -1750,6 +2494,484 @@ def wave_lz_gate(wave_id: str):
     servers = STORE.list_all_servers()
     matches = STORE.list_matches()
     return check_lz_gate(STORE, wave_id, servers, matches)
+
+
+# ---------------------------------------------------------------------------
+# F8 (Phase A) — operator-authored LZ designs (LLM-driven LZ design foundation)
+# ---------------------------------------------------------------------------
+@app.get("/api/lz/designs")
+def lz_designs_list():
+    """List all LZ designs (summary) + which one is active. Phase A lets an
+    operator persist + activate a hand-authored design; Phase B adds the LLM
+    interview that PRODUCES the design. The active design drives
+    /api/lz/archetypes, lz_context, iac-emit, lz_readiness, check_lz_gate."""
+    from ..core.lz import get_active_lz_design
+    out = []
+    active = get_active_lz_design(STORE)
+    for d in STORE.list_lz_designs():
+        out.append({"design_id": d.design_id, "name": d.name,
+                    "summary": d.summary or "",
+                    "is_active": d.is_active,
+                    "archetype_count": len(d.archetypes or {}),
+                    "archetypes": list((d.archetypes or {}).keys()),
+                    "scale": d.scale or "",
+                    "updated_at": d.updated_at, "updated_by": d.updated_by})
+    return {"designs": out, "active": {"design_id": active.design_id,
+            "name": active.name, "is_builtin": active.design_id.startswith("builtin"),
+            "scale": getattr(active, "scale", "") or ""}}
+
+
+@app.get("/api/lz/designs/{design_id}")
+def lz_designs_get(design_id: str):
+    d = STORE.get_lz_design(design_id)
+    if not d:
+        raise HTTPException(404, "design not found")
+    return d.to_dict()
+
+
+@app.post("/api/lz/designs")
+def lz_designs_create(body: dict):
+    """Create (or update if ``design_id`` present) an LZ design. Validates the
+    blueprint deterministically (CIDR non-overlap, peering symmetry, required
+    keys) — a design that fails validation is rejected with 422 + the error
+    list so the LLM (Phase B) or the operator can fix it. Does NOT activate;
+    call /api/lz/designs/{id}/activate to make it drive the gate."""
+    from ..core.lz import validate_lz_design
+    from ..core.models import LZDesign, _new_id, _now
+    design_id = (body.get("design_id") or "").strip() or _new_id("lzd")
+    d = LZDesign(
+        design_id=design_id,
+        name=str(body.get("name") or "").strip() or f"design-{design_id[-4:]}",
+        summary=str(body.get("summary") or "").strip()[:500],
+        archetypes=body.get("archetypes") or {},
+        requirements=body.get("requirements") or {},
+        conversation=body.get("conversation") or [],
+        onprem_cidrs=body.get("onprem_cidrs") or [],
+        is_active=False,
+        scale=str(body.get("scale") or ""),
+        created_at=(STORE.get_lz_design(design_id) or LZDesign()).created_at or _now(),
+        updated_at=_now(),
+        updated_by=str(body.get("updated_by") or "operator"),
+    )
+    v = validate_lz_design(d)
+    if not v["ok"]:
+        raise HTTPException(422, f"invalid LZ design: {'; '.join(v['errors'])}")
+    STORE.upsert_lz_design(d)
+    return {"design_id": d.design_id, "name": d.name, "valid": True,
+            "is_active": False, "archetypes": list(d.archetypes.keys())}
+
+
+@app.post("/api/lz/designs/{design_id}/activate")
+def lz_designs_activate(design_id: str, body: Optional[dict] = None):
+    """Make ``design_id`` the sole active LZ design (atomic single-active
+    invariant). The design must already exist + pass validation."""
+    from ..core.lz import validate_lz_design
+    d = STORE.get_lz_design(design_id)
+    if not d:
+        raise HTTPException(404, "design not found")
+    v = validate_lz_design(d)
+    if not v["ok"]:
+        raise HTTPException(422, f"cannot activate invalid design: {'; '.join(v['errors'])}")
+    by = str((body or {}).get("by") or "operator")
+    STORE.set_active_lz_design(design_id, updated_by=by)
+    return {"design_id": design_id, "is_active": True, "updated": True}
+
+
+@app.delete("/api/lz/designs/{design_id}")
+def lz_designs_delete(design_id: str):
+    d = STORE.get_lz_design(design_id)
+    if not d:
+        raise HTTPException(404, "design not found")
+    if d.is_active:
+        raise HTTPException(409, "deactivate the design before deleting (or "
+                            "activate another); an active design can't be deleted")
+    STORE.delete_lz_design(design_id)
+    return {"design_id": design_id, "deleted": True}
+
+
+class LZInterviewReq(BaseModel):
+    demand: str
+    onprem_cidrs: Optional[List[str]] = None
+    design_id: Optional[str] = None      # continue an existing design's interview
+    conversation: Optional[List[Dict[str, str]]] = None  # or pass turns inline
+    scale: Optional[str] = None          # small/medium/large override (else inferred)
+    by: str = "operator"
+
+
+@app.get("/api/lz/scale-tiers")
+def lz_scale_tiers():
+    """The 3 LZ scale tiers (small/medium/large) with their default-strategy
+    comparison matrix (account/networking/security/audit/budgeting/identity +
+    topology + archetype count) and the cross-scale ``LZ_GOLDEN_RULES``. The UI
+    renders this as the comparison matrix + the golden-rule banner; the operator
+    picks a tier (or accepts the inferred one) and the rest is default strategy,
+    while the user-modifiable parts flow through the AI prompt interview."""
+    from ..core.lz import LZ_SCALE_TIERS, LZ_SCALE_TIERS_ORDER, LZ_GOLDEN_RULES
+    return {"tiers": [LZ_SCALE_TIERS[s] for s in LZ_SCALE_TIERS_ORDER],
+            "order": list(LZ_SCALE_TIERS_ORDER),
+            "golden_rules": LZ_GOLDEN_RULES}
+
+
+@app.get("/api/lz/scale")
+def lz_scale_inferred():
+    """The scale tier inferred from the live estate (``lz.scale_for``) — what
+    the UI defaults the scale picker to. Returns the full estate sizing metrics
+    (servers, apps, total vCPU cores, total memory GB, baremetal count, regulated
+    flag, by-env distribution) so the operator can compare their real estate
+    against the tier's ``estate_size`` bands and sanity-check the inference."""
+    from ..core.lz import scale_for, estate_scale_metrics, LZ_SCALE_TIERS
+    servers = STORE.list_all_servers()
+    m = estate_scale_metrics(servers)
+    tier = scale_for(servers, metrics=m)
+    return {"scale": tier, "label": LZ_SCALE_TIERS[tier]["label"],
+            "signals": m,
+            "bands": LZ_SCALE_TIERS[tier]["estate_size"]}
+
+
+@app.post("/api/lz/design/interview")
+def lz_design_interview(req: LZInterviewReq):
+    """LLM LZ design interview (Phase B). Drives ``LLMClient.design_lz`` — the
+    LLM proposes a blueprint dict and the deterministic ``validate_lz_design``
+    loops it until sound (CIDR non-overlap, symmetric peering, required keys).
+    ``scale`` (small/medium/large) sets the default strategy the LLM honors
+    (inferred from the estate when unset); the operator's ``demand`` customizes
+    the user-modifiable parts (app placement, CIDRs, names, compliance tiers).
+    Returns the proposed design (NOT persisted) + the validation + the
+    conversation; the UI previews it, then POSTs it to /api/lz/designs to persist
+    and /api/lz/designs/{id}/activate to make it drive the gate. Pass
+    ``design_id`` to continue an existing design's interview (iterate): its
+    stored conversation + onprem_cidrs are loaded as the prior turns."""
+    demand = (req.demand or "").strip()
+    if not demand:
+        raise HTTPException(400, "demand is required")
+    servers = STORE.list_all_servers()
+    matches = STORE.list_matches()
+    conv = list(req.conversation or [])
+    onprem = list(req.onprem_cidrs or [])
+    scale = (req.scale or "").strip() or None
+    if req.design_id:
+        d = STORE.get_lz_design(req.design_id)
+        if d is None:
+            raise HTTPException(404, "design not found")
+        if not conv:
+            conv = list(d.conversation or [])
+        if not onprem:
+            onprem = list(d.onprem_cidrs or [])
+        # continue at the stored design's scale unless the operator re-pinned
+        if not scale and d.scale:
+            scale = d.scale
+    res = LLM.design_lz(demand, servers, matches, onprem_cidrs=onprem,
+                       conversation=conv, scale=scale)
+    design = res.get("design")
+    if design is not None and req.design_id:
+        # keep the same row when iterating so the UI upserts into it
+        design.design_id = req.design_id
+    return {
+        "ok": res["ok"],
+        "error": res.get("error") or "",
+        "rounds": res.get("rounds") or [],
+        "validation": res.get("validation"),
+        "design": design.to_dict() if design is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F8 (Phase B+) — network designer: VPC + subnets per account + placement
+# ---------------------------------------------------------------------------
+class NetworkDesignReq(BaseModel):
+    demand: Optional[str] = None        # if set, ask MigraQ to propose the policy
+    policy: Optional[Dict[str, Any]] = None   # explicit policy (else default)
+    design_id: Optional[str] = None     # upsert into this row when activating
+    activate: bool = False              # persist + make active
+    by: str = "operator"
+
+
+@app.post("/api/lz/network/design")
+def network_design(req: NetworkDesignReq):
+    """Run the network designer: carve the active LZ design's per-archetype VPCs
+    into subnets (one per tier) and place every server into a VPC + subnet + IP.
+    With ``demand``, MigraQ proposes the carving policy (LLM propose→validate→
+    loop); without it the deterministic ``default_network_policy`` is used.
+    Returns the built design + validation. When ``activate`` is set the design is
+    persisted (upsert into ``design_id`` or a new row) and made the active one;
+    otherwise it's an ephemeral preview (placement overrides need an active
+    design — call with activate first)."""
+    from ..core.lz import get_active_lz_design
+    from ..core.network import build_network_design, default_network_policy
+    from ..core.models import _new_id
+    lz = get_active_lz_design(STORE)
+    servers = STORE.list_all_servers()
+    matches = STORE.list_matches()
+    policy = req.policy
+    rounds = []
+    if req.demand and req.demand.strip():
+        pres = LLM.design_network_policy(req.demand.strip(), servers, lz, matches)
+        rounds = pres.get("rounds") or []
+        if pres["ok"]:
+            policy = pres["policy"]            # use the LLM's validated policy
+        else:
+            # the LLM failed to produce a valid policy — fall back to the
+            # deterministic default instead of building with the invalid
+            # last-attempted policy (which would yield empty subnets / a broken
+            # design). The rounds are still returned so the UI shows why.
+            policy = default_network_policy()
+    design_id = req.design_id or _new_id("nd")
+    existing = STORE.get_network_design(design_id) if req.design_id else None
+    nd = build_network_design(lz, servers, matches, policy=policy,
+                              design_id=design_id,
+                              name=(existing.name if existing else "network design"))
+    if req.activate:
+        nd.updated_by = req.by
+        STORE.upsert_network_design(nd)
+        STORE.set_active_network_design(nd.design_id, updated_by=req.by)
+    return {"ok": nd.validation.get("ok", False),
+            "validation": nd.validation, "rounds": rounds,
+            "design": nd.to_dict(), "active": req.activate}
+
+
+class DistributeReq(BaseModel):
+    demand: str
+    scale: Optional[str] = None
+    onprem_cidrs: Optional[List[str]] = None
+    activate: bool = True
+    by: str = "operator"
+
+
+@app.post("/api/lz/distribute")
+def lz_distribute(req: DistributeReq):
+    """One combined prompt → distribute machines + DBs into VPCs AND subnets in a
+    single action. Chains the two LLM steps the LZ tab otherwise runs separately:
+
+      1. LZ design (``LLMClient.design_lz``) — the VPC/ACCOUNT assignment: which
+         apps/roles land in which archetype (each a VPC + account), via
+         ``requirements.classifier`` (app_map/role_map). Activated so it drives
+         the gate and is the basis for step 2.
+      2. Network designer (``design_network_policy`` + ``build_network_design``)
+         — the SUBNET carving inside each VPC: tier_order + tiers (role→tier
+         subnet), built ON TOP of the just-active LZ design (which owns account
+         naming — each archetype IS one account). Activated so placements drive
+         the Estate classification + topology.
+
+    The SAME ``demand`` is sent to both LLM calls — each extracts the part its
+    schema owns (LZ pulls app_map/role_map/archetypes + account naming; network
+    pulls tier_order/tiers). ``scale`` sets the LZ default strategy.
+    ``activate=False`` = preview (neither design persisted). Returns both
+    designs + validation + whether each was activated.
+    """
+    from ..core.lz import get_active_lz_design
+    from ..core.network import build_network_design, default_network_policy
+    from ..core.models import _new_id, _now
+    demand = (req.demand or "").strip()
+    if not demand:
+        raise HTTPException(400, "demand is required")
+    servers = STORE.list_all_servers()
+    matches = STORE.list_matches()
+    onprem = list(req.onprem_cidrs or [])
+    scale = (req.scale or "").strip() or None
+
+    # Step 1 — LZ design (VPC/account assignment via the classifier).
+    lz_res = LLM.design_lz(demand, servers, matches, onprem_cidrs=onprem, scale=scale)
+    lz_design = lz_res.get("design")
+    lz_activated = False
+    if (req.activate and lz_res["ok"] and lz_design and lz_design.archetypes
+            and not lz_design.design_id.startswith("builtin")):
+        lz_design.updated_by = req.by
+        lz_design.updated_at = _now()
+        STORE.upsert_lz_design(lz_design)
+        STORE.set_active_lz_design(lz_design.design_id, updated_by=req.by)
+        lz_activated = True
+
+    # The active LZ step 2 builds on: the just-activated one, else the
+    # pre-existing active, else the built-in default (step 2 still runs).
+    active_lz = lz_design if lz_activated else get_active_lz_design(STORE)
+
+    # Step 2 — network designer (subnet carving within each VPC). Same demand.
+    net_res = LLM.design_network_policy(demand, servers, active_lz, matches)
+    net_policy = (net_res.get("policy") if net_res["ok"]
+                  else default_network_policy())
+    nd = build_network_design(active_lz, servers, matches, policy=net_policy,
+                              design_id=_new_id("nd"), name="distributed network")
+    net_activated = False
+    if req.activate and (nd.validation or {}).get("ok"):
+        nd.updated_by = req.by
+        STORE.upsert_network_design(nd)
+        STORE.set_active_network_design(nd.design_id, updated_by=req.by)
+        net_activated = True
+
+    return {
+        "lz": {"ok": lz_res["ok"], "error": lz_res.get("error") or "",
+               "validation": lz_res.get("validation"),
+               "rounds": lz_res.get("rounds") or [],
+               "activated": lz_activated,
+               "design": lz_design.to_dict() if lz_design else None},
+        "network": {"ok": (nd.validation or {}).get("ok", False),
+                    "error": net_res.get("error") or "",
+                    "validation": nd.validation,
+                    "rounds": net_res.get("rounds") or [],
+                    "activated": net_activated,
+                    "design": nd.to_dict()},
+        "active_lz_archetypes": list((active_lz.archetypes or {}).keys()),
+    }
+
+
+@app.get("/api/lz/network/design")
+def network_design_active():
+    """The active network design (or null when none). Drives the topology +
+    placement preview in the web panel."""
+    nd = STORE.get_active_network_design()
+    return {"active": nd.to_dict() if nd else None}
+
+
+@app.get("/api/lz/network/designs")
+def network_designs_list():
+    out = []
+    for nd in STORE.list_network_designs():
+        out.append({"design_id": nd.design_id, "name": nd.name,
+                    "summary": nd.summary or "",
+                    "is_active": nd.is_active,
+                    "vpc_count": len(nd.vpcs or []),
+                    "placement_count": len(nd.placements or {}),
+                    "valid": (nd.validation or {}).get("ok", False),
+                    "updated_at": nd.updated_at})
+    active = STORE.get_active_network_design()
+    return {"designs": out, "active": {"design_id": active.design_id,
+            "name": active.name} if active else None}
+
+
+@app.post("/api/lz/network/designs/{design_id}/activate")
+def network_design_activate(design_id: str, body: Optional[dict] = None):
+    nd = STORE.get_network_design(design_id)
+    if not nd:
+        raise HTTPException(404, "network design not found")
+    if not (nd.validation or {}).get("ok"):
+        raise HTTPException(422, "cannot activate an invalid network design: "
+                            + "; ".join((nd.validation or {}).get("errors", [])))
+    by = str((body or {}).get("by") or "operator")
+    STORE.set_active_network_design(design_id, updated_by=by)
+    return {"design_id": design_id, "is_active": True, "updated": True}
+
+
+@app.delete("/api/lz/network/designs/{design_id}")
+def network_design_delete(design_id: str):
+    nd = STORE.get_network_design(design_id)
+    if not nd:
+        raise HTTPException(404, "network design not found")
+    if nd.is_active:
+        raise HTTPException(409, "deactivate the design before deleting")
+    STORE.delete_network_design(design_id)
+    return {"design_id": design_id, "deleted": True}
+
+
+class NetworkPlacementReq(BaseModel):
+    hostname: str                        # stable identity (lowercased)
+    subnet: str = ""                     # target subnet name; "" = clear override
+    archetype: str = ""                  # target VPC's archetype; "" = clear override
+    account: str = ""                    # target account; "" = clear override
+    by: str = "operator"
+
+
+@app.post("/api/lz/network/placement")
+def network_placement_override(req: NetworkPlacementReq):
+    """Move one server to a different subnet within its VPC (operator pin,
+    survives regenerate) and/or to a different VPC (an archetype pin — VPC is
+    1:1 with archetype) and/or to a different account (an account pin — account
+    is otherwise derived 1:1 from the archetype, so this reattributes the
+    server WITHOUT moving its VPC). Requires an active network design. Re-runs
+    the deterministic placement with the updated overrides and persists,
+    returning the server's new placement + the design's validation.
+
+    VPC change: ``archetype`` names one of the active design's archetypes (each
+    is one VPC). Changing VPC clears any stale subnet pin (subnet names differ
+    across VPCs) unless ``subnet`` also names a subnet valid in the NEW VPC.
+    Account change: ``account`` names one of the accounts already in the design
+    (the union of ``accounts.values()`` / ``vpcs[*].account``). It is independent
+    of the VPC — the server keeps its VPC/subnet/IP and only its account
+    attribution changes. Send ``account=""`` (and no other field) to revert to the
+    VPC's account."""
+    from ..core.network import build_network_design
+    nd = STORE.get_active_network_design()
+    if not nd:
+        raise HTTPException(409, "no active network design — generate + apply one first")
+    host = (req.hostname or "").strip().lower()
+    if not host:
+        raise HTTPException(400, "hostname is required")
+    servers = STORE.list_all_servers()
+    srv = next((s for s in servers if s.identity_key == host), None)
+    if srv is None:
+        raise HTTPException(404, f"no server with hostname {host!r}")
+    from ..core.lz import _classifier_from_design, archetype_for, get_active_lz_design
+    lz = get_active_lz_design(STORE)
+    clf = _classifier_from_design(lz)
+    base_arch = archetype_for(srv, None, clf)
+    vpc_by_arch = {v.get("archetype"): v for v in (nd.vpcs or [])}
+    # resolve the EFFECTIVE archetype: a VPC pin overrides the classifier result;
+    # without one the classifier decides. This is the archetype whose VPC the
+    # subnet pin (if any) must belong to.
+    arch_overrides = dict(nd.archetype_overrides or {})
+    if req.archetype:
+        # VPC change — validate the target archetype has a VPC in this design.
+        if req.archetype not in vpc_by_arch:
+            raise HTTPException(400, f"archetype {req.archetype!r} has no VPC in the "
+                                f"active design (have {sorted(vpc_by_arch)})")
+        arch_overrides[host] = req.archetype
+        arch = req.archetype
+    elif host in arch_overrides:
+        arch = arch_overrides[host]     # keep the existing VPC pin
+    else:
+        arch = base_arch
+    vpc = vpc_by_arch.get(arch)
+    if not vpc:
+        raise HTTPException(400, f"server {host!r} archetype {arch!r} has no VPC")
+    sn_names = {s.get("name") for s in (vpc.get("subnets") or [])}
+    # the set of accounts already in the design (the legal target set for an
+    # account pin). account is otherwise derived 1:1 from the archetype, so an
+    # account pin reattributes the server to a different existing account.
+    known_accounts = sorted({a for a in (nd.accounts or {}).values()}
+                            | {v.get("account") for v in (nd.vpcs or [])
+                               if v.get("account")})
+    account_overrides = dict(nd.account_overrides or {})
+    if req.account:
+        if req.account not in known_accounts:
+            raise HTTPException(400, f"account {req.account!r} not in the active "
+                                f"design (have {known_accounts})")
+        account_overrides[host] = req.account
+    elif not req.archetype and not req.subnet:
+        # no VPC/subnet change and no account given → clear the account pin only
+        account_overrides.pop(host, None)
+    overrides = dict(nd.overrides or {})
+    # a VPC change invalidates any prior subnet pin (different VPC = different
+    # subnet names) — drop it so the server lands in its tier subnet in the new
+    # VPC, unless the operator also named a subnet valid in the new VPC.
+    if req.archetype and req.subnet and req.subnet not in sn_names:
+        raise HTTPException(400, f"subnet {req.subnet!r} not in {arch} VPC "
+                            f"(have {sorted(sn_names)})")
+    if req.archetype and not req.subnet:
+        overrides.pop(host, None)
+    if req.subnet:
+        if req.subnet not in sn_names:
+            raise HTTPException(400, f"subnet {req.subnet!r} not in {arch} VPC "
+                                f"(have {sorted(sn_names)})")
+        overrides[host] = req.subnet
+    elif not req.archetype:
+        # no VPC change and no subnet given → clear the subnet pin only
+        overrides.pop(host, None)
+    # clear the VPC pin when the operator sends an empty archetype (revert to the
+    # classifier's archetype) and didn't also name a subnet
+    if not req.archetype and not req.subnet:
+        arch_overrides.pop(host, None)
+    rebuilt = build_network_design(lz, servers, STORE.list_matches(),
+                                    policy=nd.policy or {}, overrides=overrides,
+                                    archetype_overrides=arch_overrides,
+                                    account_overrides=account_overrides,
+                                    design_id=nd.design_id, name=nd.name)
+    # preserve the row's active flag + created_at (build defaults is_active=False /
+    # created_at=now, which would deactivate the row on upsert otherwise)
+    rebuilt.is_active = nd.is_active
+    rebuilt.created_at = nd.created_at
+    rebuilt.updated_by = req.by
+    STORE.upsert_network_design(rebuilt)
+    return {"hostname": host, "placement": rebuilt.placements.get(host, {}),
+            "validation": rebuilt.validation, "active": True}
 
 
 # ---------------------------------------------------------------------------

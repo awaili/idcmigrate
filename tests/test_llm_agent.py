@@ -7,8 +7,8 @@ import pytest
 
 from idc.config import reset_settings, Settings
 from idc.core.match import match_server
-from idc.core.models import Server, Utilization, Match, Target, Wave
-from idc.llm.client import LLMClient, UNAVAILABLE
+from idc.core.models import Server, Utilization, Match, Target, Wave, Disk, CodeProfile
+from idc.llm.client import LLMClient, UNAVAILABLE, _server_brief, _code_profile_brief
 from idc.agent import claude_runner
 from idc.agent.claude_runner import AgentEvent, run_agent, build_context
 
@@ -20,6 +20,59 @@ def _mk_server():
     return Server(hostname="db-mysql-01", role="db", os="centos", cpu_cores=8,
                   mem_gb=32, business_criticality="high",
                   utilization=Utilization(cpu_p95=61.0, mem_p95=83.0, disk_used_pct=66.0))
+
+
+def _mk_oracle_server():
+    """A host whose disk + mount layout signals Oracle DB (OFA: oradata/redolog)
+    + an EOL OS + warranty bucket — the context the drawer's LLM actions must see."""
+    return Server(hostname="ora-prod-01", role="db", os="centos", cpu_cores=16,
+                  mem_gb=128, business_criticality="high",
+                  disks=[Disk(name="/", fs="/", size_gb=50),
+                         Disk(name="/opt/app/oracle", fs="/opt/app/oracle", size_gb=20),
+                         Disk(name="/oradata1", fs="/oradata1", size_gb=800),
+                         Disk(name="/redolog_A", fs="/redolog_A", size_gb=100)],
+                  tags=["oracle-db"], app_ids=["APP_ORA"],
+                  os_eol_bucket="expired", warranty_bucket="unknown",
+                  utilization=Utilization(cpu_p95=40.0, mem_p95=55.0, disk_used_pct=71.0))
+
+
+def test_server_brief_carries_mounts_eol_network():
+    s = _mk_oracle_server()
+    b = _server_brief(s)
+    # per-partition disks WITH mount points (the OFA layout that classifies Oracle)
+    mounts = [d["mount"] for d in b["disks"]]
+    assert "/oradata1" in mounts and "/redolog_A" in mounts
+    assert b["disk_gb"] == 970
+    # EOL + warranty buckets flow through (the silent-rehost signals)
+    assert b["os_eol_bucket"] == "expired" and b["warranty_bucket"] == "unknown"
+    assert "ips" in b["network"] and "datacenter" in b["network"]
+
+
+def test_code_profile_brief_none_when_missing():
+    assert _code_profile_brief(None) is None
+    p = CodeProfile(app_id="APP_ORA", language="java", runtime="tomcat",
+                    framework="spring", blockers=["hard license"])
+    pb = _code_profile_brief(p)
+    assert pb["runtime"] == "tomcat" and "hard license" in pb["blockers"]
+
+
+def test_explain_match_prompt_includes_mounts_and_profile(monkeypatch):
+    s = Settings(llm_enabled=True, llm_model="glm-5.2:cloud")
+    c = LLMClient(s)
+    captured = {}
+    fake_resp = MagicMock(); fake_resp.raise_for_status = MagicMock()
+    fake_resp.json.return_value = {"message": {"content": "TData fits the OFA layout."}}
+    def fake_post(url, json=None, timeout=None):
+        captured["messages"] = json["messages"]; return fake_resp
+    monkeypatch.setattr("idc.llm.client.httpx.post", fake_post)
+    srv = _mk_oracle_server()
+    prof = CodeProfile(app_id="APP_ORA", language="sqlpl", runtime="oracle",
+                       blockers=["PL/SQL packages"])
+    out = c.explain_match(srv, match_server(srv), prof)
+    assert out == "TData fits the OFA layout."
+    user = next(m["content"] for m in captured["messages"] if m["role"] == "user")
+    # the mount layout + EOL bucket + code profile all reach the prompt
+    assert "/oradata1" in user and "expired" in user and "oracle" in user
 
 
 def test_llm_disabled_returns_unavailable(monkeypatch):

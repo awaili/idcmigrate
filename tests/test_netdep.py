@@ -55,6 +55,62 @@ def test_discover_prometheus_falls_back_to_fixture_when_no_metric():
     assert any(d.dst_ip == "10.10.3.11" for d in deps), "should fall back to fixture"
 
 
+def test_discover_prometheus_uses_configured_metric(monkeypatch):
+    """With IDC_NETDEP_PROM_METRIC + IDC_PROM_URL set, the prometheus path
+    queries that metric (not the old hardcoded "" that always fell back)."""
+    os.environ["IDC_NETDEP_SOURCE"] = "prometheus"
+    os.environ["IDC_PROM_URL"] = "http://prom.test"
+    os.environ["IDC_NETDEP_PROM_METRIC"] = "conntrack_dst"
+    reset_settings()
+    s = _srv("app-orders-01", "10.10.1.11")
+
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"data": {"result": [
+                {"metric": {"instance": "app-orders-01:9100",
+                            "dst_ip": "10.10.3.11", "dst_port": "3306"},
+                 "value": [0, "1"]},
+            ]}}
+
+    def fake_get(url, params=None, timeout=None):
+        captured["url"] = url
+        captured["query"] = params.get("query") if params else None
+        return _Resp()
+
+    # httpx is imported lazily inside _from_prometheus; patch the real module.
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "get", fake_get)
+    deps = discover_network_deps(get_settings(), [s])
+    assert captured["query"] == "conntrack_dst"   # the configured metric was queried
+    assert any(d.dst_ip == "10.10.3.11" and d.dst_port == 3306 for d in deps)
+    assert all(d.source == "prometheus" for d in deps)
+    # cleanup env so later tests don't see the prom URL
+    os.environ.pop("IDC_PROM_URL", None)
+    os.environ.pop("IDC_NETDEP_PROM_METRIC", None)
+    os.environ.pop("IDC_NETDEP_SOURCE", None)
+    reset_settings()
+
+
+def test_discover_prometheus_empty_metric_still_falls_back(monkeypatch):
+    """No metric configured -> live path returns [] (no spurious query) and
+    the fixture fallback kicks in — preserves the out-of-the-box behavior."""
+    os.environ["IDC_NETDEP_SOURCE"] = "prometheus"
+    os.environ["IDC_PROM_URL"] = "http://prom.test"
+    os.environ.pop("IDC_NETDEP_PROM_METRIC", None)
+    reset_settings()
+    s = _srv("app-orders-01", "10.10.1.11")
+    deps = discover_network_deps(get_settings(), [s])
+    assert any(d.dst_ip == "10.10.3.11" for d in deps), "fixture fallback"
+    os.environ.pop("IDC_PROM_URL", None)
+    os.environ.pop("IDC_NETDEP_SOURCE", None)
+    reset_settings()
+
+
 # -- merge_network_deps ----------------------------------------------------
 def _estate():
     servers = [

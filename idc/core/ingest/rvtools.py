@@ -51,6 +51,17 @@ class RVToolsAdapter(Adapter):
         if not path or not os.path.exists(path):
             return IngestResult(assets=[], mode="fixture",
                                 error=f"rvtools file not found: {path}")
+        # RVTools is always file-based (vSphere export). Only block the BUNDLED
+        # fixture when the fallback is disabled — an operator-uploaded real
+        # file (outside the fixtures dir) is always honored.
+        if not settings.allow_fixture_fallback:
+            from ...config import FIXTURES
+            try:
+                if os.path.commonpath([os.path.abspath(path),
+                                       str(FIXTURES)]) == str(FIXTURES):
+                    return self._fixture_disabled(settings)
+            except ValueError:
+                pass   # different drives — not under fixtures, allow it
         if path.lower().endswith((".xlsx", ".xls")):
             return self._read_xlsx(path)
         return self._read_csv(path)
@@ -139,8 +150,29 @@ class RVToolsAdapter(Adapter):
         if not vinfo:
             return IngestResult(assets=[], mode="fixture",
                                 error="no vInfo tab in xlsx")
+        # build the same disk/network maps as the csv path from the vDisk /
+        # vNetwork tabs (already loaded into `out`), so xlsx exports don't
+        # silently drop per-disk + NIC inventory.
+        disks_by_vm: Dict[str, List[Dict[str, Any]]] = {}
+        for r in out.get("vdisk", []):
+            row = _Row(r)
+            vm = row.get("VM", "VM Name")
+            disks_by_vm.setdefault(vm, []).append({
+                "name": row.get("Disk", "Disk Label"),
+                "size_gb": _to_int(row.get("Capacity (GB)", "Provisioned (GB)", "Capacity GB")),
+                "kind": row.get("Disk Type", "Type"),
+                "fs": row.get("Path"),
+            })
+        net_by_vm: Dict[str, List[Dict[str, Any]]] = {}
+        for r in out.get("vnetwork", []):
+            row = _Row(r)
+            vm = row.get("VM", "VM Name")
+            net_by_vm.setdefault(vm, []).append({
+                "network": row.get("Network", "Network Name"),
+                "ip": row.get("IP Address", "IPv4 Address"),
+                "mac": row.get("MAC Address", "MAC"),
+            })
         # normalize into the same shape as csv path
-        # (treat first arg as vInfo, locate siblings by tab name)
         assets: List[RawAsset] = []
         for r in vinfo:
             row = _Row(r)
@@ -156,7 +188,8 @@ class RVToolsAdapter(Adapter):
                        "provisioned_gb": _to_float(row.get("Provisioned (GB)")),
                        "datacenter": row.get("Datacenter"), "cluster": row.get("Cluster"),
                        "folder": row.get("Folder"),
-                       "disks": [], "networks": []},
+                       "disks": disks_by_vm.get(vm, []),
+                       "networks": net_by_vm.get(vm, [])},
             ))
         return IngestResult(assets=assets, mode="fixture")
 

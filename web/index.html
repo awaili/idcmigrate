@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
 <meta name="theme-color" content="#0d1117"/>
 <title>idc-migrate · IDC→Tencent Cloud copilot</title>
-<link rel="stylesheet" href="/assets/app.css"/>
+<link rel="stylesheet" href="/assets/app.css?v=13"/>
 </head>
 <body>
 <header>
@@ -13,11 +13,14 @@
   <div class="tabs">
     <div class="tab active" data-tab="dashboard">Dashboard</div>
     <div class="tab" data-tab="inventory">Inventory</div>
+    <div class="tab" data-tab="lz">Landing Zone</div>
     <div class="tab" data-tab="waves">Waves</div>
     <div class="tab" data-tab="copilot">Copilot</div>
     <div class="tab" data-tab="code">Code &amp; DB</div>
     <div class="tab" data-tab="business-case">Business Case</div>
     <div class="tab" data-tab="execution">Execution</div>
+    <div class="tab" data-tab="testing">Testing</div>
+    <div class="tab" data-tab="docs">Docs</div>
     <div class="tab" data-tab="readiness">Readiness</div>
     <div class="tab" data-tab="data-quality">Data Quality</div>
   </div>
@@ -26,19 +29,21 @@
     <button class="sm" onclick="doIngest()">Ingest</button>
     <button class="sm primary" id="rebuildBtn" onclick="doRebuild()">Rebuild</button>
     <span id="rebuildStatus" class="muted" style="font-size:12px"></span>
-    <label class="muted" style="white-space:nowrap;font-size:12px">max waves
-      <input id="rebuildMaxWaves" type="number" min="0" step="1" value="0" style="width:64px" title="Hard cap on total waves when rebuilding (0 = no cap). The same guarantee as plan-llm's --max-waves.">
-    </label>
-    <span style="width:14px"></span>
-    <select id="uploadSrc" class="sm" title="source to upload">
-      <option value="servicenow">ServiceNow (.csv)</option>
-      <option value="rvtools">RVTools (.csv/.xlsx)</option>
-      <option value="zabbix">Zabbix (.json)</option>
-      <option value="prometheus">Prometheus (.json)</option>
-    </select>
-    <button class="sm" onclick="$('uploadFile').click()">Upload file…</button>
-    <input type="file" id="uploadFile" style="display:none"
-           onchange="doUpload(this.files[0])">
+    <span class="hdr-secondary">
+      <label class="muted" style="white-space:nowrap;font-size:12px">max waves
+        <input id="rebuildMaxWaves" type="number" min="0" step="1" value="0" style="width:64px" title="Hard cap on total waves when rebuilding (0 = no cap). The same guarantee as plan-llm's --max-waves.">
+      </label>
+      <span style="width:14px"></span>
+      <select id="uploadSrc" class="sm" title="source to upload">
+        <option value="servicenow">ServiceNow (.csv)</option>
+        <option value="rvtools">RVTools (.csv/.xlsx)</option>
+        <option value="zabbix">Zabbix (.json)</option>
+        <option value="prometheus">Prometheus (.json)</option>
+      </select>
+      <button class="sm" onclick="$('uploadFile').click()">Upload file…</button>
+      <input type="file" id="uploadFile" style="display:none"
+             onchange="doUpload(this.files[0])">
+    </span>
   </div>
 </header>
 
@@ -59,6 +64,17 @@
     <div class="row cols" style="gap:14px;align-items:flex-start">
       <div class="card" style="flex:1"><h2>Match confidence</h2><div class="bars" id="barConf"></div></div>
       <div class="card" style="flex:1"><h2>By region</h2><div class="bars" id="barRegion"></div></div>
+    </div>
+    <div class="card">
+      <h2>By application <span class="muted" id="dashAppCount"></span></h2>
+      <div class="row" style="gap:8px;margin-bottom:8px;align-items:center">
+        <input id="dashAppSearch" placeholder="filter by app id or name (e.g. APP_0087, oracle)" style="min-width:260px;flex:1" oninput="renderDashApp(this.value)" title="search apps by id or name"/>
+        <span class="muted" style="font-size:12px">click a row to open Inventory filtered to that app</span>
+      </div>
+      <div class="xscroll" style="max-height:46vh;overflow:auto"><table class="tbl mcard"><thead><tr>
+        <th style="text-align:left">App</th><th>Env</th><th>7R</th><th>Target</th>
+        <th style="text-align:right">Servers</th><th style="text-align:right">Cores</th><th style="text-align:right">Mem&nbsp;GB</th>
+      </tr></thead><tbody id="dashAppBody"></tbody></table></div>
     </div>
     <div class="card">
       <h2>Wave progress <span class="muted">(click a wave to inspect)</span></h2>
@@ -105,6 +121,92 @@
     </div>
   </section>
 
+  <!-- ===================== LANDING ZONE (F8) ===================== -->
+  <section id="tab-lz" class="tabsec hidden">
+    <div class="card">
+      <h2>Landing Zone <span class="muted">(F8 — parameterized blueprint + placement gate)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <span class="muted">Per-archetype blueprint + lifecycle. Workload waves are gated until their target archetype is <b>finalized</b> and LZ guardrails pass. Expand <b>blueprint</b> for the full Tencent mapping; <b>emit IaC</b> asks the executor to generate the LZ Terraform.</span>
+        <button class="sm" onclick="loadLzArchetypes()">Refresh</button>
+      </div>
+      <div id="lzArchCards" style="margin-top:8px"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="card">
+      <h2>LZ design <span class="muted">(Phase B/C — interview MigraQ, preview, apply &amp; activate)</span></h2>
+      <div class="muted" style="font-size:12px;margin:4px 0 10px;border-left:3px solid var(--green);padding:3px 8px;background:var(--bg2)">
+        <span class="tag" style="color:var(--green)">Layer 1 · Account &amp; VPC architecture</span>
+        — decides <b>how many accounts</b> (archetypes), <b>which apps go in which account</b> (app_map), each account's <b>VPC CIDR</b>, the <b>peering</b> topology, <b>internet egress</b>, and <b>governance / compliance tiers</b>.
+        Subnet sizes and per-server IP addresses are <b>not</b> decided here — that is Layer 2 (the Network designer below).
+      </div>
+      <div style="margin-bottom:10px;border:1px solid var(--bd);border-radius:8px;padding:10px">
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:6px">
+          <b>Scale tier</b>
+          <select id="lzScale" onchange="onLzScaleChange()" title="The scale tier sets the DEFAULT STRATEGY (the matrix below) — everything the operator does NOT customize via the AI prompt. The picker defaults to the tier inferred from your estate." style="min-width:200px">
+            <option value="">loading…</option>
+          </select>
+          <span id="lzScaleSig" class="muted" style="font-size:12px"></span>
+          <span class="muted" style="font-size:12px">· defaults = scale strategy · customizable = your prompt below</span>
+        </div>
+        <div id="lzScaleMatrix" style="overflow:auto"></div>
+        <div id="lzGoldenRules" style="margin-top:8px"></div>
+      </div>
+      <div style="margin-bottom:8px">
+        <div class="muted" style="font-size:12px;margin-bottom:4px">starter scenarios for the selected scale — click to <b>append</b> one (stack several). They customize the user-modifiable parts (app placement, extra tiers, CIDR overrides) on top of the scale's default strategy; the scale tier fills topology + governance:</div>
+        <div id="lzDesignScenarios" class="row" style="flex-wrap:wrap;gap:6px"></div>
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end">
+        <textarea id="lzDesignDemand" rows="3" style="flex:1 1 320px;min-width:200px" placeholder="Layer 1 — describe the ACCOUNT &amp; VPC architecture to customize on top of the selected scale's default: which apps go in which account (app_map: app_id -> account), add/rename/merge accounts, extra compliance tiers, VPC CIDR overrides. The scale tier fills topology + governance. Click a scenario above for a starter, then edit. Iterate with 'move APP_0087 to online' / 'shrink the hub CIDR to 10.8.0.0/16' / 'rename the data account to data-svc'. Subnet sizes and per-server IP belong to the Network designer below."></textarea>
+        <label class="muted" style="white-space:nowrap">on-prem CIDRs
+          <input id="lzDesignOnprem" style="width:220px" placeholder="10.0.0.0/16  (your IDC LAN — SPECIFIC ranges only)" title="The SPECIFIC on-prem IDC CIDRs the cloud VPCs must not overlap (comma-separated). Use your real IDC LAN (e.g. 10.0.0.0/16 or a few /24s), NOT the whole 10.0.0.0/8 — cloud VPCs are carved from 10.x, so /8 would reject every cloud VPC. Leave blank to skip the overlap check.">
+        </label>
+        <button class="primary" onclick="designLz()">Design with MigraQ</button>
+      </div>
+      <div class="out" id="lzDesignOut" style="margin-top:8px"><span class="muted">Describe the landing zone you need; MigraQ proposes a blueprint, the deterministic engine validates it (CIDR non-overlap, symmetric peering), and you preview before applying. Iterating loads the active design's prior turns.</span></div>
+      <div id="lzDesignPreview" style="margin-top:8px"></div>
+      <div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button class="sm primary" id="lzDesignApplyBtn" onclick="applyDesign()" disabled>Apply &amp; activate</button>
+        <button class="sm" id="lzDesignSaveBtn" onclick="applyDesign({activate:false})" disabled>Save draft</button>
+        <span class="muted" style="font-size:12px">Apply persists the design + makes it the active one driving the gate; Save draft persists without activating.</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Saved designs <span class="muted">(activate / delete)</span></h2>
+      <div class="xscroll"><table class="tbl mcard" id="lzDesignTbl"><thead><tr>
+        <th>name</th><th>scale</th><th>archetypes</th><th>AI description</th><th>active</th><th>updated</th><th>actions</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Network designer <span class="muted">(VPC + subnets per account, place servers in VPCs)</span></h2>
+      <div class="muted" style="font-size:12px;margin:4px 0 10px;border-left:3px solid #a06bff;padding:3px 8px;background:var(--bg2)">
+        <span class="tag" style="color:#a06bff">Layer 2 · Subnet carving &amp; host placement</span>
+        — runs on top of the <b>active LZ design above</b>: carves each account VPC into <b>tier subnets</b> (web/app/data/infra), sets <b>subnet sizes</b>, groups <b>roles → tiers</b>, and places every server into a <b>subnet + IP</b>.
+        It does <b>not</b> add / rename / merge accounts or change VPC CIDRs — those are Layer 1 (the LZ design above).
+      </div>
+      <div style="margin-bottom:8px">
+        <div class="muted" style="font-size:12px;margin-bottom:4px">carving templates — click to <b>append</b> a starter prompt (stack several), then Generate:</div>
+        <div id="ndScenarios" class="row" style="flex-wrap:wrap;gap:6px"></div>
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end">
+        <textarea id="ndDemand" rows="2" style="flex:1 1 320px;min-width:200px" placeholder="Layer 2 — optional: describe the SUBNET carving to MigraQ, e.g. '/24 subnets, group db+cache into the data tier, drop the infra tier'. Leave blank for the default (4 tier subnets per VPC, auto-sized). To add / rename / merge accounts or change VPC CIDRs, use the LZ design above — not this box."></textarea>
+        <label class="muted" style="white-space:nowrap">subnet /prefix
+          <input id="ndPrefix" style="width:64px" placeholder="auto" title="subnet prefix (blank = auto: VPC split into 4 tier subnets). Leave blank unless you want a specific size.">
+        </label>
+        <button class="primary" onclick="generateNetwork({activate:true})">Generate &amp; apply</button>
+        <button class="sm" onclick="generateNetwork({activate:false})">Preview</button>
+      </div>
+      <div class="out" id="ndOut" style="margin-top:8px"><span class="muted">Generate carves the active LZ design's per-archetype VPCs into tier subnets (web/app/data/infra) and places every server into a VPC + subnet + IP. MigraQ proposes the carving policy when you describe it; otherwise the deterministic default is used. Apply makes it the active network design so per-server placement overrides persist.</span></div>
+      <div id="ndTopo" style="margin-top:8px"></div>
+      <div class="xscroll" style="margin-top:8px"><table class="tbl mcard" id="ndSavedTbl"><thead><tr>
+        <th>name</th><th>AI description</th><th>vpcs</th><th>placed</th><th>valid</th><th>active</th><th>actions</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Server placement <span class="muted">(which servers land where)</span></h2>
+      <div class="muted" style="font-size:12px;margin:4px 0 6px">Each row is one server with its classifier archetype (the account it lands in) and its live network placement (VPC / subnet / tier / IP). Filter by archetype, app, or free text; <b>click a row</b> to move it to a different account / VPC / subnet (pins survive regenerate). Generates in the Network designer card above flow into this table on refresh.</div>
+      <div id="lzCls"><span class="muted">Loading…</span></div>
+    </div>
+  </section>
+
   <!-- ===================== WAVES ===================== -->
   <section id="tab-waves" class="tabsec hidden">
     <div class="card">
@@ -130,6 +232,15 @@
           <div id="waveMembers"><span class="muted">Click a wave on the left to see its members (paginated).</span></div>
         </div>
       </div>
+    </div>
+    <div class="card">
+      <h2>Placement gate <span class="muted">(per wave)</span></h2>
+      <div class="muted" style="font-size:12px;margin:4px 0 6px">A wave can launch only once its target Landing Zone archetype is <b>finalized</b> and LZ guardrails pass. Pick a wave to check whether it's clear.</div>
+      <div class="row" style="gap:8px;align-items:center">
+        <select id="lzGateWave" onchange="lzGateCheck()" style="flex:1;min-width:160px"></select>
+        <button class="sm primary" onclick="lzGateCheck()">check</button>
+      </div>
+      <div id="lzGateOut" style="margin-top:8px"><span class="muted">select a wave</span></div>
     </div>
     <div class="card">
       <h2>Landing Zone archetypes <span class="muted">(F8 — parameterized blueprint + placement gate)</span></h2>
@@ -237,17 +348,47 @@
       </tr></thead><tbody></tbody></table></div>
     </div>
     <div class="card">
-      <h2>DB conversion profiles <span class="muted">(F5 — executor pushes a grade per DB host)</span></h2>
+      <h2>DB conversion profiles <span class="muted">(F5/F6 — executor pushes a grade per DB host; Convert emits DDL + a compatibility report)</span></h2>
       <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
         <input id="dbScanId" placeholder="db hostname" style="flex:0 1 200px;min-width:140px" title="stable DB host identity (hostname) to scan"/>
         <select id="dbSrcEng" style="flex:0 1 auto" title="source engine"><option value="oracle">oracle</option><option value="sqlserver">sqlserver</option><option value="mysql">mysql</option></select>
         <span class="muted">→</span>
-        <select id="dbTgtEng" style="flex:0 1 auto" title="target engine"><option value="tdsql">tdsql</option><option value="cdb_mysql">cdb_mysql</option></select>
-        <button class="sm primary" onclick="doDbScan()">Scan DB</button>
-        <span class="muted" style="font-size:12px">executor scans schema/SQL, pushes a profile back; Rebuild folds the grade into the match + wave risk.</span>
+        <select id="dbTgtEng" style="flex:0 1 auto" title="target engine"><option value="tdsql">tdsql</option><option value="cdb_mysql">cdb_mysql</option><option value="postgresql">postgresql</option></select>
+        <button class="sm" onclick="doDbScan('assess')" title="grade-only (A/B/C + man-days)">Assess</button>
+        <button class="sm primary" onclick="doDbScan('convert')" title="also emit converted DDL + per-object compatibility report">Convert</button>
+        <span class="muted" style="font-size:12px">Assess = grade only; Convert = also pushes DDL + a per-object compatibility report (auto/manual/blocked). Rebuild folds the grade into the match + wave risk.</span>
       </div>
       <div class="xscroll"><table class="tbl mcard" id="dbTbl"><thead><tr>
-        <th>hostname</th><th>conversion</th><th>grade</th><th>man-days</th><th>auto %</th><th>review</th><th>blockers</th><th>rev-repl</th><th>scanned</th>
+        <th>hostname</th><th>conversion</th><th>grade</th><th>man-days</th><th>auto %</th><th>review</th><th>blockers</th><th>rev-repl</th><th>conv?</th><th>scanned</th>
+      </tr></thead><tbody></tbody></table></div>
+      <div id="dbConvDetail" class="out hidden" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2>IaC + Well-Architected guardrails <span class="muted">(F5 — executor emits Terraform + guardrail checks; gate blocks launch until pass)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px;align-items:center">
+        <select id="iacScope" style="flex:0 1 auto" title="scope"><option value="landing_zone">landing_zone</option><option value="workload">workload</option></select>
+        <input id="iacScopeId" placeholder="scope_id (lz:corp | wl:&lt;server_id&gt;)" style="flex:0 1 220px;min-width:160px"/>
+        <button class="sm primary" onclick="doIacEmit()">Emit IaC + guardrails</button>
+        <span class="muted" style="font-size:12px">executor emits Tencent HCL + runs the guardrail checks; <code>lz:&lt;arch&gt;</code> guardrails gate workload launch.</span>
+      </div>
+      <div class="xscroll"><table class="tbl mcard" id="iacTbl"><thead><tr>
+        <th>scope_id</th><th>scope</th><th>guardrails</th><th>modules</th><th>scanned</th><th>show</th>
+      </tr></thead><tbody></tbody></table></div>
+      <div id="iacDetail" class="out hidden" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2>Legacy / unsupported-OS disposition <span class="muted">(F7 — executor recommends containerize / replatform / rewrite / retain per EOL host)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px;align-items:center">
+        <input id="ldServer" placeholder="server_id (hostname)" style="flex:0 1 200px;min-width:140px"/>
+        <select id="ldRole" style="flex:0 1 auto"><option value="">role…</option><option value="app">app</option><option value="web">web</option><option value="db">db</option><option value="cache">cache</option></select>
+        <input id="ldOs" placeholder="os (e.g. centos 6)" style="flex:0 1 160px;min-width:120px"/>
+        <input id="ldRuntime" placeholder="runtime (e.g. jdk7)" style="flex:0 1 140px;min-width:100px"/>
+        <label class="muted" style="white-space:nowrap;font-size:12px"><input type="checkbox" id="ldHasRepo"> has source repo</label>
+        <button class="sm primary" onclick="doLegacyAnalyze()">Analyze</button>
+        <span class="muted" style="font-size:12px">replaces the fixed "replatform" string on EOL hosts; next Rebuild folds the rec into the match.</span>
+      </div>
+      <div class="xscroll"><table class="tbl mcard" id="ldTbl"><thead><tr>
+        <th>server_id</th><th>disposition</th><th>confidence</th><th>effort(d)</th><th>base image</th><th>rationale</th><th>scanned</th>
       </tr></thead><tbody></tbody></table></div>
     </div>
     <div class="card">
@@ -291,7 +432,7 @@
     <div class="card">
       <h2>Per-server run cost <span class="muted">(top 50 by yearly $)</span></h2>
       <div class="xscroll"><table class="tbl" id="bcTbl"><thead><tr>
-        <th>hostname</th><th>app</th><th>product</th><th>region</th><th>strategy</th><th>monthly $</th><th>yearly $</th><th>basis</th>
+        <th class="no-sort" aria-label="expand"></th><th>hostname</th><th>app</th><th>product</th><th>region</th><th>strategy</th><th>monthly $</th><th>yearly $</th><th>basis</th>
       </tr></thead><tbody></tbody></table></div>
     </div>
   </section>
@@ -301,6 +442,75 @@
     <h2>Wave execution <span class="muted">(track-only: operator / external tool performs the migration)</span></h2>
     <div id="execWaves" class="card"><span class="muted">loading waves…</span></div>
     <div class="card" id="execDetail" style="margin-top:12px"></div>
+    <div class="card" style="margin-top:12px">
+      <h2>Post-migration optimization <span class="muted">(F10 — right-size / reserved / anomaly / perf for finalized hosts)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px;align-items:center">
+        <input id="pmServer" placeholder="server_id (hostname)" style="flex:0 1 200px;min-width:140px"/>
+        <input id="pmSpec" placeholder="current spec (e.g. SA2.LARGE8)" style="flex:0 1 180px;min-width:140px"/>
+        <select id="pmProduct" style="flex:0 1 auto"><option value="CVM">CVM</option><option value="CDB">CDB</option></select>
+        <button class="sm primary" onclick="doPostmigScan()">Analyze host</button>
+        <span class="muted" id="pmSavings" style="font-size:12px"></span>
+      </div>
+      <div class="xscroll"><table class="tbl mcard" id="pmTbl"><thead><tr>
+        <th>server_id</th><th>kind</th><th>from→to</th><th>$/mo</th><th>conf</th><th>severity</th><th>reason</th>
+      </tr></thead><tbody></tbody></table></div>
+      <div class="muted" style="font-size:12px;margin-top:6px">The executor pulls the now-running cloud resource's metrics + returns recs. right-size/reserved savings roll into the portfolio business case.</div>
+    </div>
+  </section>
+
+  <!-- ===================== TESTING (F11) ===================== -->
+  <section id="tab-testing" class="tabsec hidden">
+    <h2>Automated testing <span class="muted">(F11 — generate / run pre-vs-post / compare; regression blocks cutover)</span></h2>
+    <div class="card">
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <input id="tcApp" placeholder="app_id" style="flex:0 1 200px;min-width:140px"/>
+        <button class="sm" onclick="doTestGen()">Generate cases</button>
+        <button class="sm" onclick="doTestRun('pre')" title="baseline before cutover">Run pre</button>
+        <button class="sm" onclick="doTestRun('post')" title="after cutover">Run post</button>
+        <input id="tcTarget" placeholder="target endpoint base (e.g. http://onprem:8080)" style="flex:1 1 240px;min-width:180px"/>
+        <button class="sm" onclick="doTestCompare()">Compare pre↔post</button>
+      </div>
+      <div class="out" id="tcOut" style="margin-top:8px"><span class="muted">Generate cases → run pre (baseline) → cutover → run post → compare. A regression in the diff blocks the wave's finalize (the test_regression gate).</span></div>
+    </div>
+    <div class="card">
+      <h2>Test diffs <span class="muted">(pre-vs-post verdict per case; regression = blocks finalize)</span></h2>
+      <div class="xscroll"><table class="tbl mcard" id="tdTbl"><thead><tr>
+        <th>app_id</th><th>regressions</th><th>summary</th><th>updated</th><th>detail</th>
+      </tr></thead><tbody></tbody></table></div>
+      <div id="tdDetail" class="out hidden" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2>Test runs</h2>
+      <div class="xscroll"><table class="tbl mcard" id="trTbl"><thead><tr>
+        <th>run_id</th><th>app_id</th><th>phase</th><th>pass</th><th>fail</th><th>run_at</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Test cases</h2>
+      <div class="xscroll"><table class="tbl mcard" id="tcTbl"><thead><tr>
+        <th>app_id</th><th>name</th><th>kind</th><th>endpoint</th><th>method</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- ===================== DOCS (F9) ===================== -->
+  <section id="tab-docs" class="tabsec hidden">
+    <h2>Generated docs <span class="muted">(F9 — cutover playbook + as-built per wave, grounded in real data)</span></h2>
+    <div class="card">
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <input id="docWave" placeholder="wave_id" style="flex:0 1 180px;min-width:120px"/>
+        <button class="sm" onclick="doDocGen('cutover')">Generate cutover playbook</button>
+        <button class="sm" onclick="doDocGen('as-built')">Generate as-built</button>
+      </div>
+      <div class="out" id="docOut" style="margin-top:8px"><span class="muted">Pick a wave (from the Waves tab) and generate. The executor builds the markdown from the wave's real members / targets / execution data.</span></div>
+    </div>
+    <div class="card">
+      <h2>Doc artifacts</h2>
+      <div class="xscroll"><table class="tbl mcard" id="docTbl"><thead><tr>
+        <th>doc_type</th><th>scope_id (wave)</th><th>scanned</th><th>summary</th><th>view</th>
+      </tr></thead><tbody></tbody></table></div>
+      <div id="docDetail" class="out hidden" style="margin-top:8px"></div>
+    </div>
   </section>
 
   <!-- ===================== READINESS (F10) ===================== -->
@@ -331,20 +541,23 @@
 </div>
 
 <!-- core first (shared globals/helpers), then per-page modules, then init -->
-<script src="/assets/app.js"></script>
-<script src="/assets/pages/dashboard.js"></script>
-<script src="/assets/pages/inventory.js"></script>
-<script src="/assets/pages/server-drawer.js"></script>
-<script src="/assets/pages/waves.js"></script>
-<script src="/assets/pages/plan.js"></script>
-<script src="/assets/pages/copilot.js"></script>
-<script src="/assets/pages/code.js"></script>
-<script src="/assets/pages/questions.js"></script>
-<script src="/assets/pages/business-case.js"></script>
-<script src="/assets/pages/wave-execution.js"></script>
-<script src="/assets/pages/readiness.js"></script>
-<script src="/assets/pages/data-gaps.js"></script>
-<script src="/assets/pages/rail.js"></script>
-<script src="/assets/main.js"></script>
+<script src="/assets/app.js?v=14"></script>
+<script src="/assets/pages/dashboard.js?v=12"></script>
+<script src="/assets/pages/inventory.js?v=12"></script>
+<script src="/assets/pages/server-drawer.js?v=17"></script>
+<script src="/assets/pages/waves.js?v=13"></script>
+<script src="/assets/pages/lz.js?v=15"></script>
+<script src="/assets/pages/plan.js?v=14"></script>
+<script src="/assets/pages/copilot.js?v=12"></script>
+<script src="/assets/pages/code.js?v=12"></script>
+<script src="/assets/pages/testing.js?v=12"></script>
+<script src="/assets/pages/docs.js?v=12"></script>
+<script src="/assets/pages/questions.js?v=12"></script>
+<script src="/assets/pages/business-case.js?v=12"></script>
+<script src="/assets/pages/wave-execution.js?v=12"></script>
+<script src="/assets/pages/readiness.js?v=12"></script>
+<script src="/assets/pages/data-gaps.js?v=12"></script>
+<script src="/assets/pages/rail.js?v=12"></script>
+<script src="/assets/main.js?v=12"></script>
 </body>
 </html>

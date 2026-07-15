@@ -21,7 +21,8 @@ via ``complete`` (manual override) or marks the gate result.
 from __future__ import annotations
 
 import socket
-from typing import Any, Dict, List, Optional, Tuple
+import contextvars
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..config import Settings
 from .models import (
@@ -49,6 +50,17 @@ class GatesNotSatisfied(Exception):
         super().__init__(f"cannot finalize: {len(pending)} must_pass gate(s) not satisfied: "
                          + ", ".join(g.get("name", "?") for g in pending))
         self.pending = pending
+
+
+# F11 — contextvar hook so the test_regression gate can read a TestDiff off the
+# store without the gate signature carrying a store (the other evaluators are
+# store-free). ``run_validation_gates`` sets this when a store is passed.
+_TEST_DIFF_GETTER: contextvars.ContextVar = contextvars.ContextVar(
+    "_idc_test_diff_getter", default=None)
+# F6 — same pattern for the db_conversion_blocked gate (reads the stored
+# DBConversionProfile's blocked-object count for the db host).
+_DB_CONV_GETTER: contextvars.ContextVar = contextvars.ContextVar(
+    "_idc_db_conv_getter", default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -181,12 +193,79 @@ def _gate_manual(params: Dict[str, Any], settings: Settings) -> Tuple[str, str]:
     return "pending", "requires operator/agent confirmation"
 
 
+def _gate_test_regression(params: Dict[str, Any], settings: Settings) -> Tuple[str, str]:
+    """F11 — the real version of the manual ``process_up`` stub: read the app's
+    latest TestDiff and fail when there's a regression / new_failure. The diff
+    is produced by the executor's test-compare step (pre-run vs post-run).
+
+    ``params`` carries ``app_id`` (the app under test). A store is NOT passed
+    here (the gate signature is store-free for the other evaluators); the
+    evaluator reads the diff off a module-level hook set by ``run_validation_gates``
+    so it stays testable without a global.
+
+    Verdict:
+      * regressions > 0 → ``fail`` (blocks finalize — the whole point).
+      * a clean diff exists → ``pass``.
+      * no diff yet (testing not set up, or not compared) → ``pass``, NOT
+        ``pending``. A pending must_pass gate would lock out EVERY host
+        finalize on estates that never opted into automated testing — too
+        aggressive a default. The gate only blocks when testing was actually
+        run AND found a regression; opting in is the operator's choice.
+    """
+    app_id = str(params.get("app_id") or "")
+    getter = _TEST_DIFF_GETTER.get()
+    if not app_id or getter is None:
+        return "pass", "automated testing not configured for this app"
+    try:
+        diff = getter(app_id)
+    except Exception:
+        # store lookup failed (DB error) — fail CLOSED on a must_pass cutover gate
+        # rather than letting a transient outage evaluate as a clean "pass".
+        return "pending", "test-diff lookup failed (store error) — not safe to pass"
+    if diff is None:
+        return "pass", "no test diff yet (testing not run for this app)"
+    n = int(getattr(diff, "regressions", 0) or 0)
+    if n > 0:
+        return "fail", f"{n} regression(s) / new failure(s) in test diff"
+    return "pass", f"test diff clean ({len(diff.diff)} case(s) compared)"
+
+
+def _gate_db_conversion_blocked(params: Dict[str, Any], settings: Settings) -> Tuple[str, str]:
+    """F6 — block a db-kind finalize when the host's conversion has objects with
+    no engine equivalent (``status=blocked``). Those need a rewrite or operator
+    ack before the DB is safe to cut over. Reads the DBConversionProfile off
+    the store via the ``_DB_CONV_GETTER`` hook (set by run_validation_gates).
+
+    Verdict (mirrors test_regression — no lockout for estates not using it):
+      * blocked objects > 0 → ``fail`` (blocks finalize).
+      * conversion exists, no blocked → ``pass``.
+      * no conversion assessed → ``pass`` (don't block un-assessed DBs).
+    """
+    host = str(params.get("db_server_id") or params.get("host") or "")
+    getter = _DB_CONV_GETTER.get()
+    if not host or getter is None:
+        return "pass", "DB conversion not assessed"
+    try:
+        profile = getter(host)
+    except Exception:
+        return "pending", "DB-conversion lookup failed (store error) — not safe to pass"
+    if profile is None or not getattr(profile, "conversion", None):
+        return "pass", "DB conversion not assessed (assess mode only)"
+    blocked = sum(1 for o in (profile.conversion.objects or [])
+                  if o.status == "blocked")
+    if blocked > 0:
+        return "fail", f"{blocked} blocked DB object(s) — rewrite or ack before cutover"
+    return "pass", f"DB conversion clean ({len(profile.conversion.objects)} object(s))"
+
+
 _GATE_EVALUATORS = {
     "connect": _gate_connect,
     "http_response": _gate_http,
     "app_health_promql": _gate_promql,
     "process_up": _gate_manual,
     "volume_consistency": _gate_manual,
+    "test_regression": _gate_test_regression,
+    "db_conversion_blocked": _gate_db_conversion_blocked,
 }
 
 
@@ -209,8 +288,21 @@ def default_gates_for(kind: str, server: Optional[Server] = None,
     if kind == MJK_DB:
         gates.append({"name": "db-reachable", "kind": "connect", "must_pass": True,
                       "host": host, "port": port or 3306, "timeout": 5})
+        # F6 — block finalize when a convert-mode profile has objects with no
+        # engine equivalent (rewrite/ack first). must_pass so a blocked DB
+        # actually stops the cutover; passes (no lockout) when not assessed.
+        gates.append({"name": "db-conversion-blocked", "kind": "db_conversion_blocked",
+                       "must_pass": True, "db_server_id": (server.hostname if server else host)})
     gates.append({"name": "app-health", "kind": "app_health_promql", "must_pass": False,
                   "metric": f"up{{instance=\"{_promql_label(host)}\"}}"})
+    # F11 — the real version of the manual process_up stub: block finalize on a
+    # regression in the pre-vs-post test diff. must_pass so a regression actually
+    # stops the cutover. The gate reads the diff via the store hook in
+    # run_validation_gates; with no store it stays pending (blocks) until the
+    # comparison lands. app_id is filled by launch_wave from the job's app_id.
+    if kind == MJK_HOST and getattr(server, "app_ids", None):
+        gates.append({"name": "test-regression", "kind": "test_regression",
+                      "must_pass": True, "app_id": (server.app_ids or [""])[0]})
     return gates
 
 
@@ -226,7 +318,8 @@ def _promql_label(value: str) -> str:
 
 
 def run_validation_gates(job: MigrationJob, settings: Settings,
-                         gates: Optional[List[Dict[str, Any]]] = None
+                         gates: Optional[List[Dict[str, Any]]] = None,
+                         store: Optional[Any] = None
                          ) -> Tuple[bool, List[Dict[str, Any]]]:
     """Evaluate the job's validation gates. Returns (all_must_pass_ok, results).
 
@@ -235,15 +328,39 @@ def run_validation_gates(job: MigrationJob, settings: Settings,
     result is ``pass``/``skipped``. Manual gates (``process_up``,
     ``volume_consistency``) stay ``pending`` — the operator resolves them via
     ``complete`` or by setting ``result`` manually.
+
+    ``store`` (F11) — when passed, the ``test_regression`` gate can read the
+    app's latest TestDiff off the store (via a contextvar hook so the gate
+    evaluator signature stays store-free). When None, the test_regression gate
+    stays ``pending`` (no diff to compare).
     """
     glist = gates if gates is not None else job.validation_gates
-    for g in glist:
-        kind = g.get("kind") or "manual"
-        evaluator = _GATE_EVALUATORS.get(kind, _gate_manual)
-        result, detail = evaluator(g, settings)
-        g["result"] = result
-        g["detail"] = detail
-        g["at"] = _now()
+    token = None
+    token_db = None
+    if store is not None and hasattr(store, "get_test_diff"):
+        def _get(app_id):
+            # Let store errors propagate — the evaluator catches them and returns
+            # ``pending`` (fail-closed). The old swallow->None made a transient DB
+            # outage during cutover evaluate as ``pass`` on a must_pass gate.
+            return store.get_test_diff(app_id)
+        token = _TEST_DIFF_GETTER.set(_get)
+    if store is not None and hasattr(store, "get_db_profile"):
+        def _get_db(host):
+            return store.get_db_profile(host)
+        token_db = _DB_CONV_GETTER.set(_get_db)
+    try:
+        for g in glist:
+            kind = g.get("kind") or "manual"
+            evaluator = _GATE_EVALUATORS.get(kind, _gate_manual)
+            result, detail = evaluator(g, settings)
+            g["result"] = result
+            g["detail"] = detail
+            g["at"] = _now()
+    finally:
+        if token is not None:
+            _TEST_DIFF_GETTER.reset(token)
+        if token_db is not None:
+            _DB_CONV_GETTER.reset(token_db)
     must_pass = [g for g in glist if g.get("must_pass")]
     all_ok = all(g.get("result") in ("pass", "skipped") for g in must_pass)
     return all_ok, glist
@@ -254,11 +371,14 @@ def run_validation_gates(job: MigrationJob, settings: Settings,
 # ---------------------------------------------------------------------------
 class LZNotReady(Exception):
     """Raised when ``launch_wave`` is called with ``enforce_lz_gate=True`` and a
-    blocking archetype's LZ isn't finalized (F8 placement gate)."""
+    blocking archetype's LZ isn't finalized (F8 placement gate), or the wave
+    contains undetermined (pending) hosts that have no LZ to land in."""
 
-    def __init__(self, blocking: List[str]):
-        super().__init__(f"LZ not ready for archetypes: {', '.join(blocking)}")
+    def __init__(self, blocking: List[str], reason: str = ""):
+        msg = reason or f"LZ not ready for archetypes: {', '.join(blocking)}"
+        super().__init__(msg)
         self.blocking = blocking
+        self.reason = reason
 
 
 def launch_wave(store, wave_id: str, servers: List[Server],
@@ -288,7 +408,7 @@ def launch_wave(store, wave_id: str, servers: List[Server],
     # F8 — placement gate (LZ archetype readiness)
     gate = check_lz_gate(store, wave_id, servers, matches)
     if not gate["ok"] and enforce_lz_gate:
-        raise LZNotReady(gate["blocking_archetypes"])
+        raise LZNotReady(gate["blocking_archetypes"], gate["reason"])
     gate_note = "" if gate["ok"] else f"LZ gate warning: {gate['reason']}"
     # idempotency: a server that already has a non-terminal job for this wave
     # keeps its existing job — re-launching must not create duplicate jobs
@@ -352,9 +472,17 @@ def _dominant_status(status_counts: Dict[str, int]) -> str:
         return "done"
     if status_counts.get(MJS_ROLLED_BACK, 0) == total:
         return "rolled-back"
+    # every server reached a terminal state, but a MIX of finalized + rolled-back:
+    # the wave is finished (no migration in flight), so report ``done`` rather than
+    # the misleading ``running``. ``finalized`` is terminal, NOT in-progress —
+    # counting it below made a fully-finished wave render as "running" forever.
+    terminal = (status_counts.get(MJS_FINALIZED, 0)
+                + status_counts.get(MJS_ROLLED_BACK, 0))
+    if terminal == total:
+        return "done"
     in_progress = sum(status_counts.get(s, 0) for s in
                       (MJS_REPLICATING, MJS_TESTED, MJS_READY_FOR_CUTOVER,
-                       MJS_CUT_OVER, MJS_FINALIZED))
+                       MJS_CUT_OVER))
     return "running" if in_progress > 0 else "planned"
 
 
@@ -373,7 +501,8 @@ def wave_execution_status(store, wave_id: str) -> Dict[str, Any]:
     from .lz import archetype_for
     mjobs = store.list_migration_jobs(wave_id=wave_id)
     mjob_by_server = {j.server_id: j for j in mjobs}
-    servers = {s.id: s for s in store.list_all_servers() if s.id in (wave.server_ids or [])}
+    wave_ids = set(wave.server_ids or [])
+    servers = {s.id: s for s in store.list_all_servers() if s.id in wave_ids}
     matches = {m.server_id: m for m in store.list_matches()}
 
     status_counts: Dict[str, int] = {s: 0 for s in MIGRATION_JOB_STATUSES}

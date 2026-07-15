@@ -20,6 +20,7 @@ All functions are pure (no DB, no network) so they unit-test directly.
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Set
 
@@ -193,17 +194,62 @@ def estate_query(intent: str, params: Optional[Dict[str, Any]],
         if not q:
             return {"intent": intent, "q": "", "matches": []}
         hits = []
+        total = 0
+        # Token-aware matching so a natural-language q like "oracle database"
+        # still hits. The estate tags DB/middleware hosts as ``oracle-db``,
+        # ``db:postgres``, ``mw:tomcat`` … — the bare phrase "oracle database"
+        # never appears verbatim, so a pure substring search returns zero.
+        # We (1) canonicalize multi-word tech phrases to their tag form, (2) drop
+        # filler words, (3) fold synonyms (database→db, middleware→mw) and (4)
+        # split each tag on -/: so "oracle-db" exposes "oracle" + "db" as tokens.
+        # A server matches when the whole (canonicalized) phrase is a substring
+        # OR every surviving token is present.
+        #
+        # The phrase map is load-bearing for precision: "oracle" is ambiguous on
+        # this estate — it is both an Oracle DB (tag ``oracle-db``) AND an OS
+        # (``oracle linux``). Without it, "oracle database" token-matches "oracle"
+        # (from the OS) + "db" (role) and returns MySQL/Mongo hosts that merely
+        # run on Oracle Linux. Mapping "oracle database"→"oracle-db" makes the
+        # match hit the tag exactly, excluding those false positives.
+        phrase_map = {
+            "oracle database": "oracle-db", "oracle db": "oracle-db",
+            "sql server": "sqlserver", "sqlserver database": "sqlserver",
+        }
+        for phrase, canon in phrase_map.items():
+            q = q.replace(phrase, canon)
+        stop = {"the", "a", "an", "of", "and", "or", "for", "with", "is", "are",
+                "hosted", "hosting", "hosts", "host", "server", "servers",
+                "running", "run", "which", "what", "all", "list", "show", "find"}
+        synonyms = {"database": "db", "databases": "db", "dbs": "db",
+                    "middleware": "mw", "appserver": "tomcat",
+                    "app-server": "tomcat", "cache": "cache"}
+        qtokens = []
+        for w in q.split():
+            w = w.strip(".,?;:()\"'")
+            if not w or w in stop:
+                continue
+            if w in synonyms:
+                w = synonyms[w]
+            if w and w not in qtokens:
+                qtokens.append(w)
         for s in servers:
+            tags = list(s.tags or [])
+            tech_words = []
+            for t in tags:
+                for seg in re.split(r"[-:/]+", t):
+                    if seg:
+                        tech_words.append(seg)
             hay = " ".join([s.hostname or "", s.fqdn or "", s.role or "", s.os or "",
-                            s.env or "", " ".join(s.tags or []), " ".join(s.app_ids or [])]
-                           ).lower()
-            if q in hay:
-                hits.append({"hostname": s.hostname, "role": s.role, "env": s.env,
-                             "app_ids": s.app_ids})
-                if len(hits) >= 30:
-                    break
+                            s.env or "", " ".join(tags), " ".join(s.app_ids or []),
+                            " ".join(tech_words)]).lower()
+            if q in hay or (qtokens and all(tok in hay for tok in qtokens)):
+                total += 1
+                if len(hits) < 30:   # cap the payload, but keep the true total
+                    hits.append({"hostname": s.hostname, "role": s.role, "env": s.env,
+                                 "app_ids": s.app_ids, "os": s.os, "tags": tags})
         return {"intent": intent, "q": params.get("q", ""), "matches": hits,
-                "count": len(hits)}
+                "count": total, "shown": len(hits),
+                "truncated": total > len(hits)}
 
     return {"intent": "unknown",
             "hint": "unrecognized intent; answer from general context if you can, "

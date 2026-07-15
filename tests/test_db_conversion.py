@@ -94,6 +94,104 @@ def test_no_profile_is_noop():
     assert m.rationale == "Oracle DB -> CVM BYOL"
 
 
+# -- F6 — conversion artifact + compatibility report -------------------------
+from idc.core.codeintel import db_conversion_blocked_count, db_conversion_summary
+from idc.core.models import (
+    DBConversion, DBConversionObject, DBOBJ_AUTO, DBOBJ_BLOCKED, DBOBJ_REVIEW,
+    DB_ENGINE_POSTGRESQL,
+)
+
+
+def _conv():
+    return DBConversion(
+        target_engine=DB_ENGINE_POSTGRESQL,
+        ddl=["CREATE TABLE orders (...);"],
+        objects=[
+            DBConversionObject(name="ORDERS", kind="table", status=DBOBJ_AUTO,
+                                converted="CREATE TABLE orders (...);"),
+            DBConversionObject(name="PKG_ORDERS", kind="package", status=DBOBJ_REVIEW,
+                                issue="DBMS_LOCK.SLEEP → pg_sleep", effort_days=3.0),
+            DBConversionObject(name="PKG_BILLING", kind="package", status=DBOBJ_BLOCKED,
+                                issue="UTL_FILE writes to FS", effort_days=8.0),
+        ],
+        auto_convert_pct=0.33)
+
+
+def test_db_conversion_roundtrip_through_profile():
+    p = _dbp(DB_DIFFICULTY_C)
+    p.conversion = _conv()
+    d = p.to_dict()
+    assert d["conversion"]["target_engine"] == "postgresql"
+    rt = DBConversionProfile.from_dict(d)
+    assert rt.conversion is not None
+    assert rt.conversion.target_engine == "postgresql"
+    assert len(rt.conversion.objects) == 3
+    assert rt.conversion.objects[2].status == DBOBJ_BLOCKED
+
+
+def test_db_conversion_assess_mode_has_none_conversion():
+    # a grade-only (assess-mode) profile has conversion=None and survives a
+    # roundtrip — old executor pushes (no conversion key) keep working.
+    p = _dbp(DB_DIFFICULTY_B)
+    assert p.conversion is None
+    rt = DBConversionProfile.from_dict(p.to_dict())
+    assert rt.conversion is None
+
+
+def test_db_conversion_summary_empty_for_assess():
+    assert db_conversion_summary(_dbp(DB_DIFFICULTY_C)) == ""
+    assert db_conversion_summary(None) == ""
+
+
+def test_db_conversion_summary_uses_report_md_when_present():
+    p = _dbp(DB_DIFFICULTY_C)
+    p.conversion = DBConversion(target_engine="postgresql", objects=[],
+                                report_md="# My report\n")
+    assert db_conversion_summary(p) == "# My report\n"
+
+
+def test_db_conversion_summary_synthesizes_from_objects():
+    p = _dbp(DB_DIFFICULTY_C)
+    p.conversion = _conv()
+    md = db_conversion_summary(p)
+    assert "compatibility report" in md
+    assert "postgresql" in md
+    assert "ORDERS" in md and "PKG_BILLING" in md
+    assert "1 auto, 1 review, 1 blocked" in md
+
+
+def test_db_conversion_blocked_count():
+    p = _dbp(DB_DIFFICULTY_C)
+    p.conversion = _conv()
+    assert db_conversion_blocked_count(p) == 1
+    assert db_conversion_blocked_count(_dbp(DB_DIFFICULTY_A)) == 0
+    assert db_conversion_blocked_count(None) == 0
+
+
+def test_mock_fake_db_conversion_oracle_to_pg_has_blocked_object():
+    """F6 — the mock executor's convert path emits a per-object report with an
+    auto / review / blocked mix, incl. the Oracle→PG target that was missing."""
+    from idc.executor_mock.app import _fake_db_conversion
+    conv = _fake_db_conversion("db-oracle-01", "oracle", "postgresql", "sc-x")
+    assert conv["target_engine"] == "postgresql"
+    statuses = {o["status"] for o in conv["objects"]}
+    assert "blocked" in statuses and "auto_converted" in statuses
+    assert any(o["name"] == "PKG_BILLING" and o["status"] == "blocked"
+               for o in conv["objects"])
+    assert conv["report_md"].startswith("# DB conversion compatibility report")
+    # auto_convert_pct matches the share of auto_converted objects
+    auto = sum(1 for o in conv["objects"] if o["status"] == "auto_converted")
+    assert conv["auto_convert_pct"] == round(auto / len(conv["objects"]), 2)
+
+
+def test_mock_fake_db_conversion_assess_mode_is_grade_only():
+    """assess mode (the default db-scan) must NOT emit a conversion artifact —
+    back-compat with executors that only do grading."""
+    from idc.executor_mock.app import _fake_db_profile
+    prof = _fake_db_profile("h", "oracle", "tdsql", "sc")
+    assert "conversion" not in prof   # the assess path never adds the key
+
+
 def test_confidence_floor_respected():
     m = _match(0.2)
     enrich_match_db(m, _dbp(DB_DIFFICULTY_C))   # -0.40 would go negative
@@ -201,6 +299,51 @@ def test_put_db_profile_body_id_mismatch_400():
             "db_server_id": "wrong", "source_engine": "oracle",
             "difficulty": "A"}, headers={"Authorization": "Bearer test-token"})
         assert r.status_code == 400
+    finally:
+        _cleanup(sid, host)
+
+
+def test_convert_mode_push_and_retrieve_with_conversion():
+    """F6 — a convert-mode push carries `.conversion` (DDL + per-object report);
+    GET returns it; assess-mode (no conversion key) stays back-compat."""
+    sid, host = _seed_oracle_server()
+    try:
+        body = {
+            "db_server_id": host, "source_engine": "oracle",
+            "target_engine": "postgresql", "difficulty": "C", "est_man_days": 40.0,
+            "review_objects": ["PKG_ORDERS"], "blockers": ["UTL_FILE"],
+            "reverse_replication": True, "auto_convert_pct": 0.5, "scan_id": "sc-2",
+            "summary": "Oracle -> PG converted",
+            "conversion": {
+                "target_engine": "postgresql",
+                "ddl": ["CREATE TABLE orders (...);"],
+                "objects": [
+                    {"name": "ORDERS", "kind": "table", "status": "auto_converted",
+                     "converted": "CREATE TABLE orders (...);", "issue": "", "effort_days": 0.0},
+                    {"name": "PKG_BILLING", "kind": "package", "status": "blocked",
+                     "converted": "", "issue": "UTL_FILE -> sidecar", "effort_days": 8.0},
+                ],
+                "auto_convert_pct": 0.5, "report_md": "# PG report",
+            },
+        }
+        r = client.put(f"/api/db-profiles/{host}", json=body, headers=_bearer())
+        assert r.status_code == 200, r.text
+        g = client.get(f"/api/db-profiles/{host}").json()
+        assert g["conversion"] is not None
+        assert g["conversion"]["target_engine"] == "postgresql"
+        assert len(g["conversion"]["objects"]) == 2
+        assert g["conversion"]["objects"][1]["status"] == "blocked"
+        # store roundtrip preserved the DDL + the markdown report
+        assert g["conversion"]["ddl"] == ["CREATE TABLE orders (...);"]
+        assert g["conversion"]["report_md"] == "# PG report"
+        # re-push assess-mode (no conversion key) — back-compat: conversion clears
+        r2 = client.put(f"/api/db-profiles/{host}", json={
+            "db_server_id": host, "source_engine": "oracle",
+            "target_engine": "tdsql", "difficulty": "C", "est_man_days": 40.0,
+        }, headers=_bearer())
+        assert r2.status_code == 200
+        g2 = client.get(f"/api/db-profiles/{host}").json()
+        assert g2["conversion"] is None
     finally:
         _cleanup(sid, host)
 

@@ -9,7 +9,7 @@ and the F6 ``launch_wave`` LZ-gate wiring (warn vs enforce).
 import pytest
 
 from idc.core.lz import (
-    LZ_BLUEPRINTS, LZ_CORP, LZ_DMZ, LZ_ONLINE, LZ_ARCHETYPES,
+    LZ_BLUEPRINTS, LZ_CORP, LZ_DMZ, LZ_ONLINE, LZ_ARCHETYPES, LZ_PENDING,
     TAG_CORP, TAG_DMZ, TAG_ONLINE,
     archetype_for, archetypes_for_servers, wave_archetypes,
 )
@@ -43,10 +43,14 @@ def test_web_role_routes_to_online():
     assert archetype_for(_srv(role="frontend")) == LZ_ONLINE
 
 
-def test_default_is_corp():
+def test_internal_roles_route_to_corp_blank_routes_to_pending():
+    # internal workloads (any non-web role) belong in the corp hub — the
+    # built-in default design's strategy.
     assert archetype_for(_srv(role="db")) == LZ_CORP
     assert archetype_for(_srv(role="app")) == LZ_CORP
-    assert archetype_for(_srv()) == LZ_CORP
+    # a host with NO signal at all (no role, no classifying tag) is genuinely
+    # undetermined -> pending for review, NOT dumped into the corp hub.
+    assert archetype_for(_srv()) == LZ_PENDING
 
 
 def test_tag_precedence_dmz_over_online():
@@ -90,7 +94,53 @@ def test_wave_archetypes_mix():
     ss = [_srv(role="web", sid="a"), _srv(role="db", sid="b"),
           _srv(tags=[TAG_DMZ], sid="c"), _srv(role="app", sid="d")]
     mix = wave_archetypes(["a", "b", "c", "d"], ss)
+    # web -> online; db + app (internal roles) -> corp; dmz tag -> dmz
     assert mix == {LZ_CORP: 2, LZ_ONLINE: 1, LZ_DMZ: 1}
+
+
+def test_wave_archetypes_skips_stale_members():
+    """A wave member id that no longer exists in the estate must NOT be
+    fabricated as a corp placement (would silently gate the wave on a
+    non-existent workload). It is skipped instead."""
+    ss = [_srv(role="web", sid="a")]
+    mix = wave_archetypes(["a", "ghost"], ss)
+    assert mix == {LZ_CORP: 0, LZ_ONLINE: 1, LZ_DMZ: 0}
+
+
+# -- peering topology (symmetric hub-and-spoke) -------------------------------
+def test_peering_is_symmetric():
+    """Every declared peering edge is bidirectional (VPC/VNet peering requires
+    both sides). corp↔online must agree; dmz is isolated."""
+    corp = LZ_BLUEPRINTS[LZ_CORP]["peering"]
+    online = LZ_BLUEPRINTS[LZ_ONLINE]["peering"]
+    dmz = LZ_BLUEPRINTS[LZ_DMZ]["peering"]
+    assert corp["to_online"] is True and online["to_corp"] is True
+    assert corp["to_dmz"] is False and dmz["to_corp"] is False
+    assert online["to_dmz"] is False and dmz["to_online"] is False
+
+
+def test_online_does_not_peer_directly_to_dc():
+    """The internet-exposed spoke must reach the DC via the corp hub, not a
+    direct peering (no internet-tier → on-prem route)."""
+    assert LZ_BLUEPRINTS[LZ_ONLINE]["peering"]["to_dc"] is False
+    assert LZ_BLUEPRINTS[LZ_ONLINE]["peering"]["to_corp"] is True
+    assert LZ_BLUEPRINTS[LZ_CORP]["peering"]["to_dc"] is True
+
+
+def test_peering_asymmetric_raises_on_import():
+    """The symmetry invariant is enforced at import — a tampered blueprint
+    with a one-way edge fails fast rather than emitting broken Terraform."""
+    import idc.core.lz as lz
+    saved = dict(lz.LZ_BLUEPRINTS[LZ_ONLINE]["peering"])
+    try:
+        lz.LZ_BLUEPRINTS[LZ_ONLINE]["peering"]["to_corp"] = False
+        # corp.to_online=True but online.to_corp=False → asymmetric
+        with pytest.raises(ValueError, match="asymmetric peering"):
+            lz._assert_peering_symmetric()
+    finally:
+        lz.LZ_BLUEPRINTS[LZ_ONLINE]["peering"] = saved
+    # restored blueprint re-validates clean
+    lz._assert_peering_symmetric()
 
 
 # -- DB-backed: readiness + gate + launch wiring -----------------------------
@@ -240,6 +290,30 @@ def test_lz_gate_lz_wave_always_ok():
         st.close()
     finally:
         _cleanup([lz_wid, app_wid], [lz_sid, app_sid], job_ids)
+
+
+def test_lz_gate_blocks_when_wave_has_undetermined_pending_host():
+    """A wave containing a host the classifier can't place (no signal -> pending)
+    is blocked: it has no LZ to land in, so the operator must classify it (via a
+    tag / app_map / role_map rule or a VPC pin) before the wave can launch."""
+    st = open_store(get_settings().db_url)
+    sid = _new_id("srv")
+    wid = _new_id("wave")
+    try:
+        # a signal-less host (no role, no tags) -> pending under the built-in default
+        st.upsert_server(Server(id=sid, hostname=f"blank-{sid[-4:]}",
+                                ips=["10.99.0.9"], role="", app_ids=[], tags=[]))
+        st.upsert_wave(Wave(id=wid, name="W", stage=STAGE_APP, server_ids=[sid],
+                            status="planned"))
+        servers, matches = st.list_all_servers(), st.list_matches()
+        from idc.core.lz import check_lz_gate
+        gate = check_lz_gate(st, wid, servers, matches)
+        assert gate["ok"] is False
+        assert gate["pending"] >= 1
+        assert "undetermined" in gate["reason"]
+    finally:
+        st.close()
+        _cleanup([wid], [sid], [])
 
 
 # -- backend endpoints ------------------------------------------------------

@@ -20,6 +20,7 @@ import math
 from typing import List, Optional, Tuple
 
 from .models import ALL_SOURCES, Match, Server, Target
+from .eol import os_long_term_eol
 
 # datacenter → Tencent Cloud region. Target landing zone is Thailand, so the
 # whole estate maps to Tencent Cloud's Bangkok region (ap-bangkok) — Tencent
@@ -48,6 +49,13 @@ CVM_TYPES = [
 CDB_MYSQL_SPECS = [
     (2, "MYSQL.HighMem - 2GB"), (4, "MYSQL.HighMem - 4GB"), (8, "MYSQL.HighMem - 8GB"),
     (16, "MYSQL.HighMem - 16GB"), (32, "MYSQL.HighMem - 32GB"), (64, "MYSQL.HighMem - 64GB"),
+]
+# PostgreSQL managed DB uses the same mem tiers as MySQL but its own spec label,
+# so the PG Target spec string never carries a "MYSQL" label (and cost.py maps
+# the PG mem tier back onto the CDB price book at the same tier).
+CDB_PG_SPECS = [
+    (2, "PG.HighMem - 2GB"), (4, "PG.HighMem - 4GB"), (8, "PG.HighMem - 8GB"),
+    (16, "PG.HighMem - 16GB"), (32, "PG.HighMem - 32GB"), (64, "PG.HighMem - 64GB"),
 ]
 
 REDIS_SPECS = [
@@ -130,6 +138,34 @@ def _size_by_mem(mem: int, table) -> Tuple[str, int]:
     return table[-1][1], table[-1][0]
 
 
+def _rehost_container(s: Server, region: str, az: str, cpu: int, mem: int,
+                      disk_gb: int, reason: str) -> Match:
+    """Rehost-container: containerize the workload onto a Tencent TKE managed
+    cluster (running on a right-sized CVM worker node) to escape a self-managed
+    middleware runtime or a long-term EOL/EOS OS — keep the app, discard the
+    dead image / runtime.
+
+    The target is a CVM worker (priced, right-sized), NOT the unpriced ``TKE``
+    control-plane product, so the business case keeps an accurate run-cost for
+    the ~3.9k hosts this can apply to. Mirrors the k8s-worker branch
+    (CVM + ``tke_node_pool``).
+    """
+    sku, sz = _size_cvm(cpu, mem)
+    tgt = Target(product="CVM", spec=sku, region=region, az=az,
+                 extras={"size": sz, "system_disk": 50, "data_disk": disk_gb,
+                         "tke_node_pool": True, "rehost_container": True,
+                         "sg": "derived-from-vlan", "vpc": "derived-from-subnet"},
+                 notes=f"Rehost-container onto TKE worker (CVM {sku}); CBS data "
+                       f"disk ≈ {disk_gb} GB. Containerize to escape {reason}.")
+    return Match(s.id, tgt, confidence=0.78, method="rule",
+                 rationale=f"Rehost-container ({reason}) → containerize onto "
+                           f"Tencent TKE worker (CVM {sku}, {cpu}vCPU/{mem}GB). "
+                           f"Keeps the app; discards the {reason}.",
+                 alternatives=[f"lift-and-shift to CVM {sku} as-is (keeps the "
+                               f"{reason} — not recommended)",
+                               "refactor to a managed service (separate project)"])
+
+
 def _db_engine(tags_lc: List[str], hostname: str) -> str:
     """Best-effort DB engine detection from tags + hostname (NOT from OS —
     Oracle Linux would otherwise masquerade as the Oracle engine).
@@ -176,6 +212,122 @@ def _is_oracle_db(tags_lc: List[str], hostname: str) -> bool:
     tail = name.split("oracle", 1)[1].lstrip("-_. ")
     nxt = tail.split("-", 1)[0].split("_", 1)[0].split(".", 1)[0]
     return nxt not in _ORACLE_NON_DB
+
+
+def _middleware_kind(tags) -> str:
+    """The middleware kind set by ``normalize.detect_middleware`` (the
+    ``mw:<kind>`` tag), or "" when none/unspecified."""
+    for t in tags or []:
+        low = (t or "").strip().lower()
+        if low.startswith("mw:"):
+            return low[3:]
+    return ""
+
+
+# DB engines with no first-class managed Tencent equivalent: the honest call is
+# a CVM rehost (keep the engine, move the VM) with the managed-evaluation note.
+# Mongo DOES have a managed equivalent (TencentDB for MongoDB) and is routed
+# separately below.
+_DB_NO_MANAGED = ("db2", "sybase", "cassandra", "clickhouse", "tidb",
+                  "influx", "tdengine", "opengauss", "dameng", "kingbase")
+_DB_MANAGED_HINT = {
+    "db2": "TDSQL for DB2 (evaluate)",
+    "sybase": "TencentDB (evaluate)",
+    "cassandra": "TcaplusDB / self-managed on TKE",
+    "clickhouse": "TDSQL-C ClickHouse",
+    "tidb": "TDSQL-C TiDB",
+    "influx": "TencentDB for InfluxDB / self-managed",
+    "tdengine": "TDSQL-C TDengine",
+    "opengauss": "TDSQL (openGauss)",
+    "dameng": "TencentDB (DM, evaluate)",
+    "kingbase": "TencentDB (Kingbase, evaluate)",
+}
+
+
+def _db_kind(tags) -> str:
+    """The DB engine kind set by ``normalize.detect_db_engine`` (the
+    ``db:<engine>`` tag), or "" when none/legacy."""
+    for t in tags or []:
+        low = (t or "").strip().lower()
+        if low.startswith("db:"):
+            return low[3:]
+    return ""
+
+
+# Object-store vs file-store kind from the ``object-store:<kind>`` /
+# ``file-store:<kind>`` tag set by ``normalize.detect_object_store``. Returns
+# ("", "") when the host is not a self-hosted storage node.
+def _store_kind(tags) -> str:
+    """The storage kind (``"minio"`` / ``"gluster"`` / ...) or ``""``."""
+    for t in tags or []:
+        low = (t or "").strip().lower()
+        if low.startswith("object-store:") or low.startswith("file-store:"):
+            return low.split(":", 1)[1]
+    return ""
+
+
+def _store_category(tags) -> str:
+    """``"object"`` / ``"file"`` / ``""``."""
+    for t in tags or []:
+        low = (t or "").strip().lower()
+        if low == "object-store" or low.startswith("object-store:"):
+            return "object"
+        if low == "file-store" or low.startswith("file-store:"):
+            return "file"
+    return ""
+
+
+def _cache_kind(tags) -> str:
+    """The cache kind (``"redis"`` / ``"memcache"``) or ``""``."""
+    for t in tags or []:
+        low = (t or "").strip().lower()
+        if low in ("redis", "memcache", "memcached"):
+            return "redis" if low == "redis" else "memcache"
+    return ""
+
+
+# managed-service alternative per middleware kind (the "replatform" option the
+# operator can pick instead of self-managing on TKE). Grounded in Tencent's
+# managed equivalents; "" kinds fall through with no alt.
+_MIDDLEWARE_MANAGED_ALT = {
+    "kafka": "Tencent CKafka (managed Kafka) — replatform instead of self-managed",
+    "rabbitmq": "Tencent TDMQ for RabbitMQ (managed)",
+    "activemq": "Tencent TDMQ (managed message queue)",
+    "rocketmq": "Tencent TDMQ for RocketMQ (managed)",
+    "pulsar": "Tencent TDMQ for Pulsar (managed)",
+    "zookeeper": "Tencent TSE ZooKeeper (managed coordination)",
+    "tomcat": "containerize on TKE (managed runtime)",
+    "weblogic": "containerize on TKE / migrate to Oracle WebLogic on cloud",
+    "jboss": "containerize on TKE (JBoss EAP)",
+    "websphere": "containerize on TKE (WebSphere Liberty)",
+    "jetty": "containerize on TKE (managed runtime)",
+    "elasticsearch": "Tencent Cloud Search / ES Service (managed)",
+    "flink": "Tencent Oceanus (managed streaming)",
+    "spark": "Tencent EMR Spark (managed)",
+    "zmq": "containerize on TKE",
+}
+
+# Middleware kinds that have a DISTINCT managed Tencent service → replatform to
+# it as the PRIMARY recommendation (rehost-container becomes the fallback). The
+# managed target carries a CVM-equivalent SKU so cost.py prices it under the CVM
+# book at the same footprint the self-managed node occupied — so flipping the
+# recommendation from rehost-container to managed does NOT change TCO (managed
+# pricing is usage-based and not in the bundled book; the CVM figure is a sizing
+# placeholder, noted in the rationale). spark routes to EMR (priced in the book).
+# App-server runtimes (tomcat/weblogic/jboss/websphere/jetty/zmq) have NO distinct
+# managed product — "containerize on TKE" IS the managed-runtime replatform, so
+# they keep rehost-container as the primary (handled below, not in this map).
+_MIDDLEWARE_MANAGED_TARGET = {
+    "kafka":         ("Tencent CKafka",       "Tencent CKafka (managed Kafka)"),
+    "zookeeper":     ("Tencent TSE ZooKeeper", "Tencent TSE ZooKeeper (managed coordination)"),
+    "rabbitmq":      ("Tencent TDMQ",         "Tencent TDMQ for RabbitMQ (managed)"),
+    "activemq":      ("Tencent TDMQ",         "Tencent TDMQ (managed message queue)"),
+    "rocketmq":      ("Tencent TDMQ",         "Tencent TDMQ for RocketMQ (managed)"),
+    "pulsar":        ("Tencent TDMQ",         "Tencent TDMQ for Pulsar (managed)"),
+    "elasticsearch": ("Tencent Cloud Search", "Tencent Cloud Search / ES (managed)"),
+    "flink":         ("Tencent Oceanus",      "Tencent Oceanus (managed streaming)"),
+    "spark":         ("EMR",                  "Tencent EMR Spark (managed)"),
+}
 
 
 def _data_disk_gb(s: Server) -> int:
@@ -319,6 +471,43 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
     disk_gb = _data_disk_gb(s)
     high = (s.business_criticality or "").lower() == "high"
 
+    # --- self-hosted object / file storage ------------------------------
+    # Intercepted BEFORE the role branches so a storage node (role stays "app"
+    # from normalize, tagged object-store/file-store) is never lift-and-shifted
+    # as a plain CVM. minio/oss/s3 → COS (object); gluster/ceph/nfs → CFS (file).
+    # Priced via a CVM-equivalent SKU (the bundled book has no COS/CFS line) —
+    # the rationale notes actual cost is storage/usage-driven.
+    cat = _store_category(s.tags or [])
+    if cat:
+        sku, sz = _size_cvm(cpu, mem)
+        if cat == "object":
+            kind = _store_kind(s.tags or "")
+            tgt = Target(product="COS", spec=f"对象存储 Standard ({sku})",
+                         region=region, az=az,
+                         extras={"size": sz, "data_disk": disk_gb,
+                                 "replatform": True, "source": kind or "minio"},
+                         notes=f"Self-hosted object store ({kind or 'minio'}) → Replatform to "
+                               f"Tencent COS (managed object storage). Disk ≈ {disk_gb} GB. "
+                               f"Usage-based; the CVM-equivalent SKU is a sizing placeholder.")
+            return Match(s.id, tgt, confidence=0.78, method="rule",
+                         rationale=f"Object storage ({kind or 'minio'}) → Tencent COS "
+                                   "(managed). Migrate buckets/objects, retire the node.",
+                         alternatives=["自建 MinIO on CVM",
+                                       "CFS 文件存储 (if semantically a file share)"])
+        kind = _store_kind(s.tags or "")
+        tgt = Target(product="CFS", spec=f"文件存储 Standard ({sku})",
+                     region=region, az=az,
+                     extras={"size": sz, "data_disk": disk_gb,
+                             "replatform": True, "source": kind or "gluster"},
+                     notes=f"Self-hosted file store ({kind or 'gluster'}) → Replatform to "
+                           f"Tencent CFS (managed file storage). Disk ≈ {disk_gb} GB. "
+                           "Usage-based; the CVM-equivalent SKU is a sizing placeholder.")
+        return Match(s.id, tgt, confidence=0.74, method="rule",
+                     rationale=f"File storage ({kind or 'gluster'}) → Tencent CFS (managed). "
+                               "Migrate shares, retire the node.",
+                     alternatives=["自建 Gluster/Ceph on CVM",
+                                   "COS 对象存储 (if semantically objects)"])
+
     # --- container platform ---------------------------------------------
     if stype in ("k8s-master", "k8s-node") or role == "k8s":
         tags_lc = [t.lower() for t in (s.tags or [])]
@@ -343,6 +532,77 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
                      rationale=f"K8s worker ({cpu}vCPU/{mem}GB) → CVM {sku} as TKE node pool member.",
                      alternatives=["原生 Pod 迁移到 TKE 并弃用节点"])
 
+    # --- PaaS platform -------------------------------------------------
+    # Inventory analysis step 1 is per-item PaaS detection (normalize.detect_paas
+    # → role "paas"). A self-hosted PaaS / middleware platform (the on-prem
+    # ``zpaas`` stack) is NOT a lift-and-shift candidate: rehosting the platform
+    # control-plane VMs keeps you on a proprietary self-managed PaaS. The right
+    # call is to replatform the hosted workloads onto a managed / cloud-native
+    # platform (Tencent TKE), which is the immediate Replatform recommendation.
+    if role == "paas":
+        tgt = Target(product="TKE", spec="TKE 托管集群 (managed, replatform)",
+                     region=region, az=az,
+                     extras={"workload_shape": f"{cpu}vCPU/{mem}GB",
+                             "data_disk": disk_gb, "replatform": True},
+                     notes="Self-hosted PaaS platform → replatform workloads onto "
+                           "Tencent TKE managed cluster; do NOT lift-and-shift the "
+                           "platform control-plane VMs.")
+        return Match(s.id, tgt, confidence=0.8, method="rule",
+                     rationale="PaaS platform host (zpaas) → Replatform to managed "
+                               "TKE (cloud-native). Keep the platform's hosted apps, "
+                               "discard the self-managed control plane.",
+                     alternatives=["CVM lift-and-shift (keeps the self-hosted PaaS — not recommended)",
+                                  "容器化各应用到 TKE 并退役平台节点"])
+
+    # --- middleware / app-server / MQ ----------------------------------
+    # Inventory analysis step 1 judges middleware as Replatform-FIRST: a
+    # self-managed runtime (Kafka / ZooKeeper / RabbitMQ / Elasticsearch /
+    # Flink / Spark) that has a distinct Tencent managed service replatforms to
+    # it as the primary call (rehost-container is the fallback). App-server
+    # runtimes (Tomcat / WebLogic / JBoss / WebSphere / Jetty / ZeroMQ) have no
+    # distinct managed product — "containerize on TKE" IS the managed-runtime
+    # replatform, so rehost-container stays their primary.
+    if role == "middleware":
+        mw = _middleware_kind(s.tags)
+        managed = _MIDDLEWARE_MANAGED_TARGET.get(mw)
+        if managed:
+            product, label = managed
+            sku, sz = _size_cvm(cpu, mem)
+            if product == "EMR":
+                tgt = Target(product="EMR", spec=f"EMR Spark ({sku})",
+                             region=region, az=az,
+                             extras={"size": sz, "data_disk": disk_gb,
+                                     "replatform": True, "source": "spark"},
+                             notes=f"Self-managed Spark → Replatform to {label}; "
+                                   "re-onboard data via COS/distcp.")
+            else:
+                tgt = Target(product=product, spec=f"{label} ({sku})",
+                             region=region, az=az,
+                             extras={"size": sz, "data_disk": disk_gb,
+                                     "replatform": True, "source": mw},
+                             notes=f"Self-managed {mw} middleware → Replatform to {label} "
+                                   "(managed). Discards the self-managed runtime VM. "
+                                   "Usage-based; the CVM-equivalent SKU is a sizing placeholder "
+                                   "≈ the node footprint it replaces.")
+            return Match(s.id, tgt, confidence=0.82, method="rule",
+                         rationale=f"Middleware ({mw}) → Replatform to {label} (managed) "
+                                   "as the first call; containerize onto TKE only if a managed "
+                                   "service doesn't fit the workload.",
+                         alternatives=[
+                             f"rehost-container onto TKE worker (CVM {sku}) — containerize the self-managed {mw} runtime",
+                             "lift-and-shift to CVM as-is (keeps the self-managed middleware — not recommended)",
+                         ])
+        # app-server runtime: no distinct managed product → containerize on TKE
+        # (the managed-runtime replatform) is the primary; managed-service note
+        # stays as an alternative where one exists (e.g. Oracle WebLogic on cloud).
+        m = _rehost_container(s, region, az, cpu, mem, disk_gb,
+                              f"self-managed {mw} middleware" if mw
+                              else "self-managed middleware runtime")
+        alt = _MIDDLEWARE_MANAGED_ALT.get(mw)
+        if alt and alt not in (m.alternatives or []):
+            m.alternatives = list(m.alternatives or []) + [alt]
+        return m
+
     # --- big data ------------------------------------------------------
     # EMR is for Hadoop workloads regardless of metal/virtual. NB: do NOT gate
     # on ``stype == "baremetal"`` here — that sent EVERY bare-metal host (Oracle
@@ -366,19 +626,34 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
         # (an app that *connects to* Oracle) is not lifted-and-shifted as an
         # Oracle DB.
         tags_lc = [t.lower() for t in (s.tags or [])]
-        engine = _db_engine(tags_lc, s.hostname or "")
+        # The engine comes from the ``db:<engine>`` tag set by
+        # ``normalize.detect_db_engine`` (mount-based, the live-estate signal),
+        # falling back to the legacy ``_db_engine`` (tags + hostname) path so
+        # hand-built/tagged servers still route correctly.
+        engine = _db_kind(tags_lc) or _db_engine(tags_lc, s.hostname or "")
         if _is_oracle_db(tags_lc, s.hostname or ""):
-            sku, sz = _size_cvm(cpu, mem)
-            tgt = Target(product="CVM", spec=sku, region=region, az=az,
-                         extras={"size": sz, "data_disk": disk_gb, "license": "Oracle BYOL"},
-                         notes="Oracle licensed app — lift-and-shift to CVM (BYOL). "
-                               "Evaluate TDSQL Oracle-compat for re-platforming later.")
-            return Match(s.id, tgt, confidence=0.7, method="rule",
-                         rationale="Oracle DB → CVM lift-and-shift (license mobility). "
-                                   "Re-platforming to TDSQL is a separate project.",
-                         alternatives=["TDSQL (Oracle 兼容)", "腾讯云数据库 Oracle 版"])
+            # Oracle → Replatform to TData (TencentDB for Oracle, managed
+            # Oracle-compatible). Lift-and-shift to CVM BYOL keeps the license
+            # but locks the workload onto a self-managed instance; replatforming
+            # to TData is the recommended first call (managed, no PL/SQL rewrite
+            # for the compatible subset). CVM BYOL stays as the fallback.
+            _, cap = _size_by_mem(mem, CDB_MYSQL_SPECS)
+            edition = "高可用版(HA)" if high else "基础版"
+            tgt = Target(product="TData", spec=f"Oracle-compat {cap}GB {edition}",
+                         region=region, az=az,
+                         extras={"mem_gb": cap, "data_disk": disk_gb or 500,
+                                 "edition": edition, "replatform": True,
+                                 "source_engine": "oracle"},
+                         notes=f"TData (TencentDB for Oracle, managed Oracle-compatible), "
+                               f"disk ≈ {disk_gb or 500} GB. Replatform, not lift-and-shift.")
+            return Match(s.id, tgt, confidence=0.78, method="rule",
+                         rationale="Oracle DB → Replatform to TData (managed "
+                                   "Oracle-compatible). Avoids self-managed CVM + "
+                                   "BYOL lock-in; review PL/SQL for the non-compatible tail.",
+                         alternatives=["CVM lift-and-shift (Oracle BYOL, license mobility)",
+                                       "TDSQL (Oracle 兼容)"])
         if engine == "postgres":
-            spec, cap = _size_by_mem(mem, CDB_MYSQL_SPECS)  # same mem tiers
+            spec, cap = _size_by_mem(mem, CDB_PG_SPECS)  # PG-labeled tiers
             edition = "高可用版(HA)" if high else "基础版"
             tgt = Target(product="TencentDB for PostgreSQL",
                          spec=f"PostgreSQL 16 {spec} {edition}",
@@ -400,10 +675,43 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
             return Match(s.id, tgt, confidence=0.85, method="rule",
                          rationale="DB role (sqlserver) → TencentDB for SQL Server (managed).",
                          alternatives=["自建 SQL Server on CVM (BYOL)"])
+        if engine == "mongo":
+            # MongoDB → Replatform to TencentDB for MongoDB (managed replica
+            # set / sharded cluster). Sized by the CDB (MySQL) mem tiers so the
+            # business case prices it (cost.py aliases the product onto CDB).
+            spec, cap = _size_by_mem(mem, CDB_MYSQL_SPECS)
+            edition = "高可用版(HA)" if high else "基础版"
+            tgt = Target(product="TencentDB for MongoDB",
+                         spec=f"MongoDB {spec} {edition}",
+                         region=region, az=az,
+                         extras={"mem_gb": cap, "disk_gb": disk_gb or 500,
+                                 "edition": edition, "replatform": True,
+                                 "source_engine": "mongo"},
+                         notes=f"TencentDB for MongoDB (managed), disk ≈ {disk_gb or 500} GB. "
+                               "Replatform from self-managed Mongo; review drivers/indices.")
+            return Match(s.id, tgt, confidence=0.82, method="rule",
+                         rationale="MongoDB → Replatform to TencentDB for MongoDB (managed). "
+                                   "Avoids self-managed replica-set/sharding ops.",
+                         alternatives=["自建 MongoDB on CVM (replica set)",
+                                       "容器化 Mongo on TKE (rehost-container)"])
+        if engine in _DB_NO_MANAGED:
+            # No first-class managed Tencent equivalent → honest CVM rehost (keep
+            # the engine, move the VM); the managed option is a separate
+            # evaluation noted in the alternatives, not a forced replatform.
+            sku, sz = _size_cvm(cpu, mem)
+            hint = _DB_MANAGED_HINT.get(engine, "evaluate managed DB")
+            tgt = Target(product="CVM", spec=sku, region=region, az=az,
+                         extras={"size": sz, "data_disk": disk_gb or 500},
+                         notes=f"Self-managed {engine} DB → CVM rehost (no first-class managed "
+                               f"Tencent equivalent for {engine}). Disk ≈ {disk_gb or 500} GB.")
+            return Match(s.id, tgt, confidence=0.7, method="rule",
+                         rationale=f"DB role ({engine}) → CVM rehost; managed equivalent "
+                                   f"({hint}) is a separate evaluation.",
+                         alternatives=[hint, "容器化到 TKE (rehost-container)"])
         # default mysql/mariadb
         spec, cap = _size_by_mem(mem, CDB_MYSQL_SPECS)
         edition = "高可用版(HA)" if high else "基础版"
-        is_replica = "replica" in " ".join(s.tags or []).lower()
+        is_replica = "replica" in {(t or "").lower() for t in (s.tags or [])}
         if is_replica:
             edition = "只读实例(RO)"
         tgt = Target(product="CDB", spec=f"MySQL 8.0 {spec} {edition}",
@@ -417,12 +725,18 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
 
     # --- cache ----------------------------------------------------------
     if role == "cache":
-        if high:
+        # A Redis host is pre-judged as managed PaaS directly (TencentDB for
+        # Redis), NOT gated on the `high` criticality flag — the live estate
+        # carries no criticality data, so the old gate sent every Redis host to
+        # CVM self-hosted. Non-Redis cache (e.g. memcache) keeps the criticality
+        # gate: prod → managed Redis, low-crit → CVM.
+        if _cache_kind(s.tags or []) == "redis" or high:
             spec, cap = _size_by_mem(mem, REDIS_SPECS)
             tgt = Target(product="TencentDB for Redis", spec=spec, region=region, az=az,
                          extras={"mem_gb": cap}, notes="Managed Redis (标准版集群).")
             return Match(s.id, tgt, confidence=0.85, method="rule",
-                         rationale="Prod cache → TencentDB for Redis (managed, HA).",
+                         rationale="Redis cache → TencentDB for Redis (managed, HA). "
+                                   "Replatform from self-managed Redis.",
                          alternatives=["自建 Redis on CVM"])
         sku, sz = _size_cvm(cpu, mem)
         tgt = Target(product="CVM", spec=sku, region=region, az=az,
@@ -431,6 +745,16 @@ def match_server(s: Server, sizing_strategy: str = "as_is") -> Match:
         return Match(s.id, tgt, confidence=0.8, method="rule",
                      rationale="Low-criticality cache → CVM with self-managed Redis.",
                      alternatives=["TencentDB for Redis"])
+
+    # --- long-term EOL/EOS OS → rehost-container -------------------------
+    # A long-dead OS image must not be lift-and-shifted. Only CVM-bound roles
+    # (app/web/monitoring/general) reach here — db/cache/k8s/paas/hadoop/
+    # middleware already escaped the OS via a managed / container target above,
+    # so this never overrides a managed-service recommendation. Containerize
+    # onto a supported TKE base image to escape the EOL OS.
+    if os_long_term_eol(s):
+        return _rehost_container(s, region, az, cpu, mem, disk_gb,
+                                 "long-term EOL/EOS OS")
 
     # --- web / app / monitoring / general -------------------------------
     sku, sz = _size_cvm(cpu, mem)

@@ -29,12 +29,12 @@ function renderInv(r){
   // facets
   const fc = r.facets || {};
   const groups = [
-    ['role','Role',fc.role,{db:'p',k8s:'',hadoop:'a',cache:'o',web:'g',monitoring:'',app:''}],
+    ['role','Role',fc.role,{db:'p',k8s:'',hadoop:'a',cache:'o',web:'g',monitoring:'',app:'',paas:'t',middleware:'a'}],
     ['env','Env',fc.env,{prod:'r',staging:'a',dev:'g'}],
     ['os','OS',fc.os],
     ['source_type','Type',fc.source_type],
     ['criticality','Criticality',fc.criticality,{high:'r',medium:'a',low:'g'}],
-    ['target_product','Target',fc.target_product,{CDB:'p',EMR:'a',TKE:'',CVM:''}],
+    ['target_product','Target',fc.target_product,{CDB:'p',EMR:'a',TKE:'',CVM:'',TData:'t'}],
     ['os_eol_bucket','OS EOL',fc.os_eol_bucket,{active:'g',expiring:'a',expired:'r',unknown:'',unknown_or_none:''}],
     ['warranty_bucket','Warranty',fc.warranty_bucket,{active:'g',expiring:'a',expired:'r',unknown:''}],
   ];

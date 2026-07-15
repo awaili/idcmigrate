@@ -19,7 +19,9 @@ from collections import defaultdict, deque
 from typing import Callable, Dict, List, Optional, Set
 
 from .codeintel import (
+    CRIT_RANK,
     ProfileIndex,
+    app_criticality_rank,
     disposition_waves,
     effort_rank,
     index_profiles,
@@ -49,8 +51,13 @@ def _topo_order(workloads: List[Workload],
     indeg = {w.app_id: 0 for w in workloads}
     children: Dict[str, List[str]] = defaultdict(list)
     for w in workloads:
+        # dedup depends_on first: a duplicate dep (e.g. "A;A" from a CSV cell)
+        # would double-count indegree and append the child twice, leaving the
+        # node never queued (treated as cyclic -> appended out-of-order).
+        seen_dep: set = set()
         for dep in w.depends_on:
-            if dep in by_id:
+            if dep in by_id and dep not in seen_dep:
+                seen_dep.add(dep)
                 indeg[w.app_id] += 1
                 children[dep].append(w.app_id)
 
@@ -84,7 +91,8 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
                code_profiles: Optional[List[CodeProfile]] = None,
                max_waves: int = 0,
                strategies: Optional[Dict[str, "AppStrategy"]] = None,
-               min_assessment_confidence: float = 0.0) -> List[Wave]:
+               min_assessment_confidence: float = 0.0,
+               legacy_dispositions: Optional[List] = None) -> List[Wave]:
     """Group servers into migration waves with a dependency DAG.
 
     ``code_profiles`` (from the external agent executor) enrich the plan:
@@ -119,13 +127,42 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
     """
     workloads = workloads or []
     pidx: ProfileIndex = index_profiles(code_profiles or [])
+    # F3 — precompute the app->criticality-rank map ONCE (the topo sort's
+    # tie-breaker calls the order key per app per level; app_criticality_rank
+    # scans all servers each call -> O(S*A*levels), far too slow for 15K
+    # estates). Computing it up front makes the whole topo sort O(A*levels).
+    _wl_by_id = {w.app_id: w for w in workloads}
+    _srv_app_ids = [s.app_ids or [] for s in servers]
+    crit_by_app: Dict[str, int] = {}
+
+    def _crit_for(app_id: str) -> int:
+        if app_id in crit_by_app:
+            return crit_by_app[app_id]
+        w = _wl_by_id.get(app_id)
+        srvs = [s for s in servers if app_id in (s.app_ids or [])]
+        if not srvs and w is not None:
+            srvs = [s for s in servers if s.id in set(w.server_ids)]
+        if not srvs:
+            crit_by_app[app_id] = 1
+            return 1
+        best = 2
+        for s in srvs:
+            c = (getattr(s, "business_criticality", "") or "").strip().lower()
+            r = CRIT_RANK.get(c, 1)
+            best = min(best, r)
+        crit_by_app[app_id] = best
+        return best
+
     if pidx:
         # merge code deps (idempotent — deduped) so the topo sort sees them
         merge_code_deps(workloads, code_profiles or [])
-        order_key = lambda a: (  # noqa: E731  cheap-first within a level
-            effort_rank(pidx.get(a)), pattern_rank(pidx.get(a)))
+        # F3 — order within a topo level: high-crit apps first (they release
+        # dependents + get an earlier cutover slot), then cheap effort/pattern.
+        order_key = lambda a: (  # noqa: E731  high-crit first, then cheap-first
+            _crit_for(a), effort_rank(pidx.get(a)), pattern_rank(pidx.get(a)))
     else:
-        order_key = None
+        # no code profiles — still order high-crit apps first within a level.
+        order_key = lambda a: _crit_for(a)  # noqa: E731
     by_id = {s.id: s for s in servers}
     waves: List[Wave] = []
 
@@ -135,7 +172,8 @@ def plan_waves(servers: List[Server], workloads: Optional[List[Workload]] = None
     # if EVERY app it belongs to is the same disposition (shared servers with a
     # migrating app still migrate). Servers with no app binding are never here.
     retain_ids, retire_ids = non_migrating_servers(servers, workloads,
-                                                   code_profiles or [], strategies)
+                                                   code_profiles or [], strategies,
+                                                   legacy_dispositions=legacy_dispositions)
     excluded = retain_ids | retire_ids
 
     # --- data-gap soft confidence gate: pull thinly-known hosts OUT of the

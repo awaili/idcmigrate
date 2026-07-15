@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import shlex
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
@@ -43,23 +44,40 @@ SYSTEM_PREAMBLE = (
 # the agent emits a per-archetype blueprint (VPC + peering + CAM + SG + tag
 # policy + policy-as-code) instead of a one-shot blob. The blueprints are data
 # from idc.core.lz; the agent does the actual HCL emit.
-def lz_context(archetype: str) -> str:
+#
+# Phase A: pass ``store`` to use the active (operator-authored) LZ design;
+# omit it for the built-in default (back-compat — the agent path predates the
+# design table and some callers have no store handle).
+def lz_context(archetype: str, store=None) -> str:
     """One archetype's LZ blueprint as an agent context block (F8)."""
     from ..core.lz import LZ_BLUEPRINTS, LZ_ARCHETYPES
-    if archetype not in LZ_ARCHETYPES:
-        return f"(unknown LZ archetype: {archetype})"
-    bp = LZ_BLUEPRINTS[archetype]
+    if store is not None:
+        from ..core.lz import get_active_lz_design
+        bp = get_active_lz_design(store).archetypes.get(archetype)
+        if not bp:
+            return f"(unknown LZ archetype: {archetype})"
+    else:
+        if archetype not in LZ_ARCHETYPES:
+            return f"(unknown LZ archetype: {archetype})"
+        bp = LZ_BLUEPRINTS[archetype]
     return (
         f"LANDING ZONE ARCHETYPE: {archetype}\n"
-        f"{bp['summary']}\n"
+        f"{bp.get('summary', archetype)}\n"
         f"Blueprint (emit Terraform matching this):\n"
         + json.dumps(bp, ensure_ascii=False, indent=2)
     )
 
 
-def lz_context_all() -> str:
-    """All three archetype blueprints (for a 'generate the full LZ' prompt)."""
-    return "\n\n---\n\n".join(lz_context(a) for a in ("corp", "online", "dmz"))
+def lz_context_all(store=None) -> str:
+    """All archetype blueprints of the active design (or the built-in default
+    when ``store`` is None) — for a 'generate the full LZ' prompt."""
+    if store is not None:
+        from ..core.lz import active_lz_archetypes
+        names = active_lz_archetypes(store)
+    else:
+        from ..core.lz import LZ_ARCHETYPES
+        names = list(LZ_ARCHETYPES)
+    return "\n\n---\n\n".join(lz_context(a, store=store) for a in names)
 
 
 @dataclass
@@ -146,6 +164,11 @@ async def stream_agent(
     full_prompt = f"{context}\n\n--- TASK ---\n{prompt}" if context else prompt
     cmd = _build_cmd(full_prompt, settings, mode, cwd, add_dirs)
     timeout = timeout or settings.claude_timeout
+    # Total wall-clock deadline for the whole stream: the per-read wait below is
+    # derived from the REMAINING budget, so a chatty-but-stuck agent (a line every
+    # just-under-timeout seconds) can't run indefinitely — the original per-line
+    # timeout reset on every line and had no overall bound.
+    deadline = time.monotonic() + timeout
     try:
         # Pass a minimal environment to the Claude subprocess: keep PATH/HOME/
         # locale and the Claude/Anthropic auth vars the CLI needs, but DROP the
@@ -175,7 +198,9 @@ async def stream_agent(
         assert proc.stdout is not None
         while True:
             try:
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+                remaining = max(0.1, deadline - time.monotonic())
+                line = await asyncio.wait_for(proc.stdout.readline(),
+                                              timeout=remaining)
             except asyncio.TimeoutError:
                 proc.kill()
                 yield AgentEvent("error", text=f"agent timed out after {timeout}s")

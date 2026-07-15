@@ -100,6 +100,52 @@ def test_search_finds_by_hostname():
     assert any(h["hostname"] == "b" for h in r["matches"])
 
 
+def test_search_oracle_database_finds_db_hosts():
+    # Oracle DB hosts are tagged "oracle-db" (role "db"); the phrase
+    # "oracle database" never appears verbatim, so the search must be
+    # token-aware (database→db, split oracle-db) to find them.
+    servers, _, _ = _estate()
+    servers = servers + [
+        Server(hostname="ora-prod-01", role="db", tags=["oracle-db"], env="prod"),
+        Server(hostname="pg-repl-02", role="db", tags=["db:postgres"], env="prod"),
+        Server(hostname="app-web-03", role="app", tags=["mw:tomcat"], env="dev"),
+        # MySQL host running on Oracle Linux — "oracle" must NOT match via the
+        # OS when the query is "oracle database" (the canonicalization to the
+        # oracle-db tag excludes this false positive).
+        Server(hostname="mysql-on-ol", role="db", tags=["db:mysql", "mysql"],
+               os="oracle linux", env="prod"),
+    ]
+    r = estate_query("search", {"q": "oracle database"},
+                     servers=servers, waves=[], workloads=[], **CTX_KW)
+    hostnames = {h["hostname"] for h in r["matches"]}
+    assert "ora-prod-01" in hostnames          # oracle DB host matches
+    assert "pg-repl-02" not in hostnames        # postgres is not oracle
+    assert "app-web-03" not in hostnames
+    assert "mysql-on-ol" not in hostnames       # Oracle Linux OS is not Oracle DB
+    assert r["count"] == 1 and r["shown"] == len(r["matches"])
+    # single-token "oracle" also works (substring of oracle-db)
+    r2 = estate_query("search", {"q": "oracle"},
+                      servers=servers, waves=[], workloads=[], **CTX_KW)
+    assert "ora-prod-01" in {h["hostname"] for h in r2["matches"]}
+    # "database" alone folds to db -> matches all db hosts (incl. the OL one)
+    r3 = estate_query("search", {"q": "database"},
+                      servers=servers, waves=[], workloads=[], **CTX_KW)
+    assert {"ora-prod-01", "pg-repl-02", "mysql-on-ol"} <= {h["hostname"] for h in r3["matches"]}
+
+
+def test_search_caps_payload_but_reports_true_total():
+    servers, _, _ = _estate()
+    servers = servers + [
+        Server(hostname=f"ora-{i:03d}", role="db", tags=["oracle-db"], env="prod")
+        for i in range(60)]
+    r = estate_query("search", {"q": "oracle"},
+                     servers=servers, waves=[], workloads=[], **CTX_KW)
+    assert r["count"] == 60          # true total
+    assert r["shown"] == 30          # payload capped
+    assert r["truncated"] is True
+    assert len(r["matches"]) == 30
+
+
 def test_unknown_intent_returns_hint():
     servers, waves, wls = _estate()
     r = estate_query("nonsense", {}, servers=servers, waves=waves, workloads=wls, **CTX_KW)

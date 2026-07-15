@@ -30,6 +30,8 @@ class ServiceNowAdapter(Adapter):
     def fetch(self, settings: Settings) -> IngestResult:
         if settings.has_servicenow():
             return self._online(settings)
+        if not settings.allow_fixture_fallback:
+            return self._fixture_disabled(settings)
         return self._fixture(settings)
 
     # -- offline -----------------------------------------------------------
@@ -79,7 +81,13 @@ class ServiceNowAdapter(Adapter):
             r.raise_for_status()
             rows = r.json().get("result", [])
         except Exception as e:
-            # fall back to fixture so the system stays usable
+            if not settings.allow_fixture_fallback:
+                # never pull dummy fixture data over a real (creds-configured)
+                # live deployment on a transient API failure — that would
+                # inject phantom CMDB hosts into the real inventory.
+                return IngestResult(assets=[], mode="error",
+                                    error=f"servicenow online failed ({e!r}); fixture fallback disabled")
+            # fall back to fixture so a demo/offline system stays usable
             fix = self._fixture(settings)
             return IngestResult(assets=fix.assets, mode="fixture",
                                 error=f"servicenow online failed ({e!r}); used fixture")

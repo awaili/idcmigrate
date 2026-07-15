@@ -44,10 +44,13 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   t.classList.add('active'); $('tab-'+t.dataset.tab).classList.remove('hidden');
   if(t.dataset.tab==='dashboard') loadDashboard();
   if(t.dataset.tab==='inventory') fetchInv();
-  if(t.dataset.tab==='waves'){ loadWaves(); loadLzReadiness(); }
+  if(t.dataset.tab==='lz') loadLz();
+  if(t.dataset.tab==='waves'){ loadWaves(); loadLzReadiness(); loadLzGate(); }
   if(t.dataset.tab==='code') loadCode();
   if(t.dataset.tab==='business-case') loadLatestBusinessCase();
   if(t.dataset.tab==='execution') loadExecution();
+  if(t.dataset.tab==='testing') loadTesting();
+  if(t.dataset.tab==='docs') loadDocs();
   if(t.dataset.tab==='readiness') loadReadiness();
   if(t.dataset.tab==='data-quality'){ loadDataGaps(); loadDiscovery(); }
 });
@@ -60,7 +63,7 @@ async function loadStats(){
 }
 
 /* ---------- pipeline ops ---------- */
-async function doIngest(){ await api('/ingest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source:'all'})}); await loadStats(); if(!$('tab-dashboard').classList.contains('hidden'))loadDashboard(); if(!$('tab-inventory').classList.contains('hidden'))fetchInv(); loadRail(); }
+async function doIngest(){ try{ await api('/ingest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source:'all'})}); toast('ingest done','ok'); }catch(e){ toast('ingest failed: '+e,'err'); } finally{ loadStats(); if(!$('tab-dashboard').classList.contains('hidden'))loadDashboard(); if(!$('tab-inventory').classList.contains('hidden'))fetchInv(); loadRail(); } }
 let _rebuildAbort = null;
 const _REBUILD_PHASE = {
   normalize: 'normalize', 'persist:servers': 'write servers',
@@ -111,7 +114,7 @@ async function doRebuild(){
           await loadStats();
           if(!$('tab-dashboard').classList.contains('hidden'))loadDashboard();
           if(!$('tab-inventory').classList.contains('hidden'))fetchInv();
-          if(!$('tab-waves').classList.contains('hidden'))loadWaves();
+          if(!$('tab-waves').classList.contains('hidden')){ loadWaves(); loadLzGate(); }
           loadRail();
         } else if(j.type === 'error'){
           lastErr = j.error; st.innerHTML = '<span class="ev-err">error</span>';

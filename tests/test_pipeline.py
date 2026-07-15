@@ -101,7 +101,7 @@ def test_match_targets(all_assets):
     def prod(h): return matches[by_host[h].id].target.product
 
     assert prod("db-mysql-01") == "CDB"
-    assert prod("db-oracle-01") == "CVM"   # Oracle → lift-and-shift
+    assert prod("db-oracle-01") == "TData"   # Oracle → Replatform to TData
     assert prod("k8s-master-01") == "TKE"
     assert prod("k8s-worker-01") == "CVM"  # TKE node
     assert prod("hdop-nn-01") == "EMR"

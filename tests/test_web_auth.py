@@ -74,6 +74,34 @@ def test_executor_bearer_bypasses_session_gate(_web_auth_on):
     assert c.get("/api/change-jobs", headers={"Authorization": "Bearer wrong"}).status_code == 401
 
 
+def test_executor_bearer_reaches_push_back_routes(_web_auth_on):
+    """The F5/F7/F9/F10/F11 executor push-back PUT routes must accept the
+    executor bearer when web auth is on — otherwise the middleware 401s the
+    callback before _check_executor_auth ever runs (the executor's push loop
+    is dead on any password-protected deployment). Assert each route is NOT
+    401 with a valid bearer (the handler may 400/422/404 on the body, but the
+    auth gate must let it through)."""
+    c = TestClient(m.app)
+    h = {"Authorization": "Bearer " + _web_auth_on["bearer"],
+         "content-type": "application/json"}
+    push_paths = [
+        ("/api/legacy-dispositions/srv-x", {}),
+        ("/api/docs/cutover/app-x", {}),
+        ("/api/iac-artifacts/app-x", {}),
+        ("/api/postmig-recs/srv-x/right_size", {}),
+        ("/api/test-cases/app-x", {"cases": []}),
+        ("/api/test-runs/run-x", {}),
+        ("/api/test-diffs/app-x", {}),
+    ]
+    for path, body in push_paths:
+        r = c.put(path, json=body, headers=h)
+        assert r.status_code != 401, f"{path} was 401 (bearer not honored by middleware)"
+    # without the bearer these routes ARE gated (session-only)
+    for path, body in push_paths:
+        r = c.put(path, json=body, headers={"content-type": "application/json"})
+        assert r.status_code == 401, f"{path} should be session-gated without a bearer"
+
+
 def test_change_password_requires_current_and_session(_web_auth_on):
     # unauthed -> 401
     assert client.post("/api/auth/password",

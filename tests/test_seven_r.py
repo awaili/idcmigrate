@@ -21,9 +21,16 @@ from idc.llm.client import LLMClient
 # ---------------------------------------------------------------------------
 def test_7r_vocabulary_is_seven():
     assert len(ALL_PATTERNS_7R) == 7
+    # the 7R framework: rehost, rehost-container, replatform, refactor,
+    # repurchase, retire, relocate. (retain is a keep-on-prem disposition,
+    # not one of the seven — the strategist may still return it.)
     for p in ("rehost", "rehost-container", "replatform", "refactor",
-              "repurchase", "retain", "retire"):
+              "repurchase", "retire", "relocate"):
         assert p in ALL_PATTERNS_7R
+    assert "retain" not in ALL_PATTERNS_7R   # retain is a disposition, not a 7R
+    # the LLM strategist's valid set is the 7R PLUS retain
+    from idc.core.models import STRATEGY_CHOICES
+    assert set(STRATEGY_CHOICES) == set(ALL_PATTERNS_7R) | {"retain"}
 
 
 def test_pattern_rank_orders_cheapest_first_and_non_migrating_last():
@@ -32,11 +39,17 @@ def test_pattern_rank_orders_cheapest_first_and_non_migrating_last():
     assert ranks["rehost"] == 0
     assert ranks["rehost-container"] == 1                 # between rehost and replatform
     assert ranks["replatform"] == 2
-    # migrating patterns sort before non-migrating
+    assert ranks["relocate"] == 0                          # no-code-change move, as cheap as rehost
+    # migrating patterns (the 7R minus retire) sort before the non-migrating
+    # dispositions (retain/retire), which rank >= 10.
     for m in MIGRATING_PATTERNS:
-        assert ranks[m] < ranks["retain"]
-        assert ranks[m] < ranks["retire"]
-    assert ranks["retain"] >= 10 and ranks["retire"] >= 10
+        assert pattern_rank(CodeProfile(app_id="x", migration_pattern=m)) < 10
+    retain_r = pattern_rank(CodeProfile(app_id="x", migration_pattern="retain"))
+    retire_r = pattern_rank(CodeProfile(app_id="x", migration_pattern="retire"))
+    assert retain_r >= 10 and retire_r >= 10
+    # every migrating pattern sorts before retain/retire
+    for m in MIGRATING_PATTERNS:
+        assert pattern_rank(CodeProfile(app_id="x", migration_pattern=m)) < retain_r
 
 
 def test_enrich_match_retain_floors_confidence_and_notes():
@@ -103,6 +116,29 @@ def test_seven_r_strategy_accepts_each_of_7r(strat):
     assert r["ok"] is True and r["strategy"] == strat
 
 
+def test_seven_r_strategy_accepts_retain_disposition():
+    """retain is NOT one of the 7R, but the strategist may still return it
+    (keep-on-prem) — so a regulated mainframe isn't forced into a migrating R."""
+    from idc.core.models import STRATEGY_CHOICES
+    assert "retain" in STRATEGY_CHOICES
+    s, wls, prof = _estate()
+    c = LLMClient(Settings(llm_enabled=True))
+    with patch.object(c, "chat", return_value=_resp("retain")):
+        r = c.seven_r_strategy("app-1", [s], wls, [], [prof])
+    assert r["ok"] is True and r["strategy"] == "retain"
+
+
+def test_enrich_match_relocate_is_clean_no_floor_no_requires_note():
+    """relocate is a no-code-change move (like rehost): no confidence floor, no
+    'requires relocate' note (it's not extra work)."""
+    m = Match(server_id="s", confidence=0.9, rationale="base")
+    enrich_match(m, CodeProfile(app_id="a", migration_pattern="relocate",
+                                cloud_readiness=0.9))
+    assert m.confidence == 0.9                       # no floor
+    assert "requires" not in (m.rationale or "")
+    assert "relocate" not in (m.rationale or "")      # no spurious note
+
+
 def test_seven_r_strategy_rejects_invalid_strategy():
     s, wls, prof = _estate()
     c = LLMClient(Settings(llm_enabled=True))
@@ -145,6 +181,65 @@ def test_seven_r_strategy_llm_exception_degrades():
         r = c.seven_r_strategy("app-1", [s], wls, [], [prof])
     assert r["ok"] is False
     assert "MigraQ error" in r["error"]
+
+
+# ---------------------------------------------------------------------------
+# F2 — deterministic 7R confidence ceiling (clamps the LLM value)
+# ---------------------------------------------------------------------------
+from idc.core.codeintel import seven_r_confidence
+
+
+def test_seven_r_confidence_base_is_cloud_readiness_when_clean():
+    # no blockers, low effort, well-known estate -> ceiling == cloud_readiness
+    assert seven_r_confidence(0.7, 0, "low", 1.0) == pytest.approx(0.7)
+
+
+def test_seven_r_confidence_blockers_trim_ceiling():
+    assert seven_r_confidence(0.8, 0, "low", 1.0) == pytest.approx(0.8)
+    assert seven_r_confidence(0.8, 2, "low", 1.0) == pytest.approx(0.8 - 0.30)
+    # capped at 3 blockers
+    assert seven_r_confidence(0.8, 9, "low", 1.0) == pytest.approx(0.8 - 0.45)
+
+
+def test_seven_r_confidence_high_effort_and_thin_estate_trim():
+    clean = seven_r_confidence(0.9, 0, "low", 1.0)
+    high_effort = seven_r_confidence(0.9, 0, "high", 1.0)
+    thin_estate = seven_r_confidence(0.9, 0, "low", 0.0)
+    assert high_effort < clean
+    assert thin_estate < clean
+    # never below the floor
+    assert seven_r_confidence(0.0, 9, "high", 0.0) >= 0.05
+    # never above the cap
+    assert seven_r_confidence(1.0, 0, "low", 1.0) <= 0.95
+
+
+def test_seven_r_strategy_clamps_overconfident_llm():
+    """An LLM stamping 0.95 on a blocked, thinly-known app is clamped to the
+    deterministic ceiling; the LLM may lower but not raise above it."""
+    s, wls, _ = _estate()
+    # blockered, high-effort, low-readiness profile
+    prof = CodeProfile(app_id="app-1", cloud_readiness=0.4,
+                       migration_pattern="refactor", refactor_effort="high",
+                       blockers=["PL/SQL has no equivalent", "cron assumed on host"])
+    c = LLMClient(Settings(llm_enabled=True))
+    with patch.object(c, "chat", return_value=_resp("refactor", confidence=0.95)):
+        r = c.seven_r_strategy("app-1", [s], wls, [], [prof])
+    assert r["ok"] is True
+    assert r["confidence"] < 0.95
+    assert r["confidence"] <= r["confidence_ceiling"] + 1e-9
+    assert r["confidence_clamped"] is True
+
+
+def test_seven_r_strategy_passes_llm_value_when_under_ceiling():
+    """When the LLM is *less* confident than the ceiling, its value is kept
+    (the LLM sees nuance the formula can't)."""
+    s, wls, prof = _estate()   # cloud_readiness 0.7, low effort, no blockers
+    c = LLMClient(Settings(llm_enabled=True))
+    with patch.object(c, "chat", return_value=_resp("rehost", confidence=0.3)):
+        r = c.seven_r_strategy("app-1", [s], wls, [], [prof])
+    assert r["ok"] is True
+    assert r["confidence"] == pytest.approx(0.3)
+    assert r["confidence_clamped"] is False
 
 
 # ---------------------------------------------------------------------------

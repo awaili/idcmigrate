@@ -1102,6 +1102,501 @@ def code_skip(qid: str = typer.Argument(...),
 
 
 # ---------------------------------------------------------------------------
+# F5/F6 — DB heterogeneous conversion profiles (executor pushes; CLI reads)
+# ---------------------------------------------------------------------------
+db_cli = typer.Typer(add_completion=False, help="DB heterogeneous conversion (assess + convert).")
+app_cli.add_typer(db_cli, name="db")
+
+
+@db_cli.command("profiles")
+def db_profiles():
+    """List DB conversion profiles pushed by the executor."""
+    st = _store()
+    t = Table("db_server_id", "src→tgt", "grade", "man-days", "blocked", "auto%", "conv?")
+    for p in st.list_db_profiles():
+        conv = p.conversion
+        blocked = sum(1 for o in (conv.objects or []) if o.status == "blocked") if conv else 0
+        t.add_row(p.db_server_id, f"{p.source_engine}→{p.target_engine}",
+                  p.difficulty or "-", f"{p.est_man_days:.0f}" if p.est_man_days else "-",
+                  str(blocked), f"{p.auto_convert_pct*100:.0f}%" if p.auto_convert_pct else "-",
+                  "yes" if conv else "-")
+    console.print(t)
+    st.close()
+
+
+@db_cli.command("show")
+def db_show(db_server_id: str = typer.Argument(...)):
+    """Show one DB host's conversion profile (+ compatibility report if any)."""
+    from ..core.codeintel import db_conversion_summary
+    st = _store()
+    try:
+        p = st.get_db_profile(db_server_id)
+        if not p:
+            console.print(f"[red]no DB profile for {db_server_id}[/red]")
+            raise typer.Exit(1)
+        console.print_json(data=p.to_dict())
+        report = db_conversion_summary(p)
+        if report:
+            console.print("\n[bold]Compatibility report:[/bold]\n")
+            console.print(report)
+        else:
+            console.print("\n[dim]no conversion artifact (run `idc db convert`)[/dim]")
+    finally:
+        st.close()
+
+
+@db_cli.command("convert")
+def db_convert(db_server_id: str = typer.Argument(...),
+               target_engine: str = typer.Option("", "--target",
+                   help="tdsql / cdb_mysql / postgresql (default per source engine)"),
+               source_engine: str = typer.Option("", "--source",
+                   help="oracle / sqlserver / mysql (inferred if omitted)")):
+    """Trigger the executor to convert a DB host's schema/SQL (F6).
+
+    The executor pushes a DBConversionProfile back with the converted DDL + a
+    per-object compatibility report in `.conversion`. (`db-scan` assess mode is
+    grade-only; this is convert mode.)"""
+    from ..agent import ExecutorError, get_executor_client
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled (IDC_EXECUTOR_ENABLED=false)[/red]")
+        raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]")
+        raise typer.Exit(1)
+    try:
+        res = ec.db_scan(db_server_id, source_engine, target_engine, mode="convert")
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]triggered db-convert for {db_server_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+    console.print("[dim]the executor will push the profile + compatibility report "
+                  "back to PUT /api/db-profiles; run `idc db show` once it lands.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# F7 — legacy / unsupported-OS disposition (executor pushes; CLI reads)
+# ---------------------------------------------------------------------------
+legacy_cli = typer.Typer(add_completion=False, help="Legacy/unsupported-OS disposition (containerize/replatform/rewrite/retain).")
+app_cli.add_typer(legacy_cli, name="legacy")
+
+
+@legacy_cli.command("list")
+def legacy_list():
+    """List stored legacy-OS dispositions pushed by the executor."""
+    st = _store()
+    t = Table("server_id", "disposition", "confidence", "effort(d)", "base_image", "rationale")
+    for d in st.list_legacy_dispositions():
+        t.add_row(d.server_id, d.disposition or "-",
+                  f"{d.confidence:.2f}" if d.confidence else "-",
+                  f"{d.effort_days:.0f}" if d.effort_days else "-",
+                  d.target_base_image or "-", (d.rationale or "")[:60])
+    console.print(t)
+    st.close()
+
+
+@legacy_cli.command("show")
+def legacy_show(server_id: str = typer.Argument(...)):
+    """Show one host's stored legacy-OS disposition."""
+    st = _store()
+    try:
+        d = st.get_legacy_disposition(server_id)
+        if not d:
+            console.print(f"[red]no disposition for {server_id}[/red]")
+            raise typer.Exit(1)
+        console.print_json(data=d.to_dict())
+    finally:
+        st.close()
+
+
+@legacy_cli.command("analyze")
+def legacy_analyze(server_id: str = typer.Argument(...),
+                   role: str = typer.Option("", "--role", help="app/web/db/cache/..."),
+                   os_name: str = typer.Option("", "--os", help="os string"),
+                   runtime: str = typer.Option("", "--runtime", help="jdk8/python3.9/..."),
+                   has_repo: bool = typer.Option(False, "--has-repo",
+                       help="the app has a source repo (containerize is less likely)"),
+                   os_bucket: str = typer.Option("expired", "--os-eol",
+                       help="expired|expiring|active|unknown")):
+    """Trigger the executor to analyze an EOL host and recommend
+    containerize/replatform/rewrite/retain (F7). Force re-runs even if a
+    disposition is already stored."""
+    from ..agent import ExecutorError, get_executor_client
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled (IDC_EXECUTOR_ENABLED=false)[/red]")
+        raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]")
+        raise typer.Exit(1)
+    ctx = {"role": role, "os": os_name, "runtime": runtime,
+           "has_source_repo": has_repo, "os_eol_bucket": os_bucket}
+    try:
+        res = ec.legacy_disposition(server_id, ctx)
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]triggered legacy-disposition for {server_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+    console.print("[dim]the executor will push the disposition back to "
+                  "PUT /api/legacy-dispositions; run `idc legacy show` once it lands.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# F9 — generated docs: cutover playbook + as-built (+ runbook)
+# ---------------------------------------------------------------------------
+doc_cli = typer.Typer(add_completion=False, help="Generated migration docs (cutover playbook / as-built / runbook).")
+app_cli.add_typer(doc_cli, name="doc")
+
+
+@doc_cli.command("list")
+def doc_list(doc_type: str = typer.Option("", "--type", help="runbook|cutover|as_built")):
+    """List generated doc artifacts."""
+    st = _store()
+    t = Table("doc_type", "scope_id", "scanned_at", "summary")
+    for d in st.list_doc_artifacts(doc_type=doc_type or None):
+        t.add_row(d.doc_type, d.scope_id, d.scanned_at or "-", (d.summary or "")[:50])
+    console.print(t)
+    st.close()
+
+
+@doc_cli.command("show")
+def doc_show(doc_type: str = typer.Argument(..., help="runbook|cutover|as_built"),
+              scope_id: str = typer.Argument(..., help="wave id")):
+    """Print a generated doc artifact (markdown)."""
+    st = _store()
+    try:
+        d = st.get_doc_artifact(doc_type, scope_id)
+        if not d:
+            console.print(f"[red]no {doc_type} doc for {scope_id}[/red]")
+            raise typer.Exit(1)
+        console.print(d.doc_md)
+    finally:
+        st.close()
+
+
+@doc_cli.command("cutover")
+def doc_cutover(wave_id: str = typer.Argument(...)):
+    """Trigger the executor to generate a per-wave cutover playbook (F9)."""
+    from ..agent import ExecutorError, get_executor_client
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    try:
+        res = ec.cutover_playbook(wave_id, _doc_context(st=None, wave_id=wave_id))
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
+    console.print(f"[green]triggered cutover-playbook for {wave_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+
+
+@doc_cli.command("as-built")
+def doc_as_built(wave_id: str = typer.Argument(...)):
+    """Trigger the executor to generate a per-wave as-built doc (F9)."""
+    from ..agent import ExecutorError, get_executor_client
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    try:
+        res = ec.as_built(wave_id, _doc_context(st=None, wave_id=wave_id))
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
+    console.print(f"[green]triggered as-built for {wave_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+
+
+def _doc_context(st, wave_id):
+    """Minimal context for the doc generators. A richer version would pull the
+    wave's members + targets + jobs from the store; the executor can also pull
+    them via the read GETs. Keep it light for the CLI trigger path."""
+    return {"wave_id": wave_id, "members": [], "risk_basis": {}, "targets": []}
+
+
+# ---------------------------------------------------------------------------
+# F5 — IaC generation (landing-zone/workload Terraform + guardrail checks)
+# ---------------------------------------------------------------------------
+iac_cli = typer.Typer(add_completion=False, help="IaC generation + Well-Architected guardrails.")
+app_cli.add_typer(iac_cli, name="iac")
+
+
+@iac_cli.command("list")
+def iac_list(scope: str = typer.Option("", "--scope", help="landing_zone|workload")):
+    """List stored IaC artifacts."""
+    st = _store()
+    t = Table("scope_id", "scope", "pass?", "modules", "guardrails", "scanned_at")
+    for a in st.list_iac_artifacts(scope=scope or None):
+        t.add_row(a.scope_id, a.scope or "-",
+                  "yes" if a.guardrail_pass else "NO",
+                  str(len(a.modules)), str(len(a.guardrails)),
+                  a.scanned_at or "-")
+    console.print(t)
+    st.close()
+
+
+@iac_cli.command("show")
+def iac_show(scope_id: str = typer.Argument(..., help="lz:<arch> | wl:<server_id>")):
+    """Show an IaC artifact (modules + guardrail results)."""
+    from ..core.codeintel import check_iac_guardrails
+    st = _store()
+    try:
+        a = st.get_iac_artifact(scope_id)
+        if not a:
+            console.print(f"[red]no IaC artifact for {scope_id}[/red]")
+            raise typer.Exit(1)
+        console.print(f"[bold]scope:[/bold] {a.scope}  [bold]pass:[/bold] "
+                      f"{'yes' if a.guardrail_pass else 'NO'}")
+        if a.plan_summary:
+            console.print(f"[dim]{a.plan_summary}[/dim]")
+        console.print("\n[bold]Modules:[/bold]")
+        for m in a.modules:
+            console.print(f"  — {m.get('path','?')}")
+        console.print("\n[bold]Guardrails:[/bold]")
+        for g in a.guardrails:
+            tag = "[green]PASS[/green]" if g.status == "pass" else (
+                "[red]FAIL[/red]" if g.status == "fail" else "[yellow]WARN[/yellow]")
+            console.print(f"  {tag} [{g.pillar}] {g.rule}  "
+                          + (f"— {g.finding}" if g.finding else ""))
+        v = check_iac_guardrails(a)
+        if v["failing"]:
+            console.print(f"\n[red bold]Gate BLOCKED: {len(v['failing'])} "
+                          f"blocking guardrail failure(s).[/red bold]")
+    finally:
+        st.close()
+
+
+@iac_cli.command("guardrails")
+def iac_guardrails(scope_id: str = typer.Argument(...)):
+    """Print just the guardrail verdict for an IaC artifact."""
+    from ..core.codeintel import iac_guardrail_summary
+    st = _store()
+    try:
+        a = st.get_iac_artifact(scope_id)
+        console.print(iac_guardrail_summary(a) or "no IaC emitted")
+    finally:
+        st.close()
+
+
+@iac_cli.command("emit")
+def iac_emit(scope: str = typer.Option(..., "--scope", help="landing_zone|workload"),
+             scope_id: str = typer.Option(..., "--id",
+                 help="lz:<archetype> (e.g. lz:corp) | wl:<server_id>"),
+             region: str = typer.Option("ap-bangkok", "--region")):
+    """Trigger the executor to emit IaC + run guardrail checks (F5)."""
+    from ..agent import ExecutorError, get_executor_client
+    from ..core.lz import LZ_BLUEPRINTS, resolve_archetype_blueprint
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    ctx: dict = {"target": {"cloud": "tencent", "region": region}}
+    if scope == "landing_zone" and scope_id.startswith("lz:"):
+        arch = scope_id.split(":", 1)[1]
+        # Phase A: prefer the active (operator-authored) design's blueprint,
+        # fall back to the built-in LZ_BLUEPRINTS (no store / no active design).
+        bp = None
+        try:
+            st = open_store(s.db_url)
+            try:
+                bp = resolve_archetype_blueprint(st, arch)
+            finally:
+                st.close()
+        except Exception:
+            bp = None
+        ctx["blueprint"] = bp if bp is not None else LZ_BLUEPRINTS.get(arch, {})
+    try:
+        res = ec.iac_emit(scope, scope_id, ctx)
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
+    console.print(f"[green]triggered iac-emit for {scope_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+    console.print("[dim]the executor will push the IaC + guardrail results back "
+                  "to PUT /api/iac-artifacts; run `idc iac show` once it lands.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# F10 — post-migration optimization (right-size / reserved / anomaly / perf)
+# ---------------------------------------------------------------------------
+postmig_cli = typer.Typer(add_completion=False, help="Post-migration optimization recommendations.")
+app_cli.add_typer(postmig_cli, name="postmig")
+
+
+@postmig_cli.command("recs")
+def postmig_recs(server_id: str = typer.Argument("", help="filter to one host (optional)")):
+    """List stored post-mig recommendations."""
+    st = _store()
+    t = Table("server_id", "kind", "from→to", "saving/mo", "conf", "severity", "reason")
+    for r in st.list_postmig_recs(server_id=server_id or None):
+        ft = f"{r.from_spec}→{r.to_spec}" if r.from_spec or r.to_spec else "-"
+        t.add_row(r.server_id, r.kind, ft,
+                  f"${r.monthly_saving_usd:.0f}" if r.monthly_saving_usd else "-",
+                  f"{r.confidence:.2f}" if r.confidence else "-",
+                  r.severity or "-", (r.reason or "")[:50])
+    console.print(t)
+    st.close()
+
+
+@postmig_cli.command("savings")
+def postmig_savings_cmd():
+    """Total realized savings across all post-mig recs."""
+    from ..core.cost import postmig_savings
+    st = _store()
+    s = postmig_savings(st.list_postmig_recs())
+    st.close()
+    console.print(f"[bold]Post-mig savings:[/bold] "
+                  f"${s['monthly_saving_usd']}/mo  "
+                  f"${s['yearly_saving_usd']}/yr  "
+                  f"({s['rec_count']} recs)")
+
+
+@postmig_cli.command("scan")
+def postmig_scan(server_id: str = typer.Argument(..., help="host to analyze"),
+                 spec: str = typer.Option("", "--spec", help="current cloud spec"),
+                 product: str = typer.Option("CVM", "--product")):
+    """Trigger the executor to analyze a finalized host's post-mig metrics (F10)."""
+    from ..agent import ExecutorError, get_executor_client
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    ctx = {"target": {"product": product, "spec": spec},
+           "metrics": {"cpu_p95": 8, "mem_p95": 22, "uptime_pct": 99.5}}
+    try:
+        res = ec.postmig_optimize(server_id, ctx)
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
+    console.print(f"[green]triggered postmig-optimize for {server_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+    console.print("[dim]the executor will push recs back to "
+                  "PUT /api/postmig-recs; run `idc postmig recs` once they land.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# F11 — automated testing (generate / run / compare pre-vs-post)
+# ---------------------------------------------------------------------------
+test_cli = typer.Typer(add_completion=False, help="Automated testing (generate / run / compare).")
+app_cli.add_typer(test_cli, name="test")
+
+
+@test_cli.command("cases")
+def test_cases(app_id: str = typer.Argument("", help="filter to one app (optional)")):
+    """List stored test cases."""
+    st = _store()
+    t = Table("app_id", "name", "kind", "endpoint", "method")
+    for c in st.list_test_cases(app_id=app_id or None):
+        t.add_row(c.app_id, c.name, c.kind or "-", c.endpoint or "-", c.method or "-")
+    console.print(t)
+    st.close()
+
+
+@test_cli.command("runs")
+def test_runs(app_id: str = typer.Argument("", help="filter to one app (optional)")):
+    """List test runs (pre/post)."""
+    st = _store()
+    t = Table("run_id", "app_id", "phase", "pass", "fail", "run_at")
+    for r in st.list_test_runs(app_id=app_id or None):
+        t.add_row(r.id, r.app_id, r.phase or "-", str(r.passed),
+                  str(r.failed), r.run_at or "-")
+    console.print(t)
+    st.close()
+
+
+@test_cli.command("diffs")
+def test_diffs(app_id: str = typer.Argument("", help="one app (optional)")):
+    """Show pre-vs-post test diffs. With an app_id, the detail rows."""
+    st = _store()
+    if app_id:
+        d = st.get_test_diff(app_id)
+        if not d:
+            console.print(f"[red]no test diff for {app_id}[/red]"); raise typer.Exit(1)
+        console.print(f"[bold]{app_id}[/bold]  regressions={d.regressions}  "
+                      f"({d.summary})")
+        t = Table("case", "pre", "post", "verdict", "detail")
+        for it in d.diff:
+            t.add_row(it.case, it.pre_status, it.post_status, it.verdict, it.detail)
+        console.print(t)
+    else:
+        t = Table("app_id", "regressions", "summary")
+        for d in st.list_test_diffs():
+            t.add_row(d.app_id, str(d.regressions), (d.summary or "")[:50])
+        console.print(t)
+    st.close()
+
+
+@test_cli.command("gen")
+def test_gen(app_id: str = typer.Argument(...)):
+    """Trigger the executor to generate test cases (F11)."""
+    from ..agent import ExecutorError, get_executor_client
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    try:
+        res = ec.test_gen(app_id, {})
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
+    console.print(f"[green]triggered test-gen for {app_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+
+
+@test_cli.command("run")
+def test_run(app_id: str = typer.Argument(...),
+             phase: str = typer.Option(..., "--phase", help="pre|post"),
+             target: str = typer.Option(..., "--target", help="endpoint base to hit")):
+    """Trigger a test run (F11). phase=pre for the pre-cutover baseline."""
+    from ..agent import ExecutorError, get_executor_client
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    try:
+        res = ec.test_run(app_id, phase, target, {})
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
+    console.print(f"[green]triggered test-run ({phase}) for {app_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+
+
+@test_cli.command("compare")
+def test_compare(app_id: str = typer.Argument(...),
+                 pre_run_id: str = typer.Option(..., "--pre"),
+                 post_run_id: str = typer.Option(..., "--post")):
+    """Trigger a pre-vs-post test comparison (F11). The diff drives the
+    test_regression cutover gate."""
+    from ..agent import ExecutorError, get_executor_client
+    s = get_settings()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    try:
+        res = ec.test_compare(app_id, pre_run_id, post_run_id)
+    except ExecutorError as e:
+        console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
+    console.print(f"[green]triggered test-compare for {app_id}[/green]  "
+                  f"job={res.get('job_id', '-')} status={res.get('status', '-')}")
+    console.print("[dim]run `idc test diffs <app>` to see the regression verdict; "
+                  "the test_regression gate blocks finalize on regressions.[/dim]")
+
+
+# ---------------------------------------------------------------------------
 # F6 — migration execution (track-only state machine + validation gates)
 # ---------------------------------------------------------------------------
 migrate_cli = typer.Typer(add_completion=False, help="Migration execution state machine + validation gates.")
@@ -1193,7 +1688,7 @@ def migrate_validate(job_id: str = typer.Argument(...)):
         j = st.get_migration_job(job_id)
         if not j:
             console.print(f"[red]no such job {job_id}[/red]"); raise typer.Exit(1)
-        ok, _ = run_validation_gates(j, get_settings())
+        ok, _ = run_validation_gates(j, get_settings(), store=st)
         st.upsert_migration_job(j)
         t = Table("gate", "kind", "must_pass", "result", "detail")
         for g in j.validation_gates:

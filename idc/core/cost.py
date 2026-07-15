@@ -163,6 +163,36 @@ def load_pricebook(settings: Settings, refresh: bool = False) -> PriceBook:
 # per-server estimate
 # ---------------------------------------------------------------------------
 _CDB_SPEC_RE = re.compile(r"(MYSQL\.HighMem\s*-\s*\d+GB)")
+_PG_SPEC_RE = re.compile(r"PG\.HighMem\s*-\s*(\d+)GB")
+_SQLS_CVM_RE = re.compile(r"SQL Server\s+(SA5\.\w+)")
+_TDATA_GB_RE = re.compile(r"Oracle-compat\s+(\d+)GB")
+_CVM_SKU_RE = re.compile(r"(SA5\.\w+)")
+# Products priced via a CVM-equivalent SKU in the spec (storage targets +
+# managed middleware): the bundled book has no line for these, so cost.py maps
+# them onto the CVM book at the matched CVM SKU (usage-based; noted in rationale).
+_CVM_EQUIV_PRODUCTS = {"COS", "CFS", "Tencent CKafka", "Tencent TSE ZooKeeper",
+                       "Tencent TDMQ", "Tencent Cloud Search", "Tencent Oceanus"}
+
+# The bundled price book only carries CDB (MySQL), CVM, Redis, EMR, TKE. The
+# managed PostgreSQL / SQL Server / MongoDB / Oracle(TData) targets and the
+# COS/CFS storage targets would otherwise price to 0 in the business case. Map
+# each onto the comparable priced product: managed PG/Mongo/Oracle reuse the
+# CDB (MySQL) book at the same mem tier; managed SQL Server / COS / CFS reuse
+# the CVM book at the matched CVM SKU. This yields non-zero, defensible estimates
+# (the license / usage dimension is noted in the Match rationale, not priced).
+_PRICE_PRODUCT_ALIAS = {
+    "TencentDB for PostgreSQL": "CDB",
+    "TencentDB for SQL Server": "CVM",
+    "TencentDB for MongoDB": "CDB",
+    "TData": "CDB",
+    "COS": "CVM",
+    "CFS": "CVM",
+    "Tencent CKafka": "CVM",
+    "Tencent TSE ZooKeeper": "CVM",
+    "Tencent TDMQ": "CVM",
+    "Tencent Cloud Search": "CVM",
+    "Tencent Oceanus": "CVM",
+}
 
 
 def _spec_price_key(product: str, spec: str) -> str:
@@ -172,6 +202,29 @@ def _spec_price_key(product: str, spec: str) -> str:
     if product == "CDB":
         m = _CDB_SPEC_RE.search(spec)
         return m.group(1) if m else spec
+    if product == "TencentDB for PostgreSQL":
+        # map PG mem tier -> the CDB (MySQL) price key at the same tier
+        m = _PG_SPEC_RE.search(spec)
+        return f"MYSQL.HighMem - {m.group(1)}GB" if m else spec
+    if product == "TencentDB for MongoDB":
+        # same idea: Mongo mem tier -> the CDB (MySQL) price key at that tier
+        m = re.search(r"HighMem\s*-\s*(\d+)GB", spec)
+        return f"MYSQL.HighMem - {m.group(1)}GB" if m else spec
+    if product == "TData":
+        # Oracle-compat managed DB spec is "Oracle-compat {cap}GB {edition}";
+        # map the mem tier onto the CDB (MySQL) price key at the same tier.
+        m = _TDATA_GB_RE.search(spec)
+        return f"MYSQL.HighMem - {m.group(1)}GB" if m else spec
+    if product == "TencentDB for SQL Server":
+        # map the matched CVM SKU -> the CVM price key
+        m = _SQLS_CVM_RE.search(spec)
+        return m.group(1) if m else spec
+    if product in _CVM_EQUIV_PRODUCTS:
+        # storage targets + managed middleware carry a CVM-equivalent SKU in the
+        # spec; price under the CVM book at that SKU (actual cost is usage-based —
+        # noted in the Match rationale, not priced here).
+        m = _CVM_SKU_RE.search(spec)
+        return m.group(1) if m else spec
     if product == "TKE":
         return "_default"   # managed control plane has no per-master VM cost
     return spec
@@ -180,14 +233,16 @@ def _spec_price_key(product: str, spec: str) -> str:
 def _lookup(book: PriceBook, product: str, spec_key: str,
             region: str) -> Tuple[float, float]:
     """(monthly, yearly) for product+spec+region; falls back to product default
-    then 0/0 when unpriced."""
-    cell = ((book.by_spec.get(product) or {}).get(spec_key) or {}).get(region)
+    then 0/0 when unpriced. Aliased products (PG, SQL Server) look up under
+    their priced counterpart (CDB / CVM)."""
+    bp = _PRICE_PRODUCT_ALIAS.get(product, product)
+    cell = ((book.by_spec.get(bp) or {}).get(spec_key) or {}).get(region)
     if not cell:
-        cell = ((book.by_spec.get(product) or {}).get(spec_key) or {}).get("_default")
+        cell = ((book.by_spec.get(bp) or {}).get(spec_key) or {}).get("_default")
     if not cell:
-        cell = (book.by_product.get(product) or {}).get(region)
+        cell = (book.by_product.get(bp) or {}).get(region)
     if not cell:
-        cell = (book.by_product.get(product) or {}).get("_default")
+        cell = (book.by_product.get(bp) or {}).get("_default")
     if not cell:
         return 0.0, 0.0
     monthly = float(cell.get("monthly") or 0.0)
@@ -208,6 +263,20 @@ def estimate_server(server: Server, match: Match, book: PriceBook) -> CostEstima
         basis=server.sizing_basis or "estimated",
         pricing_source=book.source, computed_at=_now(),
     )
+
+
+def postmig_savings(recs) -> Dict[str, float]:
+    """F10 — total realized monthly/yearly savings from post-mig recommendations.
+
+    Sums ``monthly_saving_usd`` across the given ``PostMigRecommendation`` recs
+    (right_size + reserved carry savings; anomaly/perf carry 0). The portfolio
+    what-if/business-case surfaces this as the post-mig optimization upside.
+    Returns ``{monthly_saving_usd, yearly_saving_usd, rec_count}``.
+    """
+    monthly = sum(float(getattr(r, "monthly_saving_usd", 0) or 0) for r in (recs or []))
+    return {"monthly_saving_usd": round(monthly, 2),
+            "yearly_saving_usd": round(monthly * 12, 2),
+            "rec_count": len(recs or [])}
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +378,11 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
             "product": est.target_product, "spec": est.spec, "region": est.region,
             "monthly": round(est.monthly_usd, 2), "yearly": round(est.yearly_usd, 2),
             "basis": est.basis, "strategy": strat,
-            "eol_premium_yearly": round(eol_onprem_premium_monthly(s, book) * 12, 2),
+            # a retire host is decommissioned -> it carries no on-prem EOL
+            # premium (it's not staying). A retain host stays on-prem so the
+            # premium is real. Migrating hosts show it for the savings calc.
+            "eol_premium_yearly": 0.0 if strat == PATTERN_RETIRE
+                                  else round(eol_onprem_premium_monthly(s, book) * 12, 2),
         })
         if est.monthly_usd > 0:
             priced += 1
@@ -321,6 +394,12 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
         "currency": "USD",
         "pricing_source": book.source,
         "generated_at": _now(),
+        # flat USD/month per server used for the IDC current-cost side of the
+        # TCO. Exposed so the per-host business-case detail (web UI) can compute
+        # each migrating host's on-prem yearly = onprem_rate*12 + eol_premium
+        # and its annual saving without re-deriving it from the portfolio totals
+        # (which would be wrong for any host carrying an EOL premium).
+        "onprem_rate": round(book.onprem_rate, 2),
         "cloud_monthly": round(cloud_monthly, 2),
         "cloud_yearly": round(cloud_yearly, 2),
         "onprem_monthly": round(onprem_monthly, 2) if book.onprem_rate > 0 else 0.0,

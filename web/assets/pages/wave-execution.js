@@ -27,6 +27,41 @@ async function loadExecution(){
     }).join('');
     if(_execSelectedWave) execView(_execSelectedWave);
   }catch(e){ $('execWaves').innerHTML = '<span class="ev-err">'+esc(String(e))+'</span>'; }
+  loadPostmig();
+}
+
+/* ---------- F10 — post-migration optimization ---------- */
+async function loadPostmig(){
+  const tb = $('pmTbl'); if(!tb) return;
+  const body = tb.querySelector('tbody'); body.innerHTML='';
+  try{
+    const [recs, sav] = await Promise.all([api('/postmig-recs'), api('/postmig-savings')]);
+    $('pmSavings').textContent = `total savings: $${sav.monthly_saving_usd}/mo · $${sav.yearly_saving_usd}/yr (${sav.rec_count} recs)`;
+    const kcol = {right_size:'#3b8eea', reserved:'var(--green)', anomaly:'var(--amber)', perf:'var(--amber)'};
+    recs.forEach(r=>{
+      const ft = (r.from_spec||r.to_spec) ? `${esc(r.from_spec||'-')}→${esc(r.to_spec||'-')}` : '-';
+      body.insertAdjacentHTML('beforeend', `<tr>
+        <td data-label="server_id">${esc(r.server_id||'-')}</td>
+        <td data-label="kind"><span style="color:${kcol[r.kind]||'var(--fg)'};font-weight:600">${esc(r.kind||'-')}</span></td>
+        <td data-label="from→to">${ft}</td>
+        <td data-label="saving">${r.monthly_saving_usd?('$'+r.monthly_saving_usd):'-'}</td>
+        <td data-label="conf">${r.confidence!=null?r.confidence.toFixed(2):'-'}</td>
+        <td data-label="severity">${esc(r.severity||'-')}</td>
+        <td data-label="reason" class="conf" title="${esc(r.reason||'')}">${esc((r.reason||'-').slice(0,60))}</td></tr>`);
+    });
+    if(!recs.length) body.insertAdjacentHTML('beforeend', `<tr><td colspan="7" class="muted">no post-mig recs yet — analyze a finalized host.</td></tr>`);
+  }catch(e){ body.innerHTML = `<tr><td colspan="7" class="ev-err">${esc(e)}</td></tr>`; }
+}
+async function doPostmigScan(){
+  const server_id = $('pmServer').value.trim();
+  if(!server_id){ toast('enter a server_id','warn'); return; }
+  const ctx = {target:{product:$('pmProduct').value, spec:$('pmSpec').value.trim()},
+               metrics:{cpu_p95:8, mem_p95:22, uptime_pct:99.5}};
+  try{
+    await api('/postmig-optimize', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({server_id, context:ctx})});
+    toast('post-mig analysis requested — recs arrive via callback.', 'ok');
+    setTimeout(loadPostmig, 1500);
+  }catch(e){ toast('post-mig scan failed: '+e, 'err'); }
 }
 
 async function execLaunch(wid){

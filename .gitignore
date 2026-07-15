@@ -66,3 +66,6 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+# ---- Local estate inventory (operator data, not code) ----
+inventory_apps.csv
+inventory_draft.txt

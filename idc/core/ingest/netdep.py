@@ -94,14 +94,71 @@ def _from_zabbix(settings: Settings, item_key: str) -> List[Dict[str, Any]]:
     Standard Zabbix items (``net.tcp.port[...]``) are active checks FROM the
     Zabbix server TO a target port — they do not capture a host's outbound
     edges. A custom trapper/item emitting JSON ``{dst_ip, dst_port}`` is
-    required. Intentionally minimal here; falls back to fixture when absent.
+    required. This pulls the item's latest value per host via ``item.get`` +
+    ``history.get`` and parses the JSON. Returns [] on any failure so the
+    caller falls back to the fixture.
     """
     if not settings.has_zabbix() or not item_key:
         return []
-    # A full implementation would item.get + history.get for `item_key` and
-    # parse the JSON value. Skipped until a real item key is wired — the
-    # fixture fallback covers the out-of-the-box path.
-    return []
+    try:
+        import httpx
+        url = settings.zbx_url
+        rid = 0
+
+        def call(method: str, params: Dict[str, Any]) -> Any:
+            nonlocal rid
+            rid += 1
+            payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": rid}
+            if settings.zbx_token:
+                payload["auth"] = settings.zbx_token
+            r = httpx.post(url, json=payload, timeout=60)
+            r.raise_for_status()
+            j = r.json()
+            if "error" in j:
+                raise RuntimeError(j["error"])
+            return j.get("result")
+
+        # find the items matching the custom key across all hosts
+        items = call("item.get", {
+            "output": ["itemid", "hostid", "name"],
+            "filter": {"key_": item_key},
+            "selectHosts": ["host"],
+        }) or []
+        if not items:
+            return []
+        hostid_to_host = {it.get("hostid"): (it.get("hosts") or [{}])[0].get("host", "")
+                         for it in items}
+        # pull the latest value for each item
+        rows: List[Dict[str, Any]] = []
+        for it in items:
+            hist = call("history.get", {
+                "output": "value", "history": 2,  # 2 = text/char
+                "itemids": it.get("itemid"), "sortfield": "clock",
+                "sortorder": "DESC", "limit": 1,
+            }) or []
+            if not hist:
+                continue
+            try:
+                val = json.loads(hist[0].get("value", ""))
+            except Exception:
+                continue   # not JSON -> skip this host
+            src = hostid_to_host.get(it.get("hostid"), "")
+            # the trapper value is one record OR a list of records
+            for rec in (val if isinstance(val, list) else [val]):
+                if not isinstance(rec, dict):
+                    continue
+                rows.append({
+                    "src_host": src,
+                    "dst_ip": rec.get("dst_ip") or rec.get("remote_ip") or "",
+                    # a single non-numeric port ("any"/"N/A") would otherwise raise
+                    # and the outer except aborts the WHOLE batch (silent []).
+                    "dst_port": (lambda p: int(p) if str(p).isdigit() else 0)(
+                        rec.get("dst_port") or rec.get("remote_port") or 0),
+                    "observed_at": _now(),
+                })
+        return rows
+    except Exception:
+        return []
 
 
 def discover_network_deps(settings: Settings, servers: List[Server]) -> List[NetDep]:
@@ -118,9 +175,9 @@ def discover_network_deps(settings: Settings, servers: List[Server]) -> List[Net
     host_to_id = _host_to_server_id(servers)
 
     if src == "prometheus":
-        rows = _from_prometheus(settings, "")  # no metric wired yet -> falls back
+        rows = _from_prometheus(settings, settings.netdep_prom_metric)
     elif src == "zabbix":
-        rows = _from_zabbix(settings, "")
+        rows = _from_zabbix(settings, settings.netdep_zabbix_item)
     else:
         rows = _read_fixture(settings.netdep_path)   # collector / fixture
 

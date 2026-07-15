@@ -16,6 +16,10 @@
   .stats{display:flex;gap:8px;margin-left:auto}
   .stat{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:11px;color:var(--muted)}
   .stat b{color:var(--accent);font-size:14px}
+  /* secondary header controls (max-waves + upload). On desktop they sit inline
+     (display:contents = the wrapper vanishes, children join the flex row); on
+     phones they're hidden to keep the header short — Ingest/Rebuild remain. */
+  .hdr-secondary{display:contents}
   button{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 11px;cursor:pointer;font-size:12px}
   button:hover{border-color:var(--accent)}
   button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -57,7 +61,7 @@
   .scroll{overflow:auto;border:1px solid var(--border);border-radius:6px;max-height:calc(100vh - 280px)}
   .tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;background:var(--panel2);border:1px solid var(--border);color:var(--muted)}
   .tag.db{color:var(--purple)}.tag.k8s{color:var(--accent)}.tag.hadoop{color:var(--amber)}
-  .tag.cache{color:var(--orange)}.tag.web{color:var(--green)}.tag.monitoring{color:var(--muted)}.tag.app{color:#58a6ff}
+  .tag.cache{color:var(--orange)}.tag.web{color:var(--green)}.tag.monitoring{color:var(--muted)}.tag.app{color:#58a6ff}.tag.paas{color:#39c5cf}.tag.middleware{color:var(--amber)}
   .pill{font-size:10px;padding:1px 6px;border-radius:10px}
   .pill.high{background:rgba(248,81,73,.15);color:var(--red)}
   .pill.medium{background:rgba(210,153,34,.15);color:var(--amber)}
@@ -100,6 +104,22 @@
   .xscroll{overflow-x:auto}              /* horizontal-only scroll wrapper for wide tables (code/jobs) */
   .qcard{margin-bottom:8px;background:var(--panel2)}
 
+  /* expandable ledger rows (business-case per-server table). The chevron column
+     is narrow + non-interactive; the detail row spans the whole table and hosts
+     a cost-focused panel rendered lazily on first expand. */
+  .tbl td.chev{width:18px;text-align:center;color:var(--muted);cursor:pointer;user-select:none;padding:5px 4px}
+  .tbl tr[data-bcrow]:hover{cursor:pointer}
+  .tbl tr.clickable{cursor:pointer}
+  .tbl tr.bc-detail>td{padding:0;background:var(--panel);border-bottom:1px solid var(--border)}
+  .tbl tr.bc-detail .bc-panel{padding:10px 12px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .tbl tr.bc-detail .bc-panel .kv{margin:0}
+  .tbl tr.bc-detail .bc-panel h4{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:500}
+  .tbl tr.bc-detail .bc-actions{grid-column:1/-1;display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:2px}
+  .tbl tr.bc-detail .bc-wi{grid-column:1/-1;font-size:12px}
+  .bc-chev{display:inline-block;transition:transform .15s}
+  tr[data-bcrow].open .bc-chev{transform:rotate(90deg)}
+  @media(max-width:760px){ .tbl tr.bc-detail .bc-panel{grid-template-columns:1fr} }
+
   /* key/value list used in server drawer — readable on desktop and stacks on mobile */
   .kv{display:grid;gap:0;border:1px solid var(--border);border-radius:8px;background:var(--panel2);padding:0;margin:10px 0;overflow:hidden}
   .kv-row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:8px 12px;border-bottom:1px solid var(--border)}
@@ -137,6 +157,7 @@
     .stats{ order:2; margin-left:0; flex-wrap:wrap }
     header > .row{ order:3; width:100%; flex-wrap:wrap; gap:6px }
     header > .row > *{ flex:1 1 auto; min-width:120px }
+    .hdr-secondary{ display:none !important }   /* hide max-waves/upload; Ingest/Rebuild stay */
     header > .row select, header > .row button{ width:auto }
     .page{ padding:10px; padding-bottom:max(10px,env(safe-area-inset-bottom)) }
     .cols > *{ flex:1 1 100% !important }   /* stack two-column card layouts; !important beats inline flex:1/1.4 */

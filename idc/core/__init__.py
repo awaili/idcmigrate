@@ -174,6 +174,11 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
         # not the transient Server.id (ids are fresh each rebuild). Index by the
         # stored db_server_id and resolve via the server's hostname/identity.
         dbidx = {d.db_server_id: d for d in store.list_db_profiles()}
+        # F7 — legacy_dispositions are keyed by the host's stable identity
+        # (hostname lowercased), like db_profiles. Fold the executor's
+        # containerize/replatform/rewrite/retain call into apply_os_eol so the
+        # EOL recommendation is grounded in the workload, not a fixed string.
+        ldidx = {d.server_id: d for d in store.list_legacy_dispositions()}
         matched = match_servers(servers)
         for m in matched:
             profile = _profile_for_server(m.server_id, servers, pidx)
@@ -182,7 +187,12 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
             # confidence dip compounds with the F4 coverage scale (no silent
             # rehost of CentOS 6 / Windows 2008). No-op for active/unknown OS.
             if srv:
-                apply_os_eol(m, srv)
+                disp = None
+                for k in (srv.hostname.lower().strip(), srv.identity_key, srv.id):
+                    disp = ldidx.get(k)
+                    if disp:
+                        break
+                apply_os_eol(m, srv, disposition=disp)
             cov = srv.assessment_confidence if srv else None
             enrich_match(m, profile, assessment_confidence=cov or 1.0)
             dbp = None
@@ -212,7 +222,8 @@ def rebuild(store: Store, settings: Optional[Settings] = None,
             strategies[app_id] = strat
         waves = plan_waves(servers, wls, code_profiles=profiles,
                           max_waves=max_waves, strategies=strategies,
-                          min_assessment_confidence=settings.min_assessment_confidence)
+                          min_assessment_confidence=settings.min_assessment_confidence,
+                          legacy_dispositions=store.list_legacy_dispositions())
         _prog("plan", waves=len(waves))
     # replace_waves always runs (also when do_plan=False) so the waves table is
     # wiped along with the other derived tables — matches the old _wipe_derived

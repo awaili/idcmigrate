@@ -30,6 +30,17 @@ class Adapter:
     def fetch(self, settings) -> IngestResult:  # noqa: ANN001
         raise NotImplementedError
 
+    def _fixture_disabled(self, settings) -> IngestResult:
+        """Return an empty result when the fixture fallback is disabled (a live
+        box with real imported data). Adapters call this instead of reading the
+        bundled fixture when ``settings.allow_fixture_fallback`` is False and no
+        live creds are configured — so a stray Ingest never pulls dummy data."""
+        return IngestResult(
+            assets=[], mode="disabled",
+            error=f"{self.source}: live creds not configured and fixture "
+                  f"fallback is off (IDC_ALLOW_FIXTURE_FALLBACK=false). "
+                  f"Import data instead.")
+
 
 _REGISTRY: Dict[str, Callable[[], Adapter]] = {}
 

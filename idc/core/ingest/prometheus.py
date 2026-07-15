@@ -54,6 +54,8 @@ class PrometheusAdapter(Adapter):
     def fetch(self, settings: Settings) -> IngestResult:
         if settings.has_prometheus():
             return self._online(settings)
+        if not settings.allow_fixture_fallback:
+            return self._fixture_disabled(settings)
         return self._fixture(settings)
 
     def _fixture(self, settings: Settings) -> IngestResult:

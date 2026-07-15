@@ -114,7 +114,7 @@ async function assessWave(id){
 }
 
 /* ---------- F8 — Landing Zone archetypes (placement gate) ---------- */
-const _LZ_ARCH_COLOR = {corp:'#3b8eea', online:'var(--green)', dmz:'#a06bff'};
+const _LZ_ARCH_COLOR = {corp:'#3b8eea', online:'var(--green)', dmz:'#a06bff', pending:'var(--amber)'};
 const _LZ_STATUS_BADGE = {not_ready:['not ready','var(--amber)'], applied:['applied','#3b8eea'], finalized:['finalized','var(--green)']};
 function _lzArchBadge(a){ const c=_LZ_ARCH_COLOR[a]||'var(--fg)'; return `<span class="tag" style="color:${c}">${esc(a)}</span>`; }
 async function loadLzReadiness(){
@@ -148,4 +148,10 @@ async function setLzStatus(archetype, status){
   try{ await api(`/lz/${archetype}/status`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({status,by:'web'})}); toast(`${archetype} → ${status}`,'ok'); }
   catch(e){ toast('lz status update failed: '+e,'err'); return; }
   loadLzReadiness();
+  // also refresh the dedicated Landing Zone tab when it's the active view
+  if(!$('tab-lz').classList.contains('hidden')) loadLzArchetypes();
+  // and re-run the per-wave Placement gate check when the Waves tab is up, so the
+  // verdict tracks the archetype status change (a wave blocked on a not-ready
+  // archetype flips to clear once you finalize it here).
+  if(!$('tab-waves').classList.contains('hidden')) lzGateCheck();
 }

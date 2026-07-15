@@ -65,23 +65,35 @@ async function proposePlan(){
     ${revHtml}
     ${valHtml}
     <div class="row" style="margin:8px 0;gap:8px">
-      <button class="primary" onclick="applyPlan()" ${errs?'disabled title="fix validation errors first"':''}>Apply (persist)</button>
+      <button id="planApplyBtn" class="primary" onclick="applyPlan()" ${errs?'disabled title="fix validation errors first"':''}>Apply (persist)</button>
       <span class="muted">Apply replaces the current waves.</span>
     </div>
     <div class="scroll" style="max-height:50vh"><table class="mcard"><thead><tr><th>wave</th><th>stage</th><th>depends_on</th><th>#</th><th>members</th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="muted">no waves</td></tr>'}</tbody></table></div>`;
 }
 
+let _applyInFlight = false;   // re-entry guard: block a second Apply until the first finishes
 async function applyPlan(){
   if(!_proposedWaves || !_proposedWaves.length){ toast('propose a plan first','warn'); return; }
+  if(_applyInFlight){ toast('apply already running — wait for it to finish','warn'); return; }
+  _applyInFlight = true;
+  const btn = $('planApplyBtn');
+  const btnLabel = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = 'applying…'; }
   $('planOut').insertAdjacentHTML('beforeend', '<span class="spinner"></span> applying…');
-  let r; try{
-    r = await api('/plan/apply', {method:'POST', headers:{'content-type':'application/json'},
+  try{
+    const r = await api('/plan/apply', {method:'POST', headers:{'content-type':'application/json'},
               body:JSON.stringify({waves:_proposedWaves})});
-  }catch(e){ $('planOut').innerHTML = '<span class="ev-err">Error: '+esc(e)+'</span>'; return; }
-  if(!r.ok){
-    $('planOut').insertAdjacentHTML('beforeend', `<div class="ev-err">apply failed: ${esc(((r.validation||{}).errors||[]).join('; '))}</div>`);
-    return;
+    if(!r || !r.ok){
+      $('planOut').insertAdjacentHTML('beforeend', `<div class="ev-err">apply failed: ${esc(((r&&r.validation||{}).errors||[]).join('; '))||esc(r&&r.error||'unknown')}</div>`);
+      return;
+    }
+    $('planOut').insertAdjacentHTML('beforeend', `<div style="color:var(--green)">✓ applied ${r.waves} wave(s)</div>`);
+    await loadWaves();   // refresh the current-waves list on the left
+    loadLzGate();        // refresh the Placement gate dropdown so it follows the new wave design
+  }catch(e){
+    $('planOut').insertAdjacentHTML('beforeend', '<div class="ev-err">Error: '+esc(e)+'</div>');
+  }finally{
+    _applyInFlight = false;
+    if(btn){ btn.disabled = false; btn.textContent = btnLabel; }
   }
-  $('planOut').insertAdjacentHTML('beforeend', `<div style="color:var(--green)">✓ applied ${r.waves} wave(s)</div>`);
-  loadWaves();   // refresh the current-waves list on the left
 }

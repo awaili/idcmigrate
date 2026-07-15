@@ -126,6 +126,16 @@ class Settings:
     netdep_days: int = field(default_factory=lambda: _env_int("IDC_NETDEP_DAYS", 7))
     # offline/fixture snapshot (default bundled fixture, like the other sources)
     netdep_path: str = field(default_factory=lambda: _env("IDC_NETDEP_PATH", str(FIXTURES / "netdep.json")))
+    # F1 — live netdep keys. Standard exporters/items do NOT expose per-
+    # connection dst ip:port, so the live paths need a CUSTOM exporter/item.
+    # Empty (default) -> the live source returns [] and falls back to the
+    # fixture, exactly the prior behavior. Wire when a custom exporter exists.
+    # Prometheus: an instant vector whose series carry dst_ip/dst_port labels
+    # and the src host as the `instance` label (e.g. a conntrack/eBPF exporter).
+    netdep_prom_metric: str = field(default_factory=lambda: _env("IDC_NETDEP_PROM_METRIC"))
+    # Zabbix: a custom item key whose value is JSON {dst_ip, dst_port} records
+    # (a trapper item pushed by an agent doing `ss -tn` on each host).
+    netdep_zabbix_item: str = field(default_factory=lambda: _env("IDC_NETDEP_ZABBIX_ITEM"))
 
     # data-gap — hardware warranty / end-of-support fold-in. OFF by default
     # (empty path): the warranty fields stay "" on every server and the F2
@@ -164,6 +174,14 @@ class Settings:
         """True if a live pricing endpoint is configured (else cost.py uses
         the bundled price fixture so the business case still renders)."""
         return bool(self.pricing_url)
+
+    # Disable the bundled-fixture fallback for the ingest adapters. Default
+    # true so the offline demo + tests work out of the box. On a live box with
+    # REAL imported data, set IDC_ALLOW_FIXTURE_FALLBACK=false so a stray
+    # "Ingest" never pulls dummy fixture data over the real estate — adapters
+    # with no live creds return empty instead of reading the bundled fixture.
+    allow_fixture_fallback: bool = field(default_factory=lambda: _env_bool(
+        "IDC_ALLOW_FIXTURE_FALLBACK", True))
 
     def has_sms(self) -> bool:
         """True if the Tencent SMS/DTS runner is wired. False -> F6 track-only."""

@@ -19,6 +19,7 @@ zero report) so the system runs out-of-the-box with zero new credentials.
 """
 from __future__ import annotations
 
+import datetime
 import json
 from pathlib import Path
 from typing import Any, Dict, List
@@ -72,7 +73,16 @@ def merge_warranty(servers: List[Server], path: str) -> Dict[str, Any]:
         eol = (r.get("hardware_eol") or "").strip()
         ws = (r.get("warranty_status") or "").strip().lower()
         if eol:
-            s.hardware_eol = eol
+            # validate ISO date up front — a non-ISO value (e.g. "March 1, 2024"
+            # or "2024/03/01") would later make warranty_bucket raise inside
+            # date.fromisoformat (caught -> UNKNOWN), silently misclassifying an
+            # expired/active host. Skip + count as unmatched-data instead.
+            try:
+                datetime.date.fromisoformat(eol)
+            except ValueError:
+                eol = ""   # drop unparseable; the host stays "unknown"
+            else:
+                s.hardware_eol = eol
         if ws:
             s.warranty_status = ws
         matched += 1

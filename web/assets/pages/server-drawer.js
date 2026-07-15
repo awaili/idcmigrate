@@ -1,8 +1,36 @@
 /* ---------- server drawer ---------- */
 const _7R_COLORS = {'rehost':'var(--green)','rehost-container':'var(--green)',
-  'replatform':'#3b8eea','refactor':'var(--amber)','repurchase':'#a06bff',
-  'retain':'#888','retire':'#e5484d'};
+  'relocate':'var(--green)','replatform':'#3b8eea','refactor':'var(--amber)',
+  'repurchase':'#a06bff','retain':'#888','retire':'#e5484d'};
 function _stratBadge(s){ if(!s) return '<span class="muted">-</span>'; return `<span style="color:${_7R_COLORS[s]||'var(--fg)'};font-weight:600">${esc(s)}</span>`; }
+function _disksHtml(disks, u){
+  // per-partition list with three columns — Label | Mount | Size — plus a total.
+  // Uses divs (not a <table>) so the drawer's mobile card-reflow (which keys off
+  // data-label on <td>) doesn't mangle it; the three columns stack cleanly on
+  // phones too. disks come from parse_disks:
+  //   Windows/VMware: name="Hard disk N", fs=""  -> Label=Hard disk N, Mount=–
+  //   Linux:          name=mount path,    fs=mount path -> Label=path, Mount=path
+  // (the Linux diskList only carries mount:size, so the label and mount are the
+  // same path — the source has no separate filesystem label / device name).
+  const ds = disks || [];
+  if(!ds.length) return '-';
+  const total = ds.reduce((a,d)=>a+(d.size_gb||0), 0);
+  const head = `<div style="display:flex;gap:10px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:500;padding-bottom:3px;border-bottom:1px solid var(--border)">
+      <span style="flex:1 1 40%">Label</span><span style="flex:1 1 40%">Mount</span><span style="flex:0 0 auto;text-align:right">Size</span></div>`;
+  const rows = ds.map(d=>{
+    const mount = d.fs ? esc(d.fs) : '<span class="muted">–</span>';
+    return `<div style="display:flex;gap:10px;padding:4px 0;border-bottom:1px solid var(--border)">
+        <span style="flex:1 1 40%;word-break:break-word">${esc(d.name||'-')}</span>
+        <span style="flex:1 1 40%;word-break:break-word" class="muted">${mount}</span>
+        <span class="conf" style="flex:0 0 auto;text-align:right;white-space:nowrap">${d.size_gb} GB</span></div>`;
+  }).join('');
+  const used = (u && u.disk_used_pct!=null) ? `<span class="muted"> · used ${u.disk_used_pct}%</span>` : '';
+  return `<div style="margin-top:2px;text-align:left;width:100%">
+      ${head}
+      ${rows}
+      <div style="display:flex;gap:10px;padding-top:5px"><span style="flex:1 1 40%"></span><span style="flex:1 1 40%"></span><span style="flex:0 0 auto;text-align:right;white-space:nowrap"><b>${total} GB</b>${used}</span></div>
+    </div>`;
+}
 function _coverageBadge(s, m){
   // F4 — data-coverage confidence + sizing basis + final match confidence
   const cov = s.assessment_confidence==null ? null : s.assessment_confidence;
@@ -74,6 +102,7 @@ function openServer(id){
   // fetch fresh full record (the row in state.last may be a partial list row)
   fetch(API+'/servers/'+id).then(r=>r.json()).then(s=>{
     const m=s.match||{}, u=s.utilization||{};
+    window._drawerServer = s;   // current record for setDisposition pre-select
     $('dTitle').textContent=s.hostname;
     const kv = (label, val) => `<div class="kv-row"><span class="kv-label">${label}</span><span class="kv-val">${val}</span></div>`;
     $('dBody').innerHTML=`
@@ -81,7 +110,7 @@ function openServer(id){
       <div class="kv">
         ${kv('OS', `${esc(s.os||'-')} ${esc(s.os_version||'')}`)}
         ${kv('CPU / RAM', `${s.cpu_cores||'-'} vCPU / ${s.mem_gb||'-'} GB`)}
-        ${kv('Disks', (s.disks||[]).map(d=>`${esc(d.name)} ${d.size_gb}GB ${esc(d.kind)} (${esc(d.fs)})`).join('<br>')||'-')}
+        ${kv('Disks', _disksHtml(s.disks, s.utilization))}
         ${kv('Network', `${esc((s.ips||[]).join(', ')||'-')} · ${esc(s.subnet||'-')} · ${esc(s.vlan||'-')}`)}
         ${kv('Env / Crit', `${esc(s.env||'-')} <span class="pill ${esc(s.business_criticality||'')}">${esc(s.business_criticality||'-')}</span>`)}
         ${kv('Apps', esc((s.app_ids||[]).join(', ')||'-'))}
@@ -91,11 +120,12 @@ function openServer(id){
         ${kv('Coverage', _coverageBadge(s, m))}
         ${kv('Warranty', _warrantyBadge(s))}
         ${kv('OS support', _osEolBadge(s))}
+        ${kv('Disposition', _dispositionBadge(s))}
         ${kv('Target', `<b>${m.target?esc(m.target.product):'-'}</b> ${m.target?esc(m.target.spec):''} <span class="muted">@ ${m.target?esc(m.target.region):''}</span>`)}
         ${kv('Rule', m.rationale?esc(m.rationale):'-')}
       </div>
       ${_codeSection(s.code)}
-      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">MigraQ explain match</button><button onclick="rightSize('${s.id}')">right-size</button><button onclick="drawerAudit('${s.id}')">audit target</button><button onclick="setWarranty('${s.id}')">set warranty</button></div>
+      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">MigraQ explain match</button><button onclick="rightSize('${s.id}')">right-size</button><button onclick="drawerAudit('${s.id}')">audit target</button><button onclick="setWarranty('${s.id}')">set warranty</button><button onclick="setDisposition('${s.id}')">set disposition</button></div>
       <pre id="dExplain" style="margin-top:10px"></pre>`;
     openDrawer();
   }).catch(e=>{ $('dTitle').textContent='Error'; $('dBody').innerHTML='<span class="ev-err">'+esc(String(e))+'</span>'; openDrawer(); });
@@ -166,4 +196,48 @@ async function saveWarranty(id){
     $('dExplain').innerHTML='';
     openServer(id);  // re-open to refresh the badge
   }catch(e){ toast('set warranty failed: '+e, 'err'); }
+}
+
+// ---------- host disposition (retain / retire) ----------
+const _DISP_COLOR = {'retain':'var(--green)', 'retire':'#e5484d'};
+function _dispositionBadge(s){
+  // s.disposition: 'retain' | 'retire' | '' (migrate). The host-level
+  // disposition overrides the app-level 7R rule: a retain/retire host is pulled
+  // out of every app wave into the trailing Retain / Retire waves on the next
+  // Rebuild. Survives a Rebuild (separate legacy_dispositions table).
+  const d = s.disposition || '';
+  if(!d) return '<span class="muted">migrate</span>';
+  return `<span class="tag" style="color:${_DISP_COLOR[d]||'var(--fg)'};font-weight:600">${d}</span> <span class="muted">· next Rebuild → ${d} wave</span>`;
+}
+function setDisposition(id){
+  // operator per-host retain/retire override. Inline form (like setWarranty),
+  // rendered into dExplain; Save PUTs + re-opens the drawer to refresh.
+  const cur = (window._drawerServer && window._drawerServer.disposition) || '';
+  $('dExplain').innerHTML = `
+    <div class="mcard" style="padding:10px">
+      <div style="font-weight:600;margin-bottom:8px">Host disposition</div>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">Override the app-level 7R rule for this host. <b>Retain</b> keeps it on-prem; <b>Retire</b> decommissions it; <b>Migrate</b> clears the override so it moves with its waves. Takes effect on the next Rebuild and survives it (stored by host identity, not the rebuild-changing server row).</div>
+      <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">
+        <label style="font-size:13px">disposition
+          <select id="dispSel" style="margin-left:4px">
+            <option value="">(migrate — no override)</option>
+            <option value="retain">retain (keep on-prem)</option>
+            <option value="retire">retire (decommission)</option>
+          </select>
+        </label>
+        <button class="sm primary" onclick="saveDisposition('${id}')">Save</button>
+        <button class="sm" onclick="document.getElementById('dExplain').innerHTML=''">Cancel</button>
+      </div>
+    </div>`;
+  const sel = $('dispSel');
+  if(cur) sel.value = cur;
+}
+async function saveDisposition(id){
+  const disp = $('dispSel').value;
+  try{
+    const r = await api('/servers/'+id+'/disposition', {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify({disposition:disp})});
+    toast(`disposition ${r.cleared?'cleared':'set'}: ${r.disposition||'(migrate)'}`, 'ok');
+    $('dExplain').innerHTML='';
+    openServer(id);  // re-open to refresh the badge
+  }catch(e){ toast('set disposition failed: '+e, 'err'); }
 }
