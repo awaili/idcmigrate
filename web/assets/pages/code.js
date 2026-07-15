@@ -1,7 +1,8 @@
 /* ---------- code intelligence (external executor) ---------- */
 async function loadCode(){
-  loadExecStatus();   // connected/disconnected badge
-  loadExecConfig();   // manage-executor form + status line
+  loadExecStatus();   // default-executor connected/disconnected badge (header)
+  loadExecutors();    // registry list (default + named) — manage panel
+  populateExecPickers();  // fill the per-trigger executor <select>s
   try{
     const profiles = await api('/code-profiles');
     const tb = $('codeTbl').querySelector('tbody'); tb.innerHTML='';
@@ -62,7 +63,8 @@ async function loadCode(){
 async function doExecutorScan(){
   const action = $('exAction').value;
   const body = {app_id:$('exApp').value.trim(), repo_url:$('exRepo').value.trim(),
-                branch:$('exBranch').value.trim(), action, mode:$('exMode').value};
+                branch:$('exBranch').value.trim(), action, mode:$('exMode').value,
+                executor_id:($('exExecutor').value||'')};
   if(!body.app_id || !body.repo_url){ $('exOut').innerHTML='<span class="ev-err">app_id and repo url required</span>'; return; }
   if(action === 'modify'){
     const s = $('exScope').value.trim();
@@ -218,46 +220,103 @@ async function loadExecStatus(){
   }catch(e){ el.innerHTML = `<span style="color:var(--amber)">● status unavailable</span>`; }
 }
 
-/* ---------- Manage executor panel (runtime config, persisted) ---------- */
-async function loadExecConfig(){
-  const statusEl=$('execCfgStatus'); if(!statusEl) return;
-  try{
-    const c = await api('/executor/config');
-    $('execUrl').value = c.url || '';
-    $('execEnabled').checked = !!c.enabled;
-    $('execTimeout').value = c.timeout || 600;
-    $('execToken').value = '';   // token is never returned; blank = keep current
-    const s = c.status || {};
-    const color = s.reachable ? 'var(--green)' : (s.configured ? 'var(--amber)' : 'var(--fg)');
-    const lbl = s.reachable ? `● connected${s.version?` · ${esc(s.version)}`:''}`
-              : s.configured ? `● configured, unreachable`
-              : '○ not configured';
-    statusEl.innerHTML = `<span style="color:${color}">${lbl}${c.token_set?'':' · token unset'}${c.enabled?'':' · disabled'}</span> <span class="muted">${esc(s.detail||'')}</span>`;
-  }catch(e){ statusEl.innerHTML=`<span class="ev-err">config load failed: ${esc(e)}</span>`; }
+/* ---------- Manage executors (registry: one default + N named) ---------- */
+function _execBadge(s){
+  if(!s) return '<span class="muted">—</span>';
+  const c = s.reachable ? 'var(--green)' : (s.configured ? 'var(--amber)' : 'var(--fg)');
+  const lbl = s.reachable ? `● up${s.version?` · ${esc(s.version)}`:''}`
+             : s.configured ? '● down' : '○ unset';
+  return `<span style="color:${c}">${lbl}</span>`;
 }
-async function saveExecConfig(){
-  const body = {url:$('execUrl').value.trim(), enabled:$('execEnabled').checked,
-                timeout:parseInt($('execTimeout').value,10)||600};
-  const tok=$('execToken').value;
-  if(tok) body.token=tok;   // only send a token if the operator typed a new one
-  const out=$('execCfgOut'); out.innerHTML='<span class="spinner"></span> saving…';
+async function loadExecutors(){
+  const el = $('execList'); if(!el) return;
+  el.innerHTML = '<span class="spinner"></span>';
+  let list; try{ list = await api('/executors'); }
+  catch(e){ el.innerHTML = `<span class="ev-err">load failed: ${esc(e)}</span>`; return; }
+  if(!list.length){ el.innerHTML = '<span class="muted">no executors — set IDC_EXECUTOR_URL or add one below.</span>'; return; }
+  el.innerHTML = list.map(_execRow).join('');
+}
+function _execRow(e){
+  const id = e.id;
+  const tag = e.default ? '<span class="tag" style="color:var(--accent);border-color:var(--accent)">default</span>' : '';
+  const del = e.default ? '' : `<button class="sm" onclick="deleteExecutor('${attr(id)}')">delete</button>`;
+  const pub = e.default ? `<div class="row" style="flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px">
+      <input id="ex_${attr(id)}_pub" value="${attr(e.public_url||'')}" placeholder="this server's public URL (https://mig.zaymuc.com)" style="flex:1 1 360px;min-width:240px" title="IDC_PUBLIC_URL — the address every executor pushes back to over the internet"/>
+      <span class="muted" style="font-size:12px">public URL = push-back target for ALL executors</span>
+    </div>` : '';
+  return `<div class="mcard" style="margin:6px 0;padding:8px 10px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+      <b>${esc(id)}</b> ${tag} ${_execBadge(e.status)}
+      <span class="muted" style="font-size:12px">${esc((e.status||{}).detail||'')}</span>
+    </div>
+    <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
+      <input id="ex_${attr(id)}_url" value="${attr(e.url||'')}" placeholder="executor URL (https://...)" style="flex:1 1 260px;min-width:180px"/>
+      <input id="ex_${attr(id)}_tok" type="password" placeholder="token ${e.token_set?'(set · blank=keep)':'(unset)'}" style="flex:0 1 150px;min-width:120px"/>
+      <label class="muted" style="white-space:nowrap;font-size:12px"><input type="checkbox" id="ex_${attr(id)}_en" ${e.enabled?'checked':''}> enabled</label>
+      <input id="ex_${attr(id)}_to" type="number" min="1" value="${e.timeout||600}" style="width:70px" title="timeout (s)"/>
+      <button class="sm primary" onclick="saveExecutor('${attr(id)}')">Save</button>
+      <button class="sm" onclick="testExecutor('${attr(id)}')">Test</button>
+      ${del}
+    </div>
+    ${pub}
+    <div class="out" id="ex_${attr(id)}_out" style="margin-top:4px"></div>
+  </div>`;
+}
+function _execBody(id){
+  const body = {url:$(`ex_${id}_url`).value.trim(), enabled:$(`ex_${id}_en`).checked,
+                timeout:parseInt($(`ex_${id}_to`).value,10)||600};
+  const tok=$(`ex_${id}_tok`).value;
+  if(tok) body.token=tok;   // blank = keep current
+  if(id==='default'){ const pub=$(`ex_${id}_pub`); if(pub) body.public_url=pub.value.trim(); }
+  return body;
+}
+async function saveExecutor(id){
+  const out=$(`ex_${id}_out`); out.innerHTML='<span class="spinner"></span> saving…';
   try{
-    await api('/executor/config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    const path = id==='default' ? '/executor/config' : '/executors/'+encodeURIComponent(id);
+    await api(path, {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify(_execBody(id))});
     out.innerHTML = `<span style="color:var(--green)">✓ saved</span>`;
-    await loadExecConfig();   // refresh the status line with the post-save probe
-    loadExecStatus();         // refresh the header badge too
-    toast('executor config saved','ok');
+    loadExecutors(); populateExecPickers(); loadExecStatus();
+    toast('executor saved','ok');
   }catch(e){ out.innerHTML=`<span class="ev-err">save failed: ${esc(e)}</span>`; }
 }
-async function testExecConfig(){
-  const body={url:$('execUrl').value.trim()};
-  const tok=$('execToken').value; if(tok) body.token=tok;
-  const out=$('execCfgOut'); out.innerHTML='<span class="spinner"></span> testing…';
+async function testExecutor(id){
+  const out=$(`ex_${id}_out`); out.innerHTML='<span class="spinner"></span> testing…';
   try{
-    const s = await api('/executor/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-    const color = s.reachable ? 'var(--green)' : 'var(--amber)';
-    out.innerHTML = `<span style="color:${color}">${s.reachable?`✓ reachable${s.version?` · ${esc(s.version)}`:''}`:`✗ ${esc(s.detail||'unreachable')}`}</span>`;
+    const s = id==='default'
+      ? await api('/executor/test', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(_execBody(id))})
+      : await api('/executors/'+encodeURIComponent(id)+'/test', {method:'POST'});
+    const c = s.reachable ? 'var(--green)' : 'var(--amber)';
+    out.innerHTML = `<span style="color:${c}">${s.reachable?`✓ reachable${s.version?` · ${esc(s.version)}`:''}`:`✗ ${esc(s.detail||'unreachable')}`}</span>`;
   }catch(e){ out.innerHTML=`<span class="ev-err">test failed: ${esc(e)}</span>`; }
+}
+async function deleteExecutor(id){
+  if(!confirm(`Delete executor "${id}"?`)) return;
+  try{
+    await api('/executors/'+encodeURIComponent(id), {method:'DELETE'});
+    toast('executor deleted','ok');
+    loadExecutors(); populateExecPickers();
+  }catch(e){ toast('delete failed: '+e,'err'); }
+}
+async function addExecutor(){
+  const id=$('newExecId').value.trim(), url=$('newExecUrl').value.trim();
+  if(!id || !url){ toast('id and url required','warn'); return; }
+  const body={url, enabled:$('newExecEnabled').checked, timeout:parseInt($('newExecTimeout').value,10)||600};
+  const tok=$('newExecToken').value; if(tok) body.token=tok;
+  try{
+    await api('/executors/'+encodeURIComponent(id), {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+    toast('executor added','ok');
+    $('newExecId').value=''; $('newExecUrl').value=''; $('newExecToken').value='';
+    loadExecutors(); populateExecPickers();
+  }catch(e){ toast('add failed: '+e,'err'); }
+}
+async function populateExecPickers(){
+  let list; try{ list = await api('/executors'); }catch(e){ return; }
+  const opts = list.map(e=>`<option value="${attr(e.id)}">${esc(e.id)}${e.default?' (default)':''}${e.enabled?'':' · off'}</option>`).join('');
+  document.querySelectorAll('select.execPicker').forEach(sel=>{
+    const cur=sel.value; sel.innerHTML=opts; if(cur && [...sel.options].some(o=>o.value===cur)) sel.value=cur;
+    else if(list.length) sel.value=list[0].id;
+  });
 }
 
 /* ---------- F5/F6 — DB conversion profiles + convert mode ---------- */
@@ -266,7 +325,7 @@ async function doDbScan(mode){
   const db_server_id = $('dbScanId').value.trim();
   if(!db_server_id){ toast('enter a db hostname first','warn'); return; }
   const body = { db_server_id, source_engine:$('dbSrcEng').value, target_engine:$('dbTgtEng').value,
-                 mode: mode || 'assess' };
+                 mode: mode || 'assess', executor_id:($('dbExecutor').value||'') };
   try{
     await api('/db-scan', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
     toast(`DB ${body.mode} requested — profile arrives via callback; Rebuild folds the grade in.`, 'ok');
@@ -315,7 +374,8 @@ async function doRuntimeContainerize(){
   if($('rtProc').value.trim()) inv.process = $('rtProc').value.trim();
   if($('rtPort').value.trim()) inv.ports = $('rtPort').value.split(',').map(s=>parseInt(s.trim())).filter(n=>n);
   if($('rtSoft').value.trim()) inv.software = $('rtSoft').value.split(',').map(s=>s.trim()).filter(s=>s);
-  const body = { app_id, server_id, inventory: inv, mode:$('rtMode').value };
+  const body = { app_id, server_id, inventory: inv, mode:$('rtMode').value,
+                 executor_id:($('rtExecutor').value||'') };
   try{
     await api('/runtime-containerize', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
     toast('Runtime containerize requested — profile arrives via callback (source=runtime-derived).', 'ok');
@@ -351,7 +411,7 @@ async function doIacEmit(){
   if(!scope_id){ toast('enter a scope_id (lz:corp or wl:<server_id>)','warn'); return; }
   try{
     await api('/iac-emit', {method:'POST', headers:{'content-type':'application/json'},
-            body:JSON.stringify({scope, scope_id, context:{}})});
+            body:JSON.stringify({scope, scope_id, context:{}, executor_id:($('iacExecutor').value||'')})});
     toast('IaC emit requested — artifact + guardrails arrive via callback.', 'ok');
     setTimeout(loadIacArtifacts, 1500);
   }catch(e){ toast('iac-emit failed: '+e, 'err'); }
@@ -398,7 +458,7 @@ async function doLegacyAnalyze(){
                 runtime:$('ldRuntime').value.trim(),
                 has_source_repo:$('ldHasRepo').checked, os_eol_bucket:'expired' };
   try{
-    await api('/legacy-disposition', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({server_id, context:ctx})});
+    await api('/legacy-disposition', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({server_id, context:ctx, executor_id:($('ldExecutor').value||'')})});
     toast('Legacy-disposition analysis requested — arrives via callback.', 'ok');
     setTimeout(loadLegacyDispositions, 1500);
   }catch(e){ toast('legacy-disposition failed: '+e, 'err'); }

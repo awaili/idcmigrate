@@ -89,6 +89,14 @@ class Settings:
     executor_token: str = field(default_factory=lambda: _env("IDC_EXECUTOR_TOKEN"))
     executor_timeout: int = field(default_factory=lambda: _env_int("IDC_EXECUTOR_TIMEOUT", 600))
     executor_enabled: bool = field(default_factory=lambda: _env_bool("IDC_EXECUTOR_ENABLED", True))
+    # IDC_PUBLIC_URL = this server's own public HTTPS base (the push direction
+    # target). Sent as the per-request `callback` on every executor trigger so a
+    # remote executor on the internet knows where to push CodeProfile /
+    # ChangeJob / ... back without a separate IDC_CALLBACK_BASE env. Empty (the
+    # default) -> callback is sent empty and the executor must fall back to its
+    # own callback-base env (back-compat). Overridable at runtime via the
+    # Manage-executor panel (DB system_config `public_url`).
+    public_url: str = field(default_factory=lambda: _env("IDC_PUBLIC_URL"))
 
     # web UI password gate. IDC_WEB_PASSWORD = the shared login password; when
     # empty (and no DB override), auth is OFF and the UI/API are open. A DB

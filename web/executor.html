@@ -46,14 +46,14 @@
   <p class="sub">What an executor must implement to work with <b>idc-migrate</b>. Full source contract: <code>docs/agent-executor.md</code>. Reference implementation: <code>idc/executor_mock/app.py</code>.</p>
 
   <div class="card">
-    <b>In one sentence:</b> an executor is an external HTTP service that idc-migrate outsources code-scan / assessment / modify work to. It receives trigger requests, does the work async, and pushes results back to idc-migrate via callbacks. Results feed reconsolidate, wave planning, and match confidence.
-    <p style="margin:10px 0 0"><span class="pill p-blue">one configured endpoint</span> connect via the <b>Manage executor</b> panel (Code &amp; DB tab) or <code>IDC_EXECUTOR_URL</code> / <code>IDC_EXECUTOR_TOKEN</code> env.</p>
+    <b>In one sentence:</b> an executor is an external worker that idc-migrate outsources code-scan / assessment / modify work to. <b>It exposes nothing to the network</b> — it <b>pulls</b> work from idc-migrate's <code>POST /api/executor/tasks/claim</code>, does the work async, and <b>pushes results back</b> to idc-migrate over <code>/api/*</code>. Results feed reconsolidate, wave planning, and match confidence.
+    <p style="margin:10px 0 0"><span class="pill p-blue">pull mode</span> the executor only needs <b>outbound</b> to idc-migrate (it can sit behind NAT/firewall). Register it via the <b>Manage executors</b> panel (Code &amp; DB tab) with its <code>IDC_EXECUTOR_TOKEN</code>; set <code>IDC_PUBLIC_URL</code> on idc-migrate so it can bake the feedback <code>callback</code> into each task.</p>
   </div>
 
   <h2 id="toc">Contents</h2>
   <ul class="toc">
     <li><a href="#auth">Auth &amp; conventions</a></li>
-    <li><a href="#actions">The 5 actions (request direction)</a></li>
+    <li><a href="#actions">Pulling work (task kinds)</a></li>
     <li><a href="#push">Push callbacks (executor → idc-migrate)</a></li>
     <li><a href="#codeprofile">CodeProfile schema</a></li>
     <li><a href="#dbprofile">DBConversionProfile (F5)</a></li>
@@ -67,34 +67,51 @@
 
   <h2 id="auth">Auth &amp; conventions</h2>
   <ul>
-    <li>Both directions use <code>Authorization: Bearer &lt;token&gt;</code>. The shared secret is <code>IDC_EXECUTOR_TOKEN</code> (idc-migrate validates pushes with it; the executor validates incoming triggers with the same value).</li>
+    <li>The executor exposes <b>nothing</b> to the network — it only makes <b>outbound</b> calls to idc-migrate. Every call uses <code>Authorization: Bearer &lt;token&gt;</code>; the shared secret is <code>IDC_EXECUTOR_TOKEN</code>. The token also <b>identifies</b> the executor (resolved to an executor id) and gates which tasks it may claim.</li>
     <li>Content-Type <code>application/json; charset=utf-8</code>. Timestamps ISO-8601 UTC (<code>...Z</code>).</li>
-    <li>Request direction base = <code>IDC_EXECUTOR_URL</code> (e.g. <code>http://executor.internal:8090</code>). Push direction base = the idc-migrate web URL (e.g. <code>https://mig.zaymuc.com</code>).</li>
-    <li>All triggers are <b>async</b>: respond <code>202 {job_id, status:"pending"}</code> immediately, then call back when done.</li>
+    <li>Base = idc-migrate's public HTTPS URL (e.g. <code>https://mig.zaymuc.com</code>) — the executor pulls <code>/api/executor/tasks/claim</code> from it and pushes results back to it. The executor must be able to reach it from its network; idc-migrate never calls back.</li>
+    <li>Tasks are <b>async</b>: a trigger returns <code>200 {task_id, status:"pending"}</code> immediately; the executor pulls + completes it.</li>
+    <li><b>Auth is required on every <code>/api/*</code> path</b> — the live idc-migrate runs behind a web login gate, so the executor must send <code>Authorization: Bearer $IDC_EXECUTOR_TOKEN</code> on <em>every</em> claim, complete, push, and context pull (including the read-only GETs below). A call without a bearer returns <code>401</code>; the bearer is the only option a headless executor has (no browser session).</li>
+    <li><b>No <code>/health</code> probe.</b> idc-migrate cannot reach the executor, so there is no liveness probe — the executor proves it is alive by polling <code>/api/executor/tasks/claim</code>. <code>executor_status</code> reports pull mode (<code>reachable=null</code>); real liveness is "an executor is claiming tasks".</li>
+    <li><b>Multiple executors are supported.</b> Register the <code>default</code> + any number of <b>named</b> executors via the <b>Manage executors</b> panel (<code>PUT /api/executors/{id}</code>; <code>GET /api/executors</code> lists them). A trigger's <code>executor_id</code> picks a target: empty = the <b>pool</b> (any executor may claim it); <code>"default"</code> or a named id = target that executor specifically. Each executor authenticates with <b>its own</b> token — idc-migrate accepts a bearer that matches any registered executor's token.</li>
   </ul>
 
-  <h2 id="actions">The 5 actions (idc-migrate → executor)</h2>
-  <p class="muted">These are the endpoints the executor must serve. All bearer-authed, all async (202 + job_id).</p>
+  <h2 id="actions">Pulling work (executor → idc-migrate)</h2>
+  <p class="muted">The executor polls <code>POST /api/executor/tasks/claim</code> (bearer-authed); idc-migrate atomically hands it one eligible task with the full <code>payload</code> (the work + the feedback <code>callback</code>). The executor runs it, pushes results back to idc-migrate's <b>public HTTPS URL</b>, then <code>POST /api/executor/tasks/{id}/complete</code>. The <code>callback</code> in the payload is authoritative; when empty the executor builds <code>{IDC_CALLBACK_BASE} + path</code> itself — see <a href="#push">Push callbacks</a>.</p>
   <table>
-    <tr><th>Endpoint</th><th>Action</th><th>Produces (via callback)</th></tr>
-    <tr><td><code>POST /v1/scan</code></td><td>scan a repo (read-only) → findings</td><td>pushes <code>ChangeJob</code> (done); scan itself does not push a profile</td></tr>
-    <tr><td><code>POST /v1/comb</code></td><td>synthesize a <code>CodeProfile</code> from findings</td><td><code>ChangeJob</code> done + <code>PUT /api/code-profiles/{app_id}</code></td></tr>
-    <tr><td><code>POST /v1/modify</code></td><td>apply a concrete <code>changes[]</code> list (idc-migrate builds it)</td><td><code>ChangeJob</code> done with <code>patch_ref</code></td></tr>
-    <tr><td><code>POST /v1/db-scan</code> <span class="tag">F5</span></td><td>scan a DB host's schema/SQL (Oracle/SQLServer → MySQL)</td><td><code>ChangeJob</code> done + <code>PUT /api/db-profiles/{db_server_id}</code></td></tr>
-    <tr><td><code>POST /v1/runtime-containerize</code> <span class="tag">F9</span></td><td>infer a Dockerfile from runtime inventory (no source repo)</td><td><code>ChangeJob</code> done + <code>PUT /api/code-profiles/{app_id}</code> with <code>source=runtime-derived</code></td></tr>
-    <tr><td><code>GET /v1/jobs/{job_id}</code></td><td>poll a job's status</td><td>returns the <code>ChangeJob</code></td></tr>
-    <tr><td><code>GET /health</code></td><td>liveness + identity</td><td><code>{ok, service, version, ...}</code> — powers the status badge / <code>idc doctor</code></td></tr>
+    <tr><th>task <code>kind</code></th><th>Action</th><th>Produces (via feedback)</th></tr>
+    <tr><td><code>scan</code></td><td>scan a repo (read-only) → findings</td><td><code>ChangeJob</code> done + <code>PUT /api/code-profiles/{app_id}</code></td></tr>
+    <tr><td><code>comb</code></td><td>synthesize a <code>CodeProfile</code> from findings</td><td><code>ChangeJob</code> done + <code>PUT /api/code-profiles/{app_id}</code></td></tr>
+    <tr><td><code>modify</code></td><td>apply a concrete <code>changes[]</code> list (idc-migrate builds it)</td><td><code>ChangeJob</code> done with <code>patch_ref</code> (heartbeat only — uses <code>IDC_CALLBACK_BASE</code>)</td></tr>
+    <tr><td><code>db-scan</code> <span class="tag">F5</span></td><td>scan a DB host's schema/SQL (Oracle/SQLServer → MySQL)</td><td><code>ChangeJob</code> done + <code>PUT /api/db-profiles/{db_server_id}</code></td></tr>
+    <tr><td><code>runtime-containerize</code> <span class="tag">F9</span></td><td>infer a Dockerfile from runtime inventory (no source repo)</td><td><code>ChangeJob</code> done + <code>PUT /api/code-profiles/{app_id}</code> with <code>source=runtime-derived</code></td></tr>
+    <tr><td><code>legacy-disposition</code> <span class="tag">F7</span></td><td>recommend containerize / replatform / rewrite / retain for an EOL host</td><td><code>ChangeJob</code> done + <code>PUT /api/legacy-dispositions/{server_id}</code></td></tr>
+    <tr><td><code>cutover-playbook</code> <span class="tag">F9</span></td><td>generate a per-wave cutover playbook (grounded markdown)</td><td><code>ChangeJob</code> done + <code>PUT /api/docs/cutover/{wave_id}</code></td></tr>
+    <tr><td><code>as-built</code> <span class="tag">F9</span></td><td>generate a per-wave as-built doc (grounded markdown)</td><td><code>ChangeJob</code> done + <code>PUT /api/docs/as-built/{wave_id}</code></td></tr>
+    <tr><td><code>iac-emit</code> <span class="tag">F5</span></td><td>emit Tencent Terraform HCL + run Well-Architected guardrails</td><td><code>ChangeJob</code> done + <code>PUT /api/iac-artifacts/{scope_id}</code></td></tr>
+    <tr><td><code>postmig-optimize</code> <span class="tag">F10</span></td><td>right-size / reserved / anomaly / perf recs from post-mig cloud metrics</td><td><code>ChangeJob</code> done + <code>PUT /api/postmig-recs/{server_id}/{kind}</code> (one per kind — uses <code>IDC_CALLBACK_BASE</code>)</td></tr>
+    <tr><td><code>test-gen</code> <span class="tag">F11</span></td><td>generate test cases from the app's <code>CodeProfile</code></td><td><code>ChangeJob</code> done + <code>PUT /api/test-cases/{app_id}</code></td></tr>
+    <tr><td><code>test-run</code> <span class="tag">F11</span></td><td>run the app's tests against a target (pre / post)</td><td><code>ChangeJob</code> done + <code>PUT /api/test-runs/{run_id}</code> (uses <code>IDC_CALLBACK_BASE</code>; <code>run_id</code> is pre-minted by idc-migrate)</td></tr>
+    <tr><td><code>test-compare</code> <span class="tag">F11</span></td><td>diff pre vs post test runs</td><td><code>ChangeJob</code> done + <code>PUT /api/test-diffs/{app_id}</code></td></tr>
+    <tr><td colspan="3"><b>Control endpoints (the executor calls these):</b> <code>POST /api/executor/tasks/claim</code> (pull one) · <code>POST /api/executor/tasks/{id}/complete</code> (done/error) · <code>POST /api/executor/tasks/{id}/lease</code> (heartbeat) · <code>GET /api/executor/tasks/{id}</code> (status). A claim holds a 15-min lease; an expired lease is requeued so a dead executor doesn't strand the task.</td></tr>
   </table>
   <div class="note"><b><code>modify</code> is the only action with side effects.</b> Default <code>mode=plan</code> (dry-run, produce a <code>patch_ref</code> only); <code>mode=execute</code> actually writes to the repo (commit/PR).</div>
 
-  <h3>POST /v1/scan</h3>
-<pre><code>{"app_id": "orders-svc", "repo_url": "git@gitlab:trade/orders-svc.git",
- "branch": "master", "callback": "https://mig.zaymuc.com/api/code-profiles/orders-svc"}
-→ 202 {"job_id": "cjob-...", "status": "pending"}</code></pre>
+  <h3>Pulling a task — <code>POST /api/executor/tasks/claim</code></h3>
+<pre><code>POST /api/executor/tasks/claim   (Authorization: Bearer $IDC_EXECUTOR_TOKEN)
+{}
+→ 200 {"task_id": "tsk-...", "kind": "scan", "status": "claimed",
+        "payload": {"app_id": "orders-svc", "repo_url": "git@gitlab:trade/orders-svc.git",
+                    "branch": "master",
+                    "callback": "https://mig.zaymuc.com/api/code-profiles/orders-svc"},
+        "executor_id": null, "lease_until": "2026-07-15T10:15:00Z"}
+   (or → 200 {"task_id": null, "status": "idle"} when the queue is empty)</code></pre>
+  <p class="muted">One task per call — loop with a short sleep when idle. The <code>payload.callback</code> is where results go back. When done: <code>POST /api/executor/tasks/{task_id}/complete</code> <code>{"status":"done","summary":"..."}</code>; renew the lease with <code>/lease</code> on long jobs.</p>
 
-  <h3>POST /v1/modify</h3>
+  <h3>kind=modify — the changes list</h3>
   <p class="muted">The <code>changes</code> array is built by idc-migrate from the app's <code>CodeProfile</code> + operator <code>overrides</code> — it tells the executor <b>exactly which file, which line, which literal (<code>old</code>) → which value (<code>new</code>)</b>. Do not re-scan; do not guess.</p>
-<pre><code>{"app_id": "orders-svc", "repo_url": "git@gitlab:trade/orders-svc.git",
+<pre><code>// payload for a claimed kind=modify task:
+{"app_id": "orders-svc", "repo_url": "git@gitlab:trade/orders-svc.git",
  "branch": "cloud-ready", "mode": "plan",
  "scope": ["db_connection", "service_discovery"],
  "changes": [
@@ -111,33 +128,37 @@
     "old": "hunter2", "new": "${ORDERS_DB_PASSWORD}",
     "effort": "low", "description": "Inline password → secret ref"}
  ],
- "notes": []}
-→ 202 {"job_id": "cjob-...", "status": "pending"}</code></pre>
-  <div class="note">If a <code>change.old</code> or <code>change.new</code> is empty, idc-migrate couldn't extract the literal. The executor must locate it by <code>file</code>+<code>line</code> itself, <b>or skip it and report <code>ChangeJob.status=error</code></b>. <b>Never invent a replacement value.</b></div>
+ "notes": [], "callback": ""}</code></pre>
+  <div class="note">If a <code>change.old</code> or <code>change.new</code> is empty, idc-migrate couldn't extract the literal. The executor must locate it by <code>file</code>+<code>line</code> itself, <b>or skip it and mark the task <code>error</code></b>. <b>Never invent a replacement value.</b></div>
 
-  <h3>POST /v1/db-scan (F5)</h3>
+  <h3>kind=db-scan (F5)</h3>
 <pre><code>{"db_server_id": "db-oracle-01", "source_engine": "oracle",
- "target_engine": "tdsql", "callback": "https://mig.zaymuc.com/api/db-profiles/db-oracle-01"}
-→ 202 {"job_id": "...", "status": "pending"}</code></pre>
+ "target_engine": "tdsql", "mode": "assess",
+ "callback": "https://mig.zaymuc.com/api/db-profiles/db-oracle-01"}</code></pre>
   <p class="muted"><code>db_server_id</code> is the DB host's <b>stable identity (hostname, lowercase)</b> — not <code>Server.id</code>, which changes every rebuild.</p>
 
-  <h3>POST /v1/runtime-containerize (F9)</h3>
+  <h3>kind=runtime-containerize (F9)</h3>
 <pre><code>{"app_id": "legacy-billing", "server_id": "srv-123",
- "inventory": {"process": "java -jar billing.jar", "port": 8080,
-               "unit": "billing.service", "software": ["openjdk-8"]},
- "mode": "plan", "callback": "https://mig.zaymuc.com/api/code-profiles/legacy-billing"}
-→ 202 {"job_id": "...", "status": "pending"}</code></pre>
+ "inventory": {"process": "java -jar billing.jar", "ports": [8080],
+               "software": ["openjdk-8"]},
+ "mode": "plan", "callback": "https://mig.zaymuc.com/api/code-profiles/legacy-billing"}</code></pre>
 
   <h2 id="push">Push callbacks (executor → idc-migrate)</h2>
-  <p class="muted">The executor calls these as it works. All bearer-authed with <code>IDC_EXECUTOR_TOKEN</code>.</p>
+  <p class="muted">The executor calls these as it works, against idc-migrate's <b>public HTTPS URL</b>. All bearer-authed with <code>IDC_EXECUTOR_TOKEN</code>. The target URL comes from the task payload's <code>callback</code> field when idc-migrate baked one in (authoritative — PUT/POST directly to it), else the executor builds <code>{IDC_CALLBACK_BASE} + path</code> itself.</p>
   <table>
     <tr><th>Endpoint</th><th>When</th></tr>
-    <tr><td><code>POST /api/change-jobs</code></td><td>heartbeat + terminal state — <code>pending→running→done/error</code>. Upsert by <code>id</code>. Use <code>summary</code> for live progress text.</td></tr>
-    <tr><td><code>PUT /api/code-profiles/{app_id}</code></td><td>when comb/scan/runtime-containerize produces a <code>CodeProfile</code> (upsert by <code>app_id</code>)</td></tr>
+    <tr><td><code>POST /api/change-jobs</code></td><td>heartbeat + terminal state — <code>pending→running→done/error</code>. Upsert by <code>id</code>. Use <code>summary</code> for live progress text. <b>Always uses <code>IDC_CALLBACK_BASE</code></b> (no per-request callback for the heartbeat).</td></tr>
+    <tr><td><code>PUT /api/code-profiles/{app_id}</code></td><td>when scan/comb/runtime-containerize produces a <code>CodeProfile</code> (upsert by <code>app_id</code>)</td></tr>
     <tr><td><code>PUT /api/db-profiles/{db_server_id}</code></td><td>when db-scan produces a <code>DBConversionProfile</code> (upsert by hostname)</td></tr>
+    <tr><td><code>PUT /api/legacy-dispositions/{server_id}</code> <span class="tag">F7</span></td><td>when legacy-disposition produces a <code>LegacyDisposition</code> (upsert by hostname)</td></tr>
+    <tr><td><code>PUT /api/docs/cutover/{wave_id}</code> / <code>/api/docs/as-built/{wave_id}</code> <span class="tag">F9</span></td><td>when cutover-playbook / as-built produce a <code>DocArtifact</code></td></tr>
+    <tr><td><code>PUT /api/iac-artifacts/{scope_id}</code> <span class="tag">F5</span></td><td>when iac-emit produces an <code>IaCArtifact</code> + guardrail results</td></tr>
+    <tr><td><code>PUT /api/postmig-recs/{server_id}/{kind}</code> <span class="tag">F10</span></td><td>one <code>PostMigRecommendation</code> per kind (uses <code>IDC_CALLBACK_BASE</code>)</td></tr>
+    <tr><td><code>PUT /api/test-cases/{app_id}</code> / <code>/api/test-runs/{run_id}</code> / <code>/api/test-diffs/{app_id}</code> <span class="tag">F11</span></td><td>test-gen / test-run / test-compare results (test-run uses <code>IDC_CALLBACK_BASE</code>)</td></tr>
     <tr><td><code>POST /api/apps/{app_id}/questions</code></td><td>raise a question to the operator when a value can't be resolved (see <a href="#questions">Questions</a>)</td></tr>
   </table>
-  <div class="note ok"><b>Callback order on completion:</b> <code>POST /api/change-jobs</code> (status=done) <b>first</b>, then the profile PUT (only for comb/scan/db-scan that produce a profile).</div>
+  <div class="note ok"><b>Callback order on completion:</b> <code>POST /api/change-jobs</code> (status=done) <b>first</b>, then the profile/artifact PUT (only for actions that produce one).</div>
+  <div class="note"><b>Reachability:</b> idc-migrate's push endpoints sit behind its public nginx HTTPS ingress (e.g. <code>https://mig.zaymuc.com/api/*</code>) and accept the bearer token before the login gate — <b>no extra port or certificate needed</b>. idc-migrate sends its own public URL as <code>callback</code> on every trigger (set <code>IDC_PUBLIC_URL</code> on the idc-migrate side, or the Manage-executor panel); when it's unset the executor must configure <code>IDC_CALLBACK_BASE</code> to that same public domain. Either way the executor pushes over the public internet to idc-migrate's HTTPS address.</div>
 
   <h2 id="codeprofile">CodeProfile — the assessment (must produce for comb)</h2>
   <p class="muted">Pushed via <code>PUT /api/code-profiles/{app_id}</code>. Data model: <code>idc/core/models.py::CodeProfile</code>.</p>
@@ -212,8 +233,8 @@
 }</code></pre>
   <p class="muted">Push <code>status=running</code> repeatedly during long work, updating <code>summary</code> for live progress; terminal <code>done</code>/<code>error</code> goes through the same endpoint.</p>
 
-  <h2 id="context">Context the executor can pull (read-only GET, no bearer)</h2>
-  <p>While working, the executor may fetch more context from idc-migrate:</p>
+  <h2 id="context">Context the executor can pull (read-only GET, bearer-authed)</h2>
+  <p>While working, the executor may fetch more context from idc-migrate. All of these are <b>bearer-authed</b> with <code>IDC_EXECUTOR_TOKEN</code> (same secret as the pushes) — under the live login gate there is no anonymous access, so a GET without a bearer returns <code>401</code>:</p>
   <ul>
     <li><code>GET /api/workloads/{app_id}</code> — the app's <code>tier</code>, <code>depends_on</code>, <code>server_ids</code> (blast radius).</li>
     <li><code>GET /api/apps/{app_id}/targets</code> — matched Tencent targets for the app's servers <code>{product, spec, region, confidence}</code> (e.g. DB matched to CDB → parameterize JDBC to CDB-style host, not bare IP).</li>
@@ -245,22 +266,22 @@
 
   <h2 id="lifecycle">Lifecycle &amp; errors</h2>
   <ul>
-    <li>Triggers are async: <code>202 + job_id</code>; results via callback or <code>GET /v1/jobs/{id}</code>.</li>
-    <li>Timeout: <code>IDC_EXECUTOR_TIMEOUT</code> (default 600s) bounds the HTTP connection, not the job — long work is expressed via <code>ChangeJob.status</code>.</li>
-    <li>Concurrency: a new scan for the same <code>app_id</code> overwrites the old profile; same <code>job_id</code> re-push is upsert.</li>
-    <li>Status codes: <code>400</code> schema, <code>401</code> auth, <code>404</code> unknown app, <code>409</code> already-running (optional), <code>422</code> repo unreachable, <code>5xx</code> internal.</li>
+    <li>Triggers are async: a trigger returns <code>200 {task_id, status:"pending"}</code>; the task waits in the queue until an executor claims it.</li>
+    <li>Lifecycle: <code>pending → claimed → done|error</code>. A claim holds a 15-min lease — renew via <code>/lease</code> on long jobs, or the task is requeued and another executor may reclaim it. idc-migrate also mirrors the terminal state into <code>change-jobs</code>.</li>
+    <li>Concurrency: a new scan for the same <code>app_id</code> overwrites the old profile; multiple executors may poll the same queue — the atomic claim hands each task to exactly one.</li>
+    <li>Status codes: <code>400</code> schema, <code>401</code> auth/unknown token, <code>404</code> unknown task/executor, <code>409</code> not-owned (complete/lease on a task the caller doesn't own), <code>422</code> repo unreachable (reported via task <code>error</code>).</li>
   </ul>
 
   <h2 id="minimal">Minimal viable executor</h2>
-  <p>The smallest useful executor implements:</p>
+  <p>The smallest useful executor is a <b>poll loop</b> (it exposes no HTTP server):</p>
   <ol>
-    <li><code>GET /health</code> → <code>{ok:true, service, version}</code>.</li>
-    <li><code>POST /v1/scan</code> + <code>POST /v1/comb</code> → return <code>202 + job_id</code>, then in the background: <code>POST /api/change-jobs</code> (running → done) and <code>PUT /api/code-profiles/{app_id}</code> with a real <code>CodeProfile</code>.</li>
-    <li><code>POST /v1/modify</code> → apply the given <code>changes[]</code> (literal replace by <code>file</code>+<code>line</code>), produce a <code>patch_ref</code>; <code>mode=plan</code> dry-run only.</li>
-    <li><code>GET /v1/jobs/{id}</code> → return the job record.</li>
+    <li>Loop: <code>POST /api/executor/tasks/claim</code> (bearer). On <code>task_id:null</code> sleep briefly and retry.</li>
+    <li>For <code>kind=scan|comb</code>: clone the repo, scan it, then push back <code>POST /api/change-jobs</code> (running → done) and <code>PUT /api/code-profiles/{app_id}</code> (to the <code>callback</code> in the payload) with a real <code>CodeProfile</code>.</li>
+    <li>For <code>kind=modify</code>: apply the payload's <code>changes[]</code> (literal replace by <code>file</code>+<code>line</code>), produce a <code>patch_ref</code>; <code>mode=plan</code> dry-run only.</li>
+    <li>Always finish with <code>POST /api/executor/tasks/{task_id}/complete</code> <code>{"status":"done"|"error",...}</code> (renew via <code>/lease</code> if the work is long). On any worker error, complete with <code>status=error</code> — never leave a task claimed.</li>
   </ol>
   <p>db-scan (F5) and runtime-containerize (F9) are optional until you need them.</p>
-  <div class="card"><b>Reference implementation:</b> <code>idc/executor_mock/app.py</code> — ~370 lines, implements the whole contract with in-memory jobs and real callbacks. Run it with <code>idc executor-mock</code> (port 8090), then point idc-migrate at it via the <b>Manage executor</b> panel (<code>http://127.0.0.1:8090</code> + token) and Save &amp; test. A production executor swaps the mock's canned answers for a real scanner (AST/regex rules + optional MigraQ for semantic calls) and a real repo writer (commit/PR for <code>modify</code>).</div>
+  <div class="card"><b>Reference implementation:</b> <code>idc/executor_mock/app.py</code> — a pull poller that claims tasks, runs the canned scan/comb/modify/… logic, pushes results back, and completes. Run it with <code>idc executor-mock</code> (set <code>IDC_MOCK_CALLBACK</code> to idc-migrate's base + <code>IDC_EXECUTOR_TOKEN</code> to the shared secret, both registered in the <b>Manage executors</b> panel). A production executor swaps the mock's canned answers for a real scanner (AST/regex rules + optional MigraQ for semantic calls) and a real repo writer (commit/PR for <code>modify</code>).</div>
 
   <hr/>
   <p class="muted">idc-migrate · executor contract · <span id="base"></span></p>

@@ -4,9 +4,14 @@
  * previously only had a backend + CLI. */
 let _proposedWaves = null;   // last proposed wave list (for Apply)
 
-async function proposePlan(){
-  const demand = $('planDemand').value.trim();
-  if(!demand){ $('planOut').innerHTML = '<span class="ev-err">enter a demand first</span>'; return; }
+async function proposePlan(demandOverride){
+  // demandOverride: when set, use it instead of the textarea (e.g. the review-
+  // feedback replan folds the red-team findings into the demand). The textarea
+  // is left untouched so the operator's original intent is preserved.
+  const demand = (demandOverride !== undefined && demandOverride !== null)
+    ? demandOverride.trim()
+    : $('planDemand').value.trim();
+  if(!demand){ $('planOut').innerHTML = '<span class="ev-err">enter a demand first</span>'; return null; }
   // max_waves is optional; omit from the body when blank so the backend only
   // auto-parses a cap from the demand text.
   const mw = $('planMaxWaves').value.trim();
@@ -16,10 +21,10 @@ async function proposePlan(){
   let r; try{
     r = await api('/plan/propose', {method:'POST', headers:{'content-type':'application/json'},
               body:JSON.stringify(body)});
-  }catch(e){ $('planOut').innerHTML = '<span class="ev-err">Error: '+esc(e)+'</span>'; return; }
+  }catch(e){ $('planOut').innerHTML = '<span class="ev-err">Error: '+esc(e)+'</span>'; return null; }
   if(!r.ok){
     $('planOut').innerHTML = `<span class="ev-err">MigraQ failed: ${esc((r.errors||[]).join('; '))||esc(r.raw||'')}</span>`;
-    return;
+    return r;
   }
   _proposedWaves = r.waves || [];
   const val = r.validation || {errors:[], warnings:[]};
@@ -69,6 +74,7 @@ async function proposePlan(){
       <span class="muted">Apply replaces the current waves.</span>
     </div>
     <div class="scroll" style="max-height:50vh"><table class="mcard"><thead><tr><th>wave</th><th>stage</th><th>depends_on</th><th>#</th><th>members</th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="muted">no waves</td></tr>'}</tbody></table></div>`;
+  return r;   // so callers (e.g. replanWithReview) can branch on ok/error
 }
 
 let _applyInFlight = false;   // re-entry guard: block a second Apply until the first finishes

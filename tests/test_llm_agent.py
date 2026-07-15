@@ -342,7 +342,7 @@ async def _fake_stream(prompt, settings=None, mode="plan", cwd=None, add_dirs=No
 
 def test_run_agent_collects_output(monkeypatch):
     monkeypatch.setattr(claude_runner, "stream_agent", _fake_stream)
-    res = asyncio.get_event_loop().run_until_complete(
+    res = asyncio.run(
         run_agent("dummy", settings=Settings(), mode="plan", context="ctx"))
     assert res.status == "done"
     assert "Hello world." in res.output
@@ -375,44 +375,32 @@ def test_build_cmd_plan_vs_execute():
 
 
 # ---------------------------------------------------------------------------
-# executor connectivity probe (doctor / web status indicator)
+# executor status (pull mode — the executor exposes nothing, so idc-migrate
+# cannot probe it; liveness is inferred from claim activity, not a /health call)
 # ---------------------------------------------------------------------------
 def test_executor_status_not_configured():
     from idc.agent import executor_status
     es = executor_status(Settings())   # executor_url empty
-    assert es["configured"] is False and es["reachable"] is False
-    assert "not configured" in es["detail"]
+    assert es["configured"] is False
+    assert es["reachable"] is None            # pull mode: no outbound probe
+    assert "pull mode" in es["detail"]
 
 
-def test_executor_status_reachable(monkeypatch):
+def test_executor_status_never_probes(monkeypatch):
+    """Pull mode: even with a url set, idc-migrate never reaches out (the
+    executor exposes nothing). httpx.get must not be called; reachable is
+    None and the public_url flag is reported."""
     from idc.agent import executor_status
-    fake = MagicMock()
-    fake.status_code = 200
-    fake.json.return_value = {"ok": True, "service": "idc-executor-mock",
-                              "version": "0.1.0"}
-    monkeypatch.setattr("httpx.get", lambda *a, **k: fake)
-    s = Settings(executor_url="http://localhost:8090", executor_token="t")
-    es = executor_status(s)
-    assert es["configured"] and es["reachable"] and es["version"] == "0.1.0"
-    assert es["token_set"] is True
+    import idc.agent.executor_client as ec
+    probed = []
 
-
-def test_executor_status_unreachable(monkeypatch):
-    from idc.agent import executor_status
     def boom(*a, **k):
-        raise ConnectionRefusedError("nope")
+        probed.append(1)
+        raise AssertionError("executor_status must not probe in pull mode")
     monkeypatch.setattr("httpx.get", boom)
-    s = Settings(executor_url="http://localhost:65535")
+    s = Settings(executor_url="http://localhost:8090", executor_token="t",
+                 public_url="https://mig.test")
     es = executor_status(s)
-    assert es["configured"] and not es["reachable"]
-    assert "unreachable" in es["detail"]
-
-
-def test_executor_status_non_200(monkeypatch):
-    from idc.agent import executor_status
-    fake = MagicMock()
-    fake.status_code = 404
-    monkeypatch.setattr("httpx.get", lambda *a, **k: fake)
-    s = Settings(executor_url="http://localhost:8090")
-    es = executor_status(s)
-    assert not es["reachable"] and es["status_code"] == 404
+    assert es["configured"] and es["token_set"] and es["public_url_set"]
+    assert es["reachable"] is None and es["version"] is None
+    assert probed == []                       # no outbound call

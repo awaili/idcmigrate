@@ -15,7 +15,6 @@
     <div class="tab" data-tab="inventory">Inventory</div>
     <div class="tab" data-tab="lz">Landing Zone</div>
     <div class="tab" data-tab="waves">Waves</div>
-    <div class="tab" data-tab="copilot">Copilot</div>
     <div class="tab" data-tab="code">Code &amp; DB</div>
     <div class="tab" data-tab="business-case">Business Case</div>
     <div class="tab" data-tab="execution">Execution</div>
@@ -23,6 +22,7 @@
     <div class="tab" data-tab="docs">Docs</div>
     <div class="tab" data-tab="readiness">Readiness</div>
     <div class="tab" data-tab="data-quality">Data Quality</div>
+    <div class="tab" data-tab="copilot">Copilot</div>
   </div>
   <div class="stats" id="stats"></div>
   <div class="row">
@@ -295,6 +295,13 @@
 
   <!-- ===================== CODE (external agent executor) ===================== -->
   <section id="tab-code" class="tabsec hidden">
+    <div class="card" style="padding:8px 14px;background:var(--card)">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <b>Executor contract guide</b>
+        <a class="sm" href="/executor" target="_blank" rel="noopener">Open the full contract ↗</a>
+        <span class="muted" style="font-size:12px">what an executor must implement: the actions, push callbacks, schemas, auth, and how to connect one or more executors. Also in <code>docs/agent-executor.md</code>.</span>
+      </div>
+    </div>
     <div class="card">
       <h2>Trigger executor <span class="muted">(scan / comb / modify an app's repo)</span> <span id="execStatus" class="muted" style="font-size:12px;float:right">checking executor…</span></h2>
       <div class="row" style="flex-wrap:wrap;gap:8px">
@@ -303,6 +310,7 @@
         <input id="exBranch" placeholder="branch (opt)" style="flex:0 1 140px;min-width:120px"/>
         <select id="exAction" onchange="toggleModifyFields()" style="flex:0 1 auto"><option value="scan">scan</option><option value="comb">comb</option><option value="modify">modify</option></select>
         <select id="exMode" style="flex:0 1 auto"><option value="plan">plan</option><option value="execute">execute</option></select>
+        <select id="exExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
         <button class="primary" onclick="doExecutorScan()">Run</button>
       </div>
       <div id="exModifyFields" class="hidden grid2col" style="margin-top:8px">
@@ -318,17 +326,21 @@
       <div class="out" id="exOut" style="margin-top:8px"><span class="muted">Requires IDC_EXECUTOR_URL. Results arrive async via callback → Rebuild to fold into waves.</span></div>
     </div>
     <div class="card">
-      <h2>Manage executor <span class="muted">(connection + enable/disable — persists across restarts)</span></h2>
-      <div id="execCfgStatus" class="muted" style="font-size:12px;margin-bottom:6px">loading…</div>
-      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
-        <input id="execUrl" placeholder="executor URL (e.g. http://127.0.0.1:8090)" style="flex:1 1 300px;min-width:200px"/>
-        <input id="execToken" type="password" placeholder="token (leave blank to keep)" style="flex:1 1 180px;min-width:140px"/>
-        <label class="muted" style="white-space:nowrap"><input type="checkbox" id="execEnabled"> enabled</label>
-        <input id="execTimeout" type="number" min="1" step="1" value="600" style="width:80px" title="timeout (seconds)"/>
-        <button class="primary" onclick="saveExecConfig()">Save &amp; test</button>
-        <button class="sm" onclick="testExecConfig()">Test connection</button>
-      </div>
-      <div class="out" id="execCfgOut" style="margin-top:8px"><span class="muted">URL / token / enabled are saved to the DB and applied immediately (no redeploy). Start the mock with <span class="kbd">idc executor-mock</span> (port 8090).</span></div>
+      <h2>Manage executors <span class="muted">(connect one or more external executors — each trigger picks one)</span></h2>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">A trigger sends its request to one executor (pick per trigger below); every executor pushes results back to this server's one public URL. The <b>default</b> executor is the single connection from <code>IDC_EXECUTOR_URL</code> / this panel; add named executors (e.g. a DB-conversion specialist) below. Push direction auth accepts any registered executor's token.</div>
+      <div id="execList"><span class="muted">loading executors…</span></div>
+      <div class="out" id="execCfgOut" style="margin-top:8px"><span class="muted">Saved to the DB and applied immediately (no redeploy). The default's <b>public URL</b> (IDC_PUBLIC_URL) is the address every executor pushes back to over the internet. Start a mock with <span class="kbd">idc executor-mock --port 8090</span>.</span></div>
+      <details style="margin-top:8px">
+        <summary class="muted">+ add a named executor</summary>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
+          <input id="newExecId" placeholder="id (e.g. db-specialist)" style="flex:0 1 160px;min-width:120px"/>
+          <input id="newExecUrl" placeholder="executor URL (https://...)" style="flex:1 1 260px;min-width:180px"/>
+          <input id="newExecToken" type="password" placeholder="token" style="flex:0 1 160px;min-width:120px"/>
+          <label class="muted" style="white-space:nowrap"><input type="checkbox" id="newExecEnabled" checked> enabled</label>
+          <input id="newExecTimeout" type="number" min="1" step="1" value="600" style="width:70px" title="timeout (s)"/>
+          <button class="sm primary" onclick="addExecutor()">Add</button>
+        </div>
+      </details>
     </div>
     <div class="card">
       <h2>7R strategy <span class="muted">(AI assigns 6R + rehost-container per app after reconsolidate)</span></h2>
@@ -354,6 +366,7 @@
         <select id="dbSrcEng" style="flex:0 1 auto" title="source engine"><option value="oracle">oracle</option><option value="sqlserver">sqlserver</option><option value="mysql">mysql</option></select>
         <span class="muted">→</span>
         <select id="dbTgtEng" style="flex:0 1 auto" title="target engine"><option value="tdsql">tdsql</option><option value="cdb_mysql">cdb_mysql</option><option value="postgresql">postgresql</option></select>
+        <select id="dbExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
         <button class="sm" onclick="doDbScan('assess')" title="grade-only (A/B/C + man-days)">Assess</button>
         <button class="sm primary" onclick="doDbScan('convert')" title="also emit converted DDL + per-object compatibility report">Convert</button>
         <span class="muted" style="font-size:12px">Assess = grade only; Convert = also pushes DDL + a per-object compatibility report (auto/manual/blocked). Rebuild folds the grade into the match + wave risk.</span>
@@ -368,6 +381,7 @@
       <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px;align-items:center">
         <select id="iacScope" style="flex:0 1 auto" title="scope"><option value="landing_zone">landing_zone</option><option value="workload">workload</option></select>
         <input id="iacScopeId" placeholder="scope_id (lz:corp | wl:&lt;server_id&gt;)" style="flex:0 1 220px;min-width:160px"/>
+        <select id="iacExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
         <button class="sm primary" onclick="doIacEmit()">Emit IaC + guardrails</button>
         <span class="muted" style="font-size:12px">executor emits Tencent HCL + runs the guardrail checks; <code>lz:&lt;arch&gt;</code> guardrails gate workload launch.</span>
       </div>
@@ -384,6 +398,7 @@
         <input id="ldOs" placeholder="os (e.g. centos 6)" style="flex:0 1 160px;min-width:120px"/>
         <input id="ldRuntime" placeholder="runtime (e.g. jdk7)" style="flex:0 1 140px;min-width:100px"/>
         <label class="muted" style="white-space:nowrap;font-size:12px"><input type="checkbox" id="ldHasRepo"> has source repo</label>
+        <select id="ldExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
         <button class="sm primary" onclick="doLegacyAnalyze()">Analyze</button>
         <span class="muted" style="font-size:12px">replaces the fixed "replatform" string on EOL hosts; next Rebuild folds the rec into the match.</span>
       </div>
@@ -400,6 +415,7 @@
         <input id="rtPort" placeholder="port (e.g. 8080)" style="flex:0 1 90px;min-width:70px"/>
         <input id="rtSoft" placeholder="software (e.g. openjdk-8)" style="flex:0 1 140px;min-width:100px"/>
         <select id="rtMode" style="flex:0 1 auto"><option value="plan">plan (dry-run)</option><option value="execute">execute (writes)</option></select>
+        <select id="rtExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
         <button class="sm" onclick="prefillRuntimeInventory()">Pre-fill from server</button>
         <button class="sm primary" onclick="doRuntimeContainerize()">Infer scaffold</button>
       </div>
@@ -545,9 +561,9 @@
 <script src="/assets/pages/dashboard.js?v=12"></script>
 <script src="/assets/pages/inventory.js?v=12"></script>
 <script src="/assets/pages/server-drawer.js?v=17"></script>
-<script src="/assets/pages/waves.js?v=13"></script>
+<script src="/assets/pages/waves.js?v=15"></script>
 <script src="/assets/pages/lz.js?v=15"></script>
-<script src="/assets/pages/plan.js?v=14"></script>
+<script src="/assets/pages/plan.js?v=16"></script>
 <script src="/assets/pages/copilot.js?v=12"></script>
 <script src="/assets/pages/code.js?v=12"></script>
 <script src="/assets/pages/testing.js?v=12"></script>

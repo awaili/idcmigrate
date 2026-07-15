@@ -13,6 +13,7 @@ import threading
 import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from queue import Empty, Queue
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -235,6 +236,25 @@ CREATE TABLE IF NOT EXISTS change_jobs (
     finished_at VARCHAR(40),
     KEY idx_cjob_app (app_id),
     KEY idx_cjob_status (status)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS executor_tasks (
+    id          VARCHAR(64) PRIMARY KEY,   -- tsk-... (the dispatch unit)
+    kind        VARCHAR(32),               -- scan|comb|modify|db-scan|...
+    payload     JSON,                      -- the full task body incl callback push targets
+    executor_id VARCHAR(64),              -- target executor, NULL = pool (any executor)
+    status      VARCHAR(16),              -- pending|claimed|running|done|error
+    claimed_by  VARCHAR(64),              -- executor id that claimed (resolved from token)
+    claimed_at  VARCHAR(40),
+    lease_until VARCHAR(40),               -- claim expires here -> requeue to pending
+    created_at  VARCHAR(40),
+    finished_at VARCHAR(40),
+    error       TEXT,
+    result_ref  VARCHAR(512),             -- patch_ref / PR url / artifact ref
+    summary     TEXT,
+    KEY idx_etask_status (status),
+    KEY idx_etask_target (executor_id),
+    KEY idx_etask_lease (lease_until)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS questions (
@@ -527,6 +547,28 @@ CREATE TABLE IF NOT EXISTS test_diffs (
     updated_at       VARCHAR(40)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 """
+
+
+# Task kinds idc-migrate enqueues for an executor to pull. Mirrors the old
+# push-trigger action names so the executor's per-kind handlers map 1:1.
+TASK_KINDS = (
+    "scan", "comb", "modify", "db-scan", "runtime-containerize",
+    "legacy-disposition", "cutover-playbook", "as-built", "iac-emit",
+    "postmig-optimize", "test-gen", "test-run", "test-compare",
+)
+
+
+def _lease_expiry(now_iso: str, lease_seconds: int) -> str:
+    """``now_iso + lease_seconds`` as an ISO-8601 UTC ``...Z`` string. ``now_iso``
+    follows the codebase convention (``datetime.utcnow().isoformat(...)+"Z"``).
+    Falls back to a plain increment when the string won't parse so a caller's
+    odd timestamp never crashes a claim."""
+    try:
+        base = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        return (base + timedelta(seconds=lease_seconds)) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return f"{now_iso}+{lease_seconds}s"
 
 
 class Store:
@@ -1891,6 +1933,148 @@ class Store:
                 (status,))]
         return [dict(r) for r in self._fetchall(
             "SELECT * FROM change_jobs ORDER BY created_at DESC LIMIT ?", (limit,))]
+
+    # -- executor tasks (pull-dispatch queue) ---------------------------------
+    # The executor exposes nothing to the network; idc-migrate cannot push
+    # triggers to it. Instead idc-migrate enqueues a task here and the executor
+    # pulls + claims it via POST /api/executor/tasks/claim, runs it, and pushes
+    # results back over the same /api/* feedback surface (unchanged). A task
+    # targets one executor (executor_id set) or the pool (executor_id NULL,
+    # claimable by any registered executor). A claim holds a lease; an expired
+    # lease returns the task to pending so a dead executor doesn't strand work.
+    _ETASK_COLS = ["id", "kind", "payload", "executor_id", "status", "claimed_by",
+                   "claimed_at", "lease_until", "created_at", "finished_at",
+                   "error", "result_ref", "summary"]
+
+    def enqueue_task(self, task_id: str, kind: str, payload: dict,
+                     executor_id: Optional[str], created_at: str) -> Dict[str, Any]:
+        """Insert a pending task. ``executor_id`` None/'' -> pool (any executor).
+        Returns the row dict (without re-reading)."""
+        eid = (executor_id or "").strip() or None
+        row = {
+            "id": task_id, "kind": kind, "payload": dumps(payload),
+            "executor_id": eid, "status": "pending", "claimed_by": None,
+            "claimed_at": None, "lease_until": None, "created_at": created_at,
+            "finished_at": None, "error": None, "result_ref": None,
+            "summary": None,
+        }
+        sql = self._upsert_sql("executor_tasks", self._ETASK_COLS, "id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                row["id"], row["kind"], row["payload"], row["executor_id"],
+                row["status"], row["claimed_by"], row["claimed_at"],
+                row["lease_until"], row["created_at"], row["finished_at"],
+                row["error"], row["result_ref"], row["summary"]))
+        row["payload"] = payload
+        return row
+
+    def _task_row(self, r) -> Optional[Dict[str, Any]]:
+        if not r:
+            return None
+        d = dict(r)
+        d["payload"] = loads(d.get("payload")) or {}
+        return d
+
+    def claim_next_task(self, executor_id: str, lease_seconds: int,
+                        now: str) -> Optional[Dict[str, Any]]:
+        """Atomically pop one eligible task for ``executor_id``: a task targeting
+        this executor, or a pool task (executor_id NULL). Requeues any task whose
+        lease expired first (so a dead executor's stranded work is reclaimable),
+        then claims the oldest pending match. Returns the claimed row or None.
+
+        Concurrency-safe via SELECT ... FOR UPDATE inside the write tx: two
+        executors polling at once each get a distinct row (the first claim flips
+        status to claimed before the second's SELECT sees it)."""
+        with self.tx() as cur:
+            # 1. requeue expired leases back to pending (same tx)
+            cur.execute(self._x(
+                "UPDATE executor_tasks SET status='pending', claimed_by=NULL, "
+                "claimed_at=NULL, lease_until=NULL "
+                "WHERE status='claimed' AND lease_until IS NOT NULL "
+                "AND lease_until < ?"), (now,))
+            # 2. pick the oldest pending task this executor may take
+            cur.execute(self._x(
+                "SELECT * FROM executor_tasks "
+                "WHERE status='pending' "
+                "AND (executor_id IS NULL OR executor_id=?) "
+                "ORDER BY created_at ASC LIMIT 1 FOR UPDATE"), (executor_id,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            d = dict(r)
+            import datetime as _dt  # noqa: only used to build lease_until string
+            # lease_until = now + lease_seconds (ISO-ish); caller passes `now`,
+            # compute the expiry from the lease window.
+            lease_until = _lease_expiry(now, lease_seconds)
+            cur.execute(self._x(
+                "UPDATE executor_tasks SET status='claimed', claimed_by=?, "
+                "claimed_at=?, lease_until=? WHERE id=?"),
+                (executor_id, now, lease_until, d["id"]))
+            d["status"] = "claimed"
+            d["claimed_by"] = executor_id
+            d["claimed_at"] = now
+            d["lease_until"] = lease_until
+            d["payload"] = loads(d.get("payload")) or {}
+            return d
+
+    def renew_lease(self, task_id: str, executor_id: str, lease_seconds: int,
+                    now: str) -> bool:
+        """Extend a claim's lease (heartbeat). Only the owning executor may renew;
+        a task that's already terminal or requeued (claimed_by != executor_id)
+        is left untouched. Returns True if renewed.
+
+        Ownership is verified by SELECT, not by UPDATE rowcount: pymysql's
+        default counts *changed* rows, so a renewal that lands in the same
+        second (lease string unchanged) would report 0 and look like a stale
+        claim even though the owner is valid."""
+        lease_until = _lease_expiry(now, lease_seconds)
+        with self.tx() as cur:
+            cur.execute(self._x(
+                "SELECT id FROM executor_tasks "
+                "WHERE id=? AND claimed_by=? AND status='claimed' FOR UPDATE"),
+                (task_id, executor_id))
+            if not cur.fetchone():
+                return False
+            cur.execute(self._x(
+                "UPDATE executor_tasks SET lease_until=? WHERE id=?"),
+                (lease_until, task_id))
+            return True
+
+    def complete_task(self, task_id: str, executor_id: str, status: str,
+                       now: str, error: Optional[str] = None,
+                       result_ref: Optional[str] = None,
+                       summary: Optional[str] = None) -> bool:
+        """Mark a claimed task terminal (done/error). Only the owning executor
+        may complete it. Returns True on success, False if the task isn't owned
+        by ``executor_id`` (already requeued/expired) — caller treats that as
+        a no-op (the work was reclaimed)."""
+        if status not in ("done", "error"):
+            raise ValueError("status must be done or error")
+        with self.tx() as cur:
+            cur.execute(self._x(
+                "UPDATE executor_tasks SET status=?, finished_at=?, error=?, "
+                "result_ref=?, summary=? WHERE id=? AND claimed_by=?"),
+                (status, now, error, result_ref, summary, task_id, executor_id))
+            return cur.rowcount > 0
+
+    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return self._task_row(self._fetchone(
+            "SELECT * FROM executor_tasks WHERE id=?", (task_id,)))
+
+    def list_tasks(self, limit: int = 200, status: Optional[str] = None,
+                   executor_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Tasks newest-first (optionally filtered by status / target executor)."""
+        sql = "SELECT * FROM executor_tasks"
+        clauses, args = [], []
+        if status:
+            clauses.append("status=?"); args.append(status)
+        if executor_id:
+            clauses.append("executor_id=?"); args.append(executor_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(limit)
+        return [self._task_row(r) for r in self._fetchall(self._x(sql), tuple(args))]
 
     # -- questions (executor ↔ operator) -------------------------------------
     _Q_COLS = ["id", "app_id", "job_id", "kind", "prompt", "options", "context",

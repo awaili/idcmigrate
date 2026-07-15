@@ -144,43 +144,37 @@ def test_runtime_inventory_unknown_server_404():
 
 def test_containerize_auto_gathers_when_inventory_empty(monkeypatch):
     """POST /api/runtime-containerize with an empty inventory should auto-gather
-    (match port + role software) and pass a populated inventory to the executor."""
+    (match port + role software) and bake the populated inventory into the
+    enqueued task's payload (pull mode — the executor pulls it)."""
     sid, host = _seed()
-    captured = {}
-
-    from idc.agent.executor_client import ExecutorClient
-    def fake_rc(self, app_id, server_id, inventory=None, mode="plan", callback=""):
-        captured["inventory"] = inventory
-        captured["mode"] = mode
-        return {"job_id": "cjob-rt", "status": "pending"}
-    monkeypatch.setattr(ExecutorClient, "runtime_containerize", fake_rc)
-    # configure executor so the trigger passes the configured-check
     m.settings.executor_enabled = True
     m.settings.executor_url = "http://mock-executor"
+    tid = None
     try:
         r = client.post("/api/runtime-containerize", json={
             "app_id": "app-rt", "server_id": sid, "inventory": {}, "mode": "plan"})
         assert r.status_code == 200, r.text
-        # the auto-gathered inventory reached the executor
-        assert 1521 in captured["inventory"]["ports"]
-        assert "oracle" in captured["inventory"]["software"]
+        tid = r.json()["task_id"]
+        inv = m.STORE.get_task(tid)["payload"]["inventory"]
+        # the auto-gathered inventory is baked into the task
+        assert 1521 in inv["ports"]
+        assert "oracle" in inv["software"]
     finally:
+        if tid:
+            with m.STORE.tx() as cur:
+                cur.execute(m.STORE._x("DELETE FROM executor_tasks WHERE id=?"), (tid,))
         m.settings.executor_enabled = False
         m.settings.executor_url = ""
         _cleanup(sid)
 
 
 def test_containerize_operator_inventory_wins(monkeypatch):
-    """Operator-provided inventory fields override the auto-gathered ones."""
+    """Operator-provided inventory fields override the auto-gathered ones and
+    land in the enqueued task's payload."""
     sid, host = _seed()
-    captured = {}
-    from idc.agent.executor_client import ExecutorClient
-    def fake_rc(self, app_id, server_id, inventory=None, mode="plan", callback=""):
-        captured["inventory"] = inventory
-        return {"job_id": "cjob-rt", "status": "pending"}
-    monkeypatch.setattr(ExecutorClient, "runtime_containerize", fake_rc)
     m.settings.executor_enabled = True
     m.settings.executor_url = "http://mock-executor"
+    tid = None
     try:
         r = client.post("/api/runtime-containerize", json={
             "app_id": "app-rt", "server_id": sid,
@@ -188,11 +182,16 @@ def test_containerize_operator_inventory_wins(monkeypatch):
                           "software": "oracle,custom"},
             "mode": "plan"})
         assert r.status_code == 200, r.text
+        tid = r.json()["task_id"]
+        inv = m.STORE.get_task(tid)["payload"]["inventory"]
         # operator's software string -> list, wins over gathered
-        assert captured["inventory"]["process"] == "oracle_lsnr"
-        assert captured["inventory"]["software"] == ["oracle", "custom"]
-        assert captured["inventory"]["ports"] == [1521]
+        assert inv["process"] == "oracle_lsnr"
+        assert inv["software"] == ["oracle", "custom"]
+        assert inv["ports"] == [1521]
     finally:
+        if tid:
+            with m.STORE.tx() as cur:
+                cur.execute(m.STORE._x("DELETE FROM executor_tasks WHERE id=?"), (tid,))
         m.settings.executor_enabled = False
         m.settings.executor_url = ""
         _cleanup(sid)

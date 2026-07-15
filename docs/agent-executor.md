@@ -230,52 +230,62 @@ The executor generates test cases from the app's `CodeProfile`, runs them agains
 
 ## 2. Interface spec
 
-Two directions:
+**The executor exposes nothing to the network.** idc-migrate cannot reach it,
+so it cannot push triggers to it (the old `POST {IDC_EXECUTOR_URL}/v1/scan`
+request direction is gone, and idc-migrate no longer probes `/health`).
+Everything flows one way — **executor → idc-migrate** — over two channels:
 
-- **Push (executor → idc-migrate)**: the executor pushes CodeProfile / ChangeJob in. idc-migrate is the server.
-- **Request (idc-migrate → executor)**: idc-migrate asks the executor to run scan/comb/modify. The executor is the server.
+- **Pull (executor → idc-migrate)**: the executor asks idc-migrate for work via
+  `POST /api/executor/tasks/claim`, gets a task (with the full work payload +
+  the feedback `callback` baked in), and reports completion via
+  `POST /api/executor/tasks/{id}/complete` (+ `/lease` heartbeats).
+- **Push feedback (executor → idc-migrate)**: while/after working, the executor
+  pushes results back over the `/api/*` feedback surface
+  (`PUT /api/code-profiles/{app_id}`, `POST /api/change-jobs`, …) — unchanged.
 
-Both use **`Authorization: Bearer <token>`** shared-secret auth. idc-migrate's secret = `IDC_EXECUTOR_TOKEN` (validates push); the executor's secret is configured by its deployer (idc-migrate sends the same `IDC_EXECUTOR_TOKEN` with its requests).
+idc-migrate is the server for both channels. Auth is **`Authorization: Bearer
+<token>`** on every call; the token is the shared secret `IDC_EXECUTOR_TOKEN`
+(configured per executor in the registry). The token also **identifies** the
+executor: idc-migrate resolves it to an executor id, which gates routing (a
+task may target one executor or the pool) and records `claimed_by`.
 
 Content type `application/json; charset=utf-8`. Timestamps are ISO-8601 UTC (`...Z`).
 
-### 2.0 Executor operational requirements (/health + repo access + callback base)
+### 2.0 Executor operational requirements (repo access + callback base)
 
-Before implementing any business endpoint, the executor must meet three operational prerequisites — they aren't in the §1 action contract, but idc-migrate and the executor **interworking at all** depends on them:
+Before implementing any business logic, the executor must meet two operational prerequisites — they aren't in the §1 action contract, but idc-migrate and the executor **interworking at all** depends on them:
 
-**① `GET /health` (must be exposed, no auth)**
+**① Liveness (no `/health` probe — pull mode)**
 
-idc-migrate's `doctor` / web status indicator probes `GET {IDC_EXECUTOR_URL}/health` (see `idc/agent/executor_client.py::executor_status`, 5s timeout). The executor must implement this endpoint and return **200**:
-
-```json
-{"ok": true, "service": "idc-executor/<name>", "version": "0.3.0",
- "callback": "<callback base>", "token_configured": true}
-```
-
-- Non-200 or connection failure → idc-migrate marks the executor unreachable, `/api/executor/status` reports `reachable=false`, and triggers are refused.
-- No bearer — the health probe happens **before** auth. All `/v1/*` endpoints other than `/health` require bearer.
+idc-migrate **cannot reach the executor** (it exposes nothing), so there is no
+`GET /health` probe and no `IDC_EXECUTOR_URL` round-trip. `executor_status`
+reports pull mode (`reachable=null`); real liveness is "an executor is claiming
+tasks", which idc-migrate infers from claim/heartbeat activity on the queue
+(reported by `/api/executor/status`), not from a network probe. The executor
+proves it is alive simply by polling `/api/executor/tasks/claim`. (An executor
+may still implement `/health` for its own operator use; idc-migrate ignores it.)
 
 **② Repo-access contract (prerequisite for scan/comb/modify)**
 
-The `repo_url` in `POST /v1/scan|comb|modify` is **fetched and cloned by the executor itself** — idc-migrate does not clone on its behalf, does not pass repo credentials, and does not pass SSH private keys. So the executor's deployer must guarantee access to the target repo:
+The `repo_url` in a scan/comb/modify task payload is **fetched and cloned by the executor itself** — idc-migrate does not clone on its behalf, does not pass repo credentials, and does not pass SSH private keys. So the executor's deployer must guarantee access to the target repo:
 
 - Supported protocols: `git@host:org/repo.git` (SSH) and `https://host/org/repo.git` (HTTPS).
 - SSH repos: the deployer provisions git + an SSH key in the executor's runtime environment (added to the repo's deploy keys / the user's authorized_keys), and the key must reach **every repo that could be scanned**. idc-migrate never ships private keys.
 - HTTPS repos: the executor brings its own git credentials (credential helper / `~/.git-credentials` / env vars), provisioned by the deployer.
-- Network reachability: the repo host (Gitlab/Gitee/GitHub) must be reachable from the executor's network (same VPC / VPN / public internet). An unreachable repo is the executor's error — return `ChangeJob.status=error` + an `error` message, **do not swallow it silently**; idc-migrate's `IDC_EXECUTOR_TIMEOUT` only bounds the HTTP connection, not the clone.
+- Network reachability: the repo host (Gitlab/Gitee/GitHub) must be reachable from the executor's network (same VPC / VPN / public internet). An unreachable repo is the executor's error — mark the task `error` (via `/complete`) + push `ChangeJob.status=error` + an `error` message, **do not swallow it silently**.
 - `branch` empty → the executor checks out the default branch.
-- `modify` `mode=execute`: the executor edits on the **cloned working copy**, commits to a **new branch**, and pushes back (or opens a PR); `patch_ref` = branch name / commit sha / PR URL (executor-defined, but must be unique and traceable). Do not push directly to the `branch` given in the trigger.
+- `modify` `mode=execute`: the executor edits on the **cloned working copy**, commits to a **new branch**, and pushes back (or opens a PR); `patch_ref` = branch name / commit sha / PR URL (executor-defined, but must be unique and traceable). Do not push directly to the `branch` given in the payload.
 
 **③ Callback base (the target of executor → idc-migrate push)**
 
-The executor pushes `CodeProfile`/`ChangeJob`/`DBConversionProfile`/`Question`/... back to idc-migrate and needs an **idc-migrate public base URL**. Two sources, **per-request `callback` takes precedence**:
+The executor pushes `CodeProfile`/`ChangeJob`/`DBConversionProfile`/`Question`/... back to idc-migrate over the public internet and needs an **idc-migrate public base URL**. Two sources, **the per-task `callback` takes precedence**:
 
-1. **per-request `callback`**: idc-migrate includes a `callback` in each `POST /v1/*` body (e.g. `https://mig.example.com/api/code-profiles/{app_id}`). This is **authoritative** — on completion the executor pushes to **this** URL (note: `callback` already includes the full path, so PUT/POST to it directly; do not re-build base + path yourself).
-2. **Fallback base** when `callback` is empty: an executor-side env var (the mock uses `IDC_MOCK_CALLBACK`; a **production executor should use the same name or `IDC_CALLBACK_BASE`**), set to idc-migrate's HTTPS public domain (e.g. `https://mig.example.com`). In this case the executor builds `PUT {base}/api/code-profiles/{app_id}` itself.
+1. **per-task `callback`**: idc-migrate bakes a `callback` into each task's payload (e.g. `https://mig.example.com/api/code-profiles/{app_id}`). This is **authoritative** — on completion the executor pushes to **this** URL (note: `callback` already includes the full path, so PUT/POST to it directly; do not re-build base + path yourself). idc-migrate builds it from `IDC_PUBLIC_URL` (see §2.6); when `IDC_PUBLIC_URL` is unset the field is empty and the executor falls back to (2).
+2. **Fallback base** when `callback` is empty: an executor-side env var (the mock uses `IDC_MOCK_CALLBACK`; a **production executor should use the same name or `IDC_CALLBACK_BASE`**), set to idc-migrate's HTTPS public domain (e.g. `https://mig.example.com`). In this case the executor builds `PUT {base}/api/code-profiles/{app_id}` itself. **This is always required for the `change-jobs` heartbeat** (the heartbeat has no per-task callback, since it isn't a profile push) and for the multi-push / unknown-id actions (`postmig-optimize` pushes one rec per `{kind}`; `test-run` pushes to a `run_id` minted by idc-migrate) — both of which carry an empty `callback`.
 
-Push requests always carry `Authorization: Bearer <IDC_EXECUTOR_TOKEN>` (the same secret as idc-migrate's side). The live idc-migrate has the web login gate on, so all `/api/*` require auth — bearer is the only option the executor can use (it has no browser session).
+Push requests always carry `Authorization: Bearer <IDC_EXECUTOR_TOKEN>` (the same secret as idc-migrate's side). The live idc-migrate has the web login gate on, so all `/api/*` require auth — bearer is the only option the executor can use (it has no browser session). The push endpoints sit behind idc-migrate's public nginx HTTPS ingress and accept the bearer before the login gate — **no extra port or certificate needed**.
 
-> idc-migrate's `IDC_EXECUTOR_URL` points at the executor (request direction); the executor's `IDC_MOCK_CALLBACK` / `IDC_CALLBACK_BASE` points at idc-migrate (push direction). They point in opposite directions — don't confuse them.
+> idc-migrate's `IDC_EXECUTOR_URL` points at the executor (request direction); idc-migrate's `IDC_PUBLIC_URL` and the executor's `IDC_MOCK_CALLBACK` / `IDC_CALLBACK_BASE` point at idc-migrate (push direction). `IDC_EXECUTOR_URL` points one way, the other three point the other way — don't confuse them.
 
 ### 2.1 Push: executor → idc-migrate
 
@@ -370,103 +380,108 @@ Response: `200 {"id": "...", "status": "..."}`.
 - `GET /api/change-jobs` — recent jobs
 - `GET /api/db-profiles` / `GET /api/db-profiles/{db_server_id}` — DB conversion assessments (F5)
 
-### 2.2 Request: idc-migrate → executor
+### 2.2 Pull: executor → idc-migrate (the executor asks for work)
 
-Base = `IDC_EXECUTOR_URL`. All requests carry `Authorization: Bearer <IDC_EXECUTOR_TOKEN>`.
+The executor exposes nothing, so it **pulls** work from idc-migrate. All calls
+carry `Authorization: Bearer <IDC_EXECUTOR_TOKEN>`; the token identifies the
+executor (resolved to an executor id) and gates routing.
 
-#### `POST /v1/scan` — trigger a scan
-
-```json
-{"app_id": "orders-svc", "repo_url": "git@gitlab:trade/orders-svc.git",
- "branch": "master", "callback": "https://idc.example.com/api/code-profiles/orders-svc"}
-```
-
-Response `202`: `{"job_id": "cjob-...", "status": "pending"}`. On completion the executor **calls back** the push endpoints (first `POST /api/change-jobs` to mark done, then `PUT /api/code-profiles/{app_id}`).
-
-#### `POST /v1/comb` — trigger a comb (produces a CodeProfile)
-
-Same schema as above; `kind=comb`.
-
-#### `POST /v1/db-scan` — trigger a heterogeneous-DB conversion assessment (F5/F6)
+#### `POST /api/executor/tasks/claim` — pull one task
 
 ```json
-{"db_server_id": "db-oracle-01", "source_engine": "oracle",
- "target_engine": "tdsql", "mode": "assess",
- "callback": "https://idc.example.com/api/db-profiles/db-oracle-01"}
+{}        // optional: {"lease_seconds": 600}
 ```
 
-`db_server_id` is the DB host's **stable identity** (hostname); the executor gets it from the estate context (idc-migrate provides it at trigger time). `mode`:
-- `assess` (default) — produces only the difficulty grade (A/B/C) + person-days + blockers (backwards-compatible; an old executor that omits `mode` gets this).
-- `convert` — additionally pushes the **converted DDL + a per-object compatibility report** inside `DBConversionProfile.conversion` (F6):
+Response `200`:
 
 ```json
-"conversion": {
-  "target_engine": "postgresql",
-  "ddl": ["CREATE TABLE orders (...);"],
-  "objects": [
-    {"name": "ORDERS", "kind": "table", "status": "auto_converted",
-     "converted": "CREATE TABLE orders (...);", "issue": "", "effort_days": 0.0},
-    {"name": "PKG_BILLING", "kind": "package", "status": "blocked",
-     "converted": "", "issue": "UTL_FILE -> sidecar service", "effort_days": 8.0}
-  ],
-  "auto_convert_pct": 0.62,
-  "report_md": "# DB conversion compatibility report ..."
-}
+{"task_id": "tsk-...", "kind": "scan", "status": "claimed",
+ "payload": { /* the full work body — see "task payloads" below, incl `callback` */ },
+ "executor_id": null, "claimed_at": "...Z", "lease_until": "...Z"}
 ```
 
-`status ∈ {auto_converted, manual_review, blocked}`; the count of `blocked` objects drives the cutover gate (a db-kind wave can't reach `finalized` until blocked objects are cleared or the operator acks). `assess` mode omits the `conversion` key; old clients keep working.
+Or `{"task_id": null, "status": "idle"}` when nothing is pending. The claim is
+**atomic** and holds a **lease** (default 15 min): idc-migrate requeues any task
+whose lease expired *before* this claim, then hands the oldest pending task the
+caller is eligible for. Eligibility:
 
-Response `202`: `{"job_id": "...", "status": "pending"}`. On completion the executor **calls back**: first `POST /api/change-jobs` to mark done (`kind=db-scan`), then `PUT /api/db-profiles/{db_server_id}` to push the `DBConversionProfile`.
+- a task with `executor_id == null` (**pool**) is claimable by **any** registered executor;
+- a task with `executor_id == "db-spec"` is claimable **only** by the executor whose token resolves to `db-spec`.
 
-#### `POST /v1/runtime-containerize` — trigger no-source containerization (F9)
+So an executor polling with its token only ever receives tasks it may work on.
+One task per call — loop with a short sleep when idle (the mock polls every
+`IDC_MOCK_POLL_INTERVAL` s).
+
+#### `POST /api/executor/tasks/{task_id}/complete` — report terminal state
 
 ```json
-{"app_id": "legacy-billing", "server_id": "srv-123",
- "inventory": {"process": "java -jar billing.jar", "port": 8080,
-               "unit": "billing.service", "software": ["openjdk-8"]},
- "mode": "plan", "callback": "https://idc.example.com/api/code-profiles/legacy-billing"}
+{"status": "done", "summary": "scanned 1248 files, 12 findings",
+ "result_ref": "mock-patch-...", "error": ""}
 ```
 
-No `repo_url` — the executor infers a Dockerfile scaffold from `inventory` (the Zabbix/Prometheus-discovered process + port + software list). Response `202`: `{"job_id": "...", "status": "pending"}`. On completion the executor **calls back**: first `POST /api/change-jobs` to mark done (`kind=runtime-containerize`, `patch_ref` points at the inferred Dockerfile scaffold), then `PUT /api/code-profiles/{app_id}` to push a `source=runtime-derived` `CodeProfile`. `mode=plan` only previews the scaffold; `mode=execute` writes it (but idc-migrate raises a confirm `Question` before writing, see §1.8).
+`status ∈ {done, error}`. Only the **owning** executor (the one that claimed
+it) may complete a task; a task whose lease already expired and was reclaimed
+returns `409` (the work was taken over — treat as a no-op). On `done`/`error`
+idc-migrate also mirrors the state into the `change-jobs` audit trail, so
+existing ChangeJob consumers keep working.
 
-#### `POST /v1/modify` — trigger a modification
+#### `POST /api/executor/tasks/{task_id}/lease` — heartbeat
 
 ```json
-{"app_id": "orders-svc", "repo_url": "git@gitlab:trade/orders-svc.git",
- "branch": "cloud-ready", "mode": "plan", "scope": ["db_connection", "service_discovery"],
- "changes": [
-   {"category": "db_connection", "kind": "endpoint",
-    "file": "src/main/resources/application.yml", "line": 12,
-    "title": "Parameterize DB host",
-    "evidence": "url: jdbc:mysql://10.0.4.20:3306/orders",
-    "old": "10.0.4.20:3306", "new": "${ORDERS_DB_HOST}:3306",
-    "effort": "low", "description": "Replace hardcoded 10.0.4.20 with ${DB_HOST}",
-    "note": "new value from operator override"},
-   {"category": "secrets_in_repo", "kind": "secret",
-    "file": "src/main/resources/application.yml", "line": 13,
-    "title": "Move DB password to secret ref",
-    "evidence": "password: hunter2",
-    "old": "hunter2", "new": "${ORDERS_DB_PASSWORD}",
-    "effort": "low", "description": "Inline password → secret ref",
-    "note": "new value from operator override"}
- ],
- "notes": []}
+{}        // optional: {"lease_seconds": 600}
 ```
 
-`mode=plan` (default) = dry-run, produces only a `patch_ref` and writes nothing to the repo; `mode=execute` = really changes and pushes a branch/PR.
+Extends the claim's lease while still working (long jobs must renew before the
+lease expires, or the task is requeued and another executor may reclaim it).
+Only the owner may renew; a stale claim returns `409`.
 
-- **`changes` (core, generated by idc-migrate)**: the concrete change list — one item per change, telling the executor **which file and line to change, and which literal (`old`) to replace with what (`new`)**. idc-migrate assembles it from the app's `CodeProfile` (joining `required_changes` + `findings` by file+line) and then folds in operator `overrides`. The executor locates-and-replaces directly from this — **no re-scan, no guessing what to change**. `scope` is kept as a category filter for back-compat, but `changes` is already scope-filtered and is the authoritative instruction.
-- **When `changes[].old` / `new` are empty**: idc-migrate couldn't extract the literal from the evidence (or the secret was redacted); `note` explains why. The executor must locate it itself by `file`+`line`, or skip that item and report via `ChangeJob.status=error`. **It must never guess a value to substitute.**
-- **`notes`**: hints from idc-migrate to the executor/operator, e.g. "this app has no CodeProfile, scan first", "N overrides matched no finding and were ignored", "the profile has no in-scope required_changes".
+#### `GET /api/executor/tasks/{task_id}` / `GET /api/executor/tasks` — status
 
-Operator `overrides` (passed in the `POST /api/executor/trigger` body; idc-migrate folds them into `changes`): an `old → new` map, e.g.
-`{"10.0.4.20": "${ORDERS_DB_HOST}", "hunter2": "${ORDERS_DB_PASSWORD}"}`. Matching a `changes` item's `old` overrides its `new`; unmatched ones are reported in `notes`. This lets the operator feed the executor the "post-migration new value", so idc-migrate doesn't have to guess a new CDB hostname — a human value that only exists at cutover time.
+The task row is the authoritative status (`pending|claimed|running|done|error`).
+`GET /api/executor/tasks` lists the queue (newest-first; optional `status` /
+`executor_id` filters) — operator/UI view.
 
-Response `202`: `{"job_id": "cjob-...", "status": "pending"}`.
+#### Task payloads (the `payload` field the executor pulls)
 
-#### `GET /v1/jobs/{job_id}` — query job status
+The payload is exactly the body the old push-trigger used to send, now baked
+into the task. Each kind carries its inputs + the feedback `callback`:
 
-Response `200`: a `ChangeJob`.
+| kind | payload | feedback push |
+|---|---|---|
+| `scan` / `comb` | `{app_id, repo_url, branch, callback}` | `POST /api/change-jobs` then `PUT /api/code-profiles/{app_id}` |
+| `modify` | `{app_id, repo_url, branch, mode, scope, changes[], notes[], callback:""}` | `POST /api/change-jobs` (heartbeat; uses IDC_CALLBACK_BASE) |
+| `db-scan` | `{db_server_id, source_engine, target_engine, mode, callback}` | `POST /api/change-jobs` then `PUT /api/db-profiles/{db_server_id}` |
+| `runtime-containerize` | `{app_id, server_id, inventory, mode, callback}` | `POST /api/change-jobs` then `PUT /api/code-profiles/{app_id}` (`source=runtime-derived`) |
+| `legacy-disposition` | `{server_id, context, callback}` | `POST /api/change-jobs` then `PUT /api/legacy-dispositions/{server_id}` |
+| `cutover-playbook` / `as-built` | `{wave_id, context, callback}` | `POST /api/change-jobs` then `PUT /api/docs/{slug}/{wave_id}` |
+| `iac-emit` | `{scope, scope_id, context, callback}` | `POST /api/change-jobs` then `PUT /api/iac-artifacts/{scope_id}` |
+| `postmig-optimize` | `{server_id, context, callback:""}` | `POST /api/change-jobs` then `PUT /api/postmig-recs/{server_id}/{kind}` ×N (uses IDC_CALLBACK_BASE) |
+| `test-gen` | `{app_id, context, callback}` | `POST /api/change-jobs` then `PUT /api/test-cases/{app_id}` |
+| `test-run` | `{app_id, phase, target, context, run_id, callback:""}` | `POST /api/change-jobs` then `PUT /api/test-runs/{run_id}` (uses IDC_CALLBACK_BASE) |
+| `test-compare` | `{app_id, pre_run_id, post_run_id, callback}` | `POST /api/change-jobs` then `PUT /api/test-diffs/{app_id}` |
+
+`db-scan` `mode`: `assess` (grade-only) | `convert` (also emit converted DDL +
+per-object compatibility report in `DBConversionProfile.conversion`, F6). The
+count of `blocked` objects drives the cutover gate. `modify` `mode`: `plan`
+(dry-run, `patch_ref` only) | `execute` (writes + pushes a branch/PR); a
+`runtime-derived` profile in `execute` is gated by an operator confirm
+`Question` raised at enqueue time (see §1.8). `test-run` `run_id` is
+**pre-minted by idc-migrate** and baked into the payload (the executor pushes
+back under it; if empty the executor mints its own).
+
+`modify` `changes[]` (core, built by idc-migrate): one item per change telling
+the executor **which file/line, which literal (`old`) → which value (`new`)** —
+assembled from the app's `CodeProfile` + operator `overrides`. The executor
+locates-and-replaces directly; **no re-scan, no guessing**. When a `changes[]`
+`old`/`new` is empty, idc-migrate couldn't extract the literal; the executor
+must locate it by `file`+`line` or skip + mark the task `error` — **it must
+never guess a value** (raise a Question instead, §2.3④).
+
+Operator `overrides` (passed in the `POST /api/executor/trigger` body;
+idc-migrate folds them into `changes`): an `old → new` map, e.g.
+`{"10.0.4.20": "${ORDERS_DB_HOST}", "hunter2": "${ORDERS_DB_PASSWORD}"}`.
+Matching a `changes` item's `old` overrides its `new`; unmatched ones are
+reported in `notes`.
 
 ### 2.3 Executor ↔ idc-migrate continuous interaction
 
@@ -538,11 +553,11 @@ scan/comb → CodeProfile → build_change_spec → changes[]
 
 ### 2.4 Lifecycle and concurrency
 
-- Jobs are async: a request immediately returns `202 + job_id`; results come via webhook callback or polling `GET /v1/jobs/{id}`.
-- Callback order: first `change-jobs` (status=running/done), then `code-profiles` (only when comb/scan produces a profile). When idc-migrate receives a profile it sets the "rebuild-available" flag.
-- Timeouts: idc-migrate's `IDC_EXECUTOR_TIMEOUT` (default 600s) only bounds the request's HTTP connection, not the job itself; long jobs are expressed via `ChangeJob.status`.
-- Concurrency: a new scan for the same `app_id` overwrites the old profile; re-sending the same `job_id` is an upsert.
-- Error codes: `400` schema, `401` auth, `404` app unknown, `409` a job already in progress (optional), `422` repo unreachable, `5xx` executor internal error.
+- Triggers are async: a trigger immediately returns `200 + {task_id, status:"pending"}` (`job_id` is an alias for `task_id`). The task sits in the queue until an executor claims it.
+- Lifecycle: `pending → claimed → (running, via heartbeat) → done|error`. An executor claims via `POST /api/executor/tasks/claim`, heartbeats via `/lease` while working, and marks terminal via `/complete`. A task whose lease expires is **requeued** to `pending` (a dead executor's work is reclaimable by another).
+- Feedback order on completion: first `POST /api/change-jobs` (status=done), then the profile/artifact PUT (only for kinds that produce one). When idc-migrate receives a profile it sets the "rebuild-available" flag. idc-migrate also mirrors the terminal task state into `change-jobs` on `/complete`.
+- Concurrency: a new scan for the same `app_id` overwrites the old profile; multiple executors may poll the same queue — the atomic claim guarantees each task is handed to exactly one.
+- Error codes: `400` schema, `401` auth/unknown token, `404` unknown task/executor, `409` not-owned (complete/lease on a task the caller doesn't own — expired/requeued), `422` repo unreachable (reported via task `error`).
 
 ### 2.5 How idc-migrate uses this data ("extra reference signal")
 
@@ -565,24 +580,36 @@ Each side configures itself; the only shared value is `IDC_EXECUTOR_TOKEN` (the 
 
 | Var | Meaning |
 |---|---|
-| `IDC_EXECUTOR_URL` | The executor's public address; idc-migrate sends `POST /v1/scan\|comb\|modify\|...` to it. Empty → feature off. |
-| `IDC_EXECUTOR_TOKEN` | Shared bearer secret; also validates the executor→idc push callbacks. |
-| `IDC_EXECUTOR_ENABLED` | `false` rejects all trigger requests (default `true`). |
-| `IDC_EXECUTOR_TIMEOUT` | idc→executor HTTP connect timeout (default 600s); does not bound the job itself. |
+| `IDC_EXECUTOR_TOKEN` | Shared bearer secret; validates the executor's pull + push calls, and **identifies** the executor (resolved to an executor id for routing). |
+| `IDC_EXECUTOR_ENABLED` | `false` rejects trigger/enqueue requests (default `true`). |
+| `IDC_PUBLIC_URL` | **This server's own public HTTPS base** (e.g. `https://mig.zaymuc.com`). Baked as the per-task `callback` so the executor can push results back here (see §2.0③). Empty (default) → `callback` is empty and the executor must fall back to its own `IDC_CALLBACK_BASE`; set this so the round-trip is self-contained from the task. |
+| `IDC_EXECUTOR_URL` / `IDC_EXECUTOR_TIMEOUT` | **Unused for triggering in pull mode** (idc-migrate no longer reaches out). Kept in the config shape + Manage-executor panel for back-compat display only. |
 
-The executor's URL/TOKEN can also be written to the DB `system_config` at runtime via the `/executor` web panel (overrides env, no restart).
+The executor's TOKEN/`IDC_PUBLIC_URL` can also be written to the DB `system_config` at runtime via the `/executor` web panel (overrides env, no restart).
 
 **executor side**:
 
 | Var | Meaning |
 |---|---|
-| `IDC_EXECUTOR_TOKEN` | Same as above; must match the idc-migrate side. |
-| Callback base (`IDC_MOCK_CALLBACK` / production `IDC_CALLBACK_BASE`) | idc-migrate's public web address; the executor pushes `CodeProfile`/`ChangeJob` back here (the fallback when per-request `callback` is empty, see §2.0③). In production this is its HTTPS public domain (e.g. `https://mig.example.com`). |
+| `IDC_EXECUTOR_TOKEN` | Same as above; must match the idc-migrate side. Identifies the executor on claim. |
+| Callback base (`IDC_MOCK_CALLBACK` / production `IDC_CALLBACK_BASE`) | idc-migrate's public web address; the executor pulls `/api/executor/tasks/claim` from it and pushes `CodeProfile`/`ChangeJob` back here (the fallback when the per-task `callback` is empty, see §2.0③). **Always required** for the `change-jobs` heartbeat and the multi-push / unknown-id actions (`postmig-optimize`, `test-run`). In production this is idc-migrate's HTTPS public domain (e.g. `https://mig.example.com`). |
 | Repo-access credentials (SSH key / git credentials) | Provisioned by the executor itself, ensuring it can clone/push `repo_url`. idc-migrate never ships them (see §2.0②). |
-| `GET /health` | **Must be exposed**, no auth, returns 200 `{service, version, ...}` (see §2.0①). idc-migrate's liveness probe depends on it. |
 | Executor's own LLM | The executor **brings its own** LLM for semantic judgment (MigraQ). See §2.7. |
 
-The push endpoints (`/api/code-profiles`, `/api/change-jobs`, `/api/db-profiles`, `/api/apps/{app_id}/questions`) sit behind idc-migrate's public HTTPS ingress, before bearer auth — **no extra port or certificate needed**.
+The pull + push endpoints (`/api/executor/tasks/*`, `/api/code-profiles`, `/api/change-jobs`, `/api/db-profiles`, `/api/legacy-dispositions`, `/api/iac-artifacts`, `/api/postmig-recs`, `/api/test-cases`, `/api/test-runs`, `/api/test-diffs`, `/api/docs`, `/api/apps/{app_id}/questions`) sit behind idc-migrate's public HTTPS ingress, before bearer auth — **no extra port or certificate needed**, all reachable from the internet over HTTPS with the bearer token.
+
+### 2.6.1 Multiple executors
+
+idc-migrate can drive **more than one executor**. The `default` executor is the one configured above (env `IDC_EXECUTOR_TOKEN` / the Manage-executor panel). Additional **named** executors are registered via the registry API:
+
+- `GET /api/executors` — list all (default first; token never returned, only `token_set`).
+- `PUT /api/executors/{id}` — upsert a named executor `{url?, token?, enabled, timeout}` (id != `default`; the default is managed via `/api/executor/config`). `url` is unused in pull mode but kept for back-compat.
+- `DELETE /api/executors/{id}` — remove a named executor (the default can't be deleted).
+- `POST /api/executors/{id}/test` — report pull-mode status for a candidate config without persisting.
+
+Every trigger request body takes an optional **`executor_id`**: empty/`""` → the **pool** (any registered executor may claim it); `"default"` or a named id → **target** that executor specifically (`404` if the named id isn't registered). The web Trigger cards expose a per-card executor picker; the CLI exposes `--executor`; the bare API takes `executor_id` in the JSON body.
+
+Pull routing is by token: an executor's `/api/executor/tasks/claim` is resolved to its executor id, and it only receives tasks where `executor_id IS NULL` (pool) or `executor_id == <its id>`. Every executor pushes feedback to the **same** idc-migrate public URL (`IDC_PUBLIC_URL`, global) and authenticates with **its own** token; idc-migrate accepts a bearer that matches **any** registered executor's token (the default's included), so pushes from any configured executor validate.
 
 ### 2.7 LLM boundary (executor brings its own; idc-migrate does not share)
 

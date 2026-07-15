@@ -2,13 +2,18 @@
 let WAVES=[];
 async function loadWaves(){ WAVES = await api('/waves'); renderWaves(); }
 
+// last red-team findings — fed back into proposePlan() as constraints so the
+// operator can re-plan with the AI's own suggestions (propose → preview → Apply).
+let _lastReviewFindings = [];
+
 async function reviewPlan(){
   const out = $('planReview'); const hint = $('reviewHint'); if(!out) return;
   out.innerHTML = '<span class="spinner"></span> red-teaming the plan…';
   if(hint) hint.textContent = '';
   try{
     const r = await api('/plan/review', {method:'POST', headers:{'content-type':'application/json'}, body:'{}'});
-    if(!r.ok){ out.innerHTML = `<span class="ev-err">review failed: ${esc(r.error||'unknown')}</span>`; return; }
+    if(!r.ok){ _lastReviewFindings = []; out.innerHTML = `<span class="ev-err">review failed: ${esc(r.error||'unknown')}</span>`; return; }
+    _lastReviewFindings = r.findings || [];
     const color = {sound:'var(--green)', 'needs-work':'var(--amber)', risky:'var(--red)'}[r.overall]||'var(--fg)';
     if(hint) hint.textContent = `${r.overall} · ${r.findings.length} finding(s)`;
     const rows = (r.findings||[]).map(f=>{
@@ -18,9 +23,58 @@ async function reviewPlan(){
         <div>${esc(f.issue)}</div>
         ${f.suggestion?`<div class="muted" style="font-size:12px">→ ${esc(f.suggestion)}</div>`:''}</div>`;
     }).join('') || '<div class="muted">no findings — plan looks sound.</div>';
+    // One-click "plan it as your design": re-run MigraQ with the findings folded
+    // into the demand as explicit constraints, then the existing propose→preview→
+    // Apply flow in plan.js takes over. Disabled when there's nothing to fix.
+    const replanBtn = _lastReviewFindings.length
+      ? `<div class="row" style="margin-top:6px;gap:8px;align-items:center"><button id="replanBtn" class="sm primary" onclick="replanWithReview()">Plan with this feedback</button><span id="replanStatus" class="muted" style="font-size:12px">re-runs MigraQ with the findings as constraints, then you Apply to persist</span></div>`
+      : '';
     out.innerHTML = `<div style="margin-bottom:4px"><span class="muted">overall:</span> <b style="color:${color}">${r.overall}</b> <span class="muted">(${r.wave_count} waves)</span></div>`
-      + rows + (r.summary?`<div class="muted" style="margin-top:4px">${esc(r.summary)}</div>`:'');
-  }catch(e){ out.innerHTML='<span class="ev-err">Error: '+esc(e)+'</span>'; }
+      + rows + (r.summary?`<div class="muted" style="margin-top:4px">${esc(r.summary)}</div>`:'')
+      + replanBtn;
+  }catch(e){ _lastReviewFindings = []; out.innerHTML='<span class="ev-err">Error: '+esc(e)+'</span>'; }
+}
+
+/* Turn the red-team findings into a constraint block appended to the operator's
+   demand, then hand off to proposePlan() (plan.js) which renders the dry-run
+   preview + the Apply button. The planner LLM sees the constraints and revises
+   the wave plan to address every finding — this is the "plan it as your design"
+   one-click. The original demand in the textarea is preserved (not overwritten);
+   only this propose run uses the augmented demand. */
+function _reviewFindingsAsConstraints(findings){
+  return findings.map(f=>{
+    const where = f.wave ? `wave "${f.wave}"` : 'the plan';
+    return `- [${f.severity}] ${where}: ${f.issue}${f.suggestion?` → fix: ${f.suggestion}`:''}`;
+  }).join('\n');
+}
+async function replanWithReview(){
+  const findings = _lastReviewFindings || [];
+  if(!findings.length){ toast('no review findings to act on','warn'); return; }
+  const btn = $('replanBtn'); const st = $('replanStatus');
+  if(btn){ btn.disabled = true; btn.textContent = 're-planning…'; }
+  // Build the augmented demand: operator's original intent (if any) + the
+  // findings as explicit constraints the planner must satisfy.
+  const base = $('planDemand').value.trim();
+  const constraints = 'Red-team review of the previous plan flagged these '
+    + 'issues — revise the wave plan to fix every one:\n'
+    + _reviewFindingsAsConstraints(findings);
+  const demand = base ? (base + '\n\n---\n' + constraints) : constraints;
+  // The preview + Apply button render in the Plan-with-MigraQ card (planOut),
+  // which sits ABOVE this review card. Scroll it into view BEFORE the LLM call
+  // so the spinner (and later the revised waves) is visible during the wait —
+  // otherwise the work happens off-screen and the click looks like a no-op.
+  if(st) st.innerHTML = '<span class="spinner"></span> asking MigraQ to revise the plan with these findings…';
+  const po = $('planOut'); if(po) po.scrollIntoView({behavior:'smooth', block:'start'});
+  try {
+    const res = await proposePlan(demand);
+    if(st) st.innerHTML = (res && res.ok)
+      ? '✓ revised plan ready above — review it and click <b>Apply</b> to persist.'
+      : '<span class="ev-err">MigraQ could not revise the plan — see the error above.</span>';
+  } catch(e) {
+    if(st) st.innerHTML = '<span class="ev-err">re-plan failed: '+esc(String(e))+'</span>';
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = 'Plan with this feedback'; }
+  }
 }
 /* Sort waves into DAG/timeline order (the order they execute), not alphabetical.
    The backend returns waves sorted by (stage, name) — correct across stages

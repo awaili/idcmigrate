@@ -36,6 +36,35 @@ def _store():
     return open_store(get_settings().db_url)
 
 
+def _cli_executor(executor_id: str):
+    """Resolve the selected executor and return ``(ExecutorClient, Settings)``.
+
+    No ``--executor`` (the default) → env ``IDC_EXECUTOR_*`` (back-compat). A
+    named id → looked up in the registry (DB) so the CLI can drive any of the
+    configured executors. Exits with a red message on disabled / unconfigured /
+    unknown id (matching the existing CLI trigger UX)."""
+    from ..agent import get_executor_client, registry
+    s = get_settings()
+    if executor_id:
+        st = _store()
+        try:
+            try:
+                s = registry.resolve(st, s, executor_id)
+            except KeyError:
+                console.print(f"[red]no such executor: {executor_id}[/red]")
+                raise typer.Exit(1)
+        finally:
+            st.close()
+    if not s.executor_enabled:
+        console.print("[red]executor disabled (IDC_EXECUTOR_ENABLED=false)[/red]")
+        raise typer.Exit(1)
+    ec = get_executor_client(s)
+    if not ec.configured:
+        console.print("[red]IDC_EXECUTOR_URL not configured[/red]")
+        raise typer.Exit(1)
+    return ec, s
+
+
 # ---------------------------------------------------------------------------
 # pipeline
 # ---------------------------------------------------------------------------
@@ -864,13 +893,18 @@ def serve(host: str = "0.0.0.0", port: int = 8010):
 
 
 @app_cli.command("executor-mock")
-def executor_mock(host: str = "0.0.0.0", port: int = 8090):
-    """Start the mock external executor (implements the executor side of the
-    contract). Point idc-migrate at it with IDC_EXECUTOR_URL=http://localhost:8090."""
-    import uvicorn
-    console.print(f"[green]mock executor → http://{host}:{port}[/green]")
-    console.print(f"[dim]callback target: {os.getenv('IDC_MOCK_CALLBACK','http://localhost:8010')}[/dim]")
-    uvicorn.run("idc.executor_mock.app:app", host=host, port=port, reload=False, log_level="info")
+def executor_mock():
+    """Run the mock external executor in pull mode — it polls idc-migrate's
+    /api/executor/tasks/claim for work, runs the canned logic, and pushes
+    results back. The executor exposes nothing to the network; configure
+    IDC_MOCK_CALLBACK (idc-migrate base, default http://localhost:8010) and
+    IDC_EXECUTOR_TOKEN (shared secret, must match idc-migrate)."""
+    from idc.executor_mock.app import run_forever
+    import asyncio
+    console.print(f"[green]mock executor pulling from "
+                  f"{os.getenv('IDC_MOCK_CALLBACK','http://localhost:8010')}"
+                  f"/api/executor/tasks/claim[/green]")
+    asyncio.run(run_forever())
 
 
 @app_cli.command()
@@ -969,7 +1003,8 @@ def code_scan(app_id: str = typer.Option(..., "--app"),
               action: str = typer.Option("scan", "--action", help="scan|comb|modify"),
               mode: str = typer.Option("plan", "--mode", help="plan|execute (modify)"),
               scope: List[str] = typer.Option([], "--scope", help="category to change (repeatable; modify)"),
-              override: List[str] = typer.Option([], "--override", help="old=new (repeatable; modify)")):
+              override: List[str] = typer.Option([], "--override", help="old=new (repeatable; modify)"),
+              executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger the external executor to scan/comb/modify an app's repo.
 
     For ``--action modify``: idc-migrate builds a concrete change list from the
@@ -977,15 +1012,8 @@ def code_scan(app_id: str = typer.Option(..., "--app"),
     sends it so the executor knows exactly what to change. ``--scope`` limits
     which categories to change (repeatable; omit = all).
     """
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled (IDC_EXECUTOR_ENABLED=false)[/red]")
-        raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]")
-        raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     # parse --override old=new → {old:new}
     overrides = _parse_overrides(override)
     for o in override:
@@ -997,9 +1025,11 @@ def code_scan(app_id: str = typer.Option(..., "--app"),
             res = ec.modify(app_id, repo_url, branch, mode=mode, scope=scope,
                             changes=spec_changes, notes=spec_notes)
         elif action == "comb":
-            res = ec.comb(app_id, repo_url, branch)
+            res = ec.comb(app_id, repo_url, branch,
+                          callback=ec.cb(f"/api/code-profiles/{app_id}"))
         else:
-            res = ec.scan(app_id, repo_url, branch)
+            res = ec.scan(app_id, repo_url, branch,
+                          callback=ec.cb(f"/api/code-profiles/{app_id}"))
     except ExecutorError as e:
         console.print(f"[red]executor error: {e}[/red]")
         raise typer.Exit(1)
@@ -1150,23 +1180,18 @@ def db_convert(db_server_id: str = typer.Argument(...),
                target_engine: str = typer.Option("", "--target",
                    help="tdsql / cdb_mysql / postgresql (default per source engine)"),
                source_engine: str = typer.Option("", "--source",
-                   help="oracle / sqlserver / mysql (inferred if omitted)")):
+                   help="oracle / sqlserver / mysql (inferred if omitted)"),
+               executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger the executor to convert a DB host's schema/SQL (F6).
 
     The executor pushes a DBConversionProfile back with the converted DDL + a
     per-object compatibility report in `.conversion`. (`db-scan` assess mode is
     grade-only; this is convert mode.)"""
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled (IDC_EXECUTOR_ENABLED=false)[/red]")
-        raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]")
-        raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     try:
-        res = ec.db_scan(db_server_id, source_engine, target_engine, mode="convert")
+        res = ec.db_scan(db_server_id, source_engine, target_engine, mode="convert",
+                         callback=ec.cb(f"/api/db-profiles/{db_server_id}"))
     except ExecutorError as e:
         console.print(f"[red]executor error: {e}[/red]")
         raise typer.Exit(1)
@@ -1219,23 +1244,18 @@ def legacy_analyze(server_id: str = typer.Argument(...),
                    has_repo: bool = typer.Option(False, "--has-repo",
                        help="the app has a source repo (containerize is less likely)"),
                    os_bucket: str = typer.Option("expired", "--os-eol",
-                       help="expired|expiring|active|unknown")):
+                       help="expired|expiring|active|unknown"),
+                   executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger the executor to analyze an EOL host and recommend
     containerize/replatform/rewrite/retain (F7). Force re-runs even if a
     disposition is already stored."""
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled (IDC_EXECUTOR_ENABLED=false)[/red]")
-        raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]")
-        raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     ctx = {"role": role, "os": os_name, "runtime": runtime,
            "has_source_repo": has_repo, "os_eol_bucket": os_bucket}
     try:
-        res = ec.legacy_disposition(server_id, ctx)
+        res = ec.legacy_disposition(server_id, ctx,
+                                     callback=ec.cb(f"/api/legacy-dispositions/{server_id}"))
     except ExecutorError as e:
         console.print(f"[red]executor error: {e}[/red]")
         raise typer.Exit(1)
@@ -1279,17 +1299,14 @@ def doc_show(doc_type: str = typer.Argument(..., help="runbook|cutover|as_built"
 
 
 @doc_cli.command("cutover")
-def doc_cutover(wave_id: str = typer.Argument(...)):
+def doc_cutover(wave_id: str = typer.Argument(...),
+                executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger the executor to generate a per-wave cutover playbook (F9)."""
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     try:
-        res = ec.cutover_playbook(wave_id, _doc_context(st=None, wave_id=wave_id))
+        res = ec.cutover_playbook(wave_id, _doc_context(st=None, wave_id=wave_id),
+                                  callback=ec.cb(f"/api/docs/cutover/{wave_id}"))
     except ExecutorError as e:
         console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
     console.print(f"[green]triggered cutover-playbook for {wave_id}[/green]  "
@@ -1297,17 +1314,14 @@ def doc_cutover(wave_id: str = typer.Argument(...)):
 
 
 @doc_cli.command("as-built")
-def doc_as_built(wave_id: str = typer.Argument(...)):
+def doc_as_built(wave_id: str = typer.Argument(...),
+                 executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger the executor to generate a per-wave as-built doc (F9)."""
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     try:
-        res = ec.as_built(wave_id, _doc_context(st=None, wave_id=wave_id))
+        res = ec.as_built(wave_id, _doc_context(st=None, wave_id=wave_id),
+                          callback=ec.cb(f"/api/docs/as-built/{wave_id}"))
     except ExecutorError as e:
         console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
     console.print(f"[green]triggered as-built for {wave_id}[/green]  "
@@ -1389,16 +1403,12 @@ def iac_guardrails(scope_id: str = typer.Argument(...)):
 def iac_emit(scope: str = typer.Option(..., "--scope", help="landing_zone|workload"),
              scope_id: str = typer.Option(..., "--id",
                  help="lz:<archetype> (e.g. lz:corp) | wl:<server_id>"),
-             region: str = typer.Option("ap-bangkok", "--region")):
+             region: str = typer.Option("ap-bangkok", "--region"),
+             executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger the executor to emit IaC + run guardrail checks (F5)."""
-    from ..agent import ExecutorError, get_executor_client
+    from ..agent import ExecutorError
     from ..core.lz import LZ_BLUEPRINTS, resolve_archetype_blueprint
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    ec, s = _cli_executor(executor)
     ctx: dict = {"target": {"cloud": "tencent", "region": region}}
     if scope == "landing_zone" and scope_id.startswith("lz:"):
         arch = scope_id.split(":", 1)[1]
@@ -1415,7 +1425,7 @@ def iac_emit(scope: str = typer.Option(..., "--scope", help="landing_zone|worklo
             bp = None
         ctx["blueprint"] = bp if bp is not None else LZ_BLUEPRINTS.get(arch, {})
     try:
-        res = ec.iac_emit(scope, scope_id, ctx)
+        res = ec.iac_emit(scope, scope_id, ctx, callback=ec.cb(f"/api/iac-artifacts/{scope_id}"))
     except ExecutorError as e:
         console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
     console.print(f"[green]triggered iac-emit for {scope_id}[/green]  "
@@ -1462,15 +1472,11 @@ def postmig_savings_cmd():
 @postmig_cli.command("scan")
 def postmig_scan(server_id: str = typer.Argument(..., help="host to analyze"),
                  spec: str = typer.Option("", "--spec", help="current cloud spec"),
-                 product: str = typer.Option("CVM", "--product")):
+                 product: str = typer.Option("CVM", "--product"),
+                 executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger the executor to analyze a finalized host's post-mig metrics (F10)."""
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     ctx = {"target": {"product": product, "spec": spec},
            "metrics": {"cpu_p95": 8, "mem_p95": 22, "uptime_pct": 99.5}}
     try:
@@ -1536,17 +1542,13 @@ def test_diffs(app_id: str = typer.Argument("", help="one app (optional)")):
 
 
 @test_cli.command("gen")
-def test_gen(app_id: str = typer.Argument(...)):
+def test_gen(app_id: str = typer.Argument(...),
+             executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger the executor to generate test cases (F11)."""
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     try:
-        res = ec.test_gen(app_id, {})
+        res = ec.test_gen(app_id, {}, callback=ec.cb(f"/api/test-cases/{app_id}"))
     except ExecutorError as e:
         console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
     console.print(f"[green]triggered test-gen for {app_id}[/green]  "
@@ -1556,15 +1558,11 @@ def test_gen(app_id: str = typer.Argument(...)):
 @test_cli.command("run")
 def test_run(app_id: str = typer.Argument(...),
              phase: str = typer.Option(..., "--phase", help="pre|post"),
-             target: str = typer.Option(..., "--target", help="endpoint base to hit")):
+             target: str = typer.Option(..., "--target", help="endpoint base to hit"),
+             executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger a test run (F11). phase=pre for the pre-cutover baseline."""
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     try:
         res = ec.test_run(app_id, phase, target, {})
     except ExecutorError as e:
@@ -1576,18 +1574,15 @@ def test_run(app_id: str = typer.Argument(...),
 @test_cli.command("compare")
 def test_compare(app_id: str = typer.Argument(...),
                  pre_run_id: str = typer.Option(..., "--pre"),
-                 post_run_id: str = typer.Option(..., "--post")):
+                 post_run_id: str = typer.Option(..., "--post"),
+                 executor: str = typer.Option("", "--executor", help="named executor id (default = the default executor)")):
     """Trigger a pre-vs-post test comparison (F11). The diff drives the
     test_regression cutover gate."""
-    from ..agent import ExecutorError, get_executor_client
-    s = get_settings()
-    if not s.executor_enabled:
-        console.print("[red]executor disabled[/red]"); raise typer.Exit(1)
-    ec = get_executor_client(s)
-    if not ec.configured:
-        console.print("[red]IDC_EXECUTOR_URL not configured[/red]"); raise typer.Exit(1)
+    from ..agent import ExecutorError
+    ec, s = _cli_executor(executor)
     try:
-        res = ec.test_compare(app_id, pre_run_id, post_run_id)
+        res = ec.test_compare(app_id, pre_run_id, post_run_id,
+                              callback=ec.cb(f"/api/test-diffs/{app_id}"))
     except ExecutorError as e:
         console.print(f"[red]executor error: {e}[/red]"); raise typer.Exit(1)
     console.print(f"[green]triggered test-compare for {app_id}[/green]  "

@@ -6,10 +6,12 @@ from .claude_runner import (
     run_agent_sync,
     stream_agent,
 )
-from .executor_client import ExecutorClient, ExecutorError, get_executor_client, executor_status
+from .executor_client import ExecutorClient, get_executor_client, executor_status
+from . import executors as registry
 
 __all__ = [
     "AgentEvent", "AgentResult", "build_context",
     "run_agent", "run_agent_sync", "stream_agent",
-    "ExecutorClient", "ExecutorError", "get_executor_client", "executor_status",
+    "ExecutorClient", "get_executor_client", "executor_status",
+    "registry",
 ]

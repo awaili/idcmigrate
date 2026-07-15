@@ -55,48 +55,44 @@ def test_runtime_confirm_question_only_for_runtime_derived():
     assert runtime_confirm_question("app-x", None) is None
 
 
-# -- executor_client request shape ------------------------------------------
-def test_executor_client_runtime_containerize_request(monkeypatch):
-    """The client builds the right POST /v1/runtime-containerize body."""
-    from idc.agent.executor_client import ExecutorClient
-    captured = {}
+# -- mock worker (pull mode): the runtime-containerize worker infers a profile --
+def test_mock_runtime_containerize_worker_pushes_profile(monkeypatch):
+    """Pull mode: the mock's _run_runtime_containerize worker (dispatched when
+    an executor claims a runtime-containerize task) infers a runtime-derived
+    CodeProfile + a Dockerfile patch_ref and pushes them back."""
+    import asyncio
+    import idc.executor_mock.app as mock
+    pushes = []
 
-    def fake_request(self, method, path, json):
-        captured["method"] = method
-        captured["path"] = path
-        captured["body"] = json
-        return {"job_id": "cjob-1", "status": "pending"}
+    async def fake_push(path, body, method="POST", url=None):
+        pushes.append((method, url or path, body))
+    monkeypatch.setattr(mock, "_push", fake_push)
 
-    monkeypatch.setattr(ExecutorClient, "_request", fake_request)
-    ec = ExecutorClient.__new__(ExecutorClient)
-    res = ec.runtime_containerize("app-x", "srv-1",
-                                   inventory={"process": "java -jar app.jar",
-                                              "port": 8080}, mode="plan")
-    assert res == {"job_id": "cjob-1", "status": "pending"}
-    assert captured["method"] == "POST"
-    assert captured["path"] == "/v1/runtime-containerize"
-    assert captured["body"]["app_id"] == "app-x"
-    assert captured["body"]["server_id"] == "srv-1"
-    assert captured["body"]["mode"] == "plan"
-    assert captured["body"]["inventory"]["port"] == 8080
+    payload = {"app_id": "app-rt", "server_id": "srv-rt",
+               "inventory": {"process": "java -jar app.jar", "ports": [8080]},
+               "mode": "plan", "callback": "http://mig/api/code-profiles/app-rt"}
+    out = asyncio.run(mock._run_runtime_containerize(payload, "tsk-rt"))
+    # a runtime-derived profile is PUT back
+    prof = next(b for mth, t, b in pushes
+                if mth == "PUT" and "code-profiles" in t)
+    assert prof["app_id"] == "app-rt" and prof["source"] == "runtime-derived"
+    # plan mode -> a scaffold patch ref (not a PR)
+    assert out["result_ref"].startswith("dockerfile-scaffold-")
 
 
-# -- mock executor round-trip (TestClient) ----------------------------------
-def test_mock_runtime_containerize_roundtrip():
-    """The mock /v1/runtime-containerize returns a job_id and records the job
-    (the async push-back is best-effort; we assert the contract shape)."""
-    from fastapi.testclient import TestClient
-    from idc.executor_mock.app import app, _JOBS
-    client = TestClient(app)
-    r = client.post("/v1/runtime-containerize", json={
-        "app_id": "app-rt", "server_id": "srv-rt",
-        "inventory": {"process": "java", "port": 8080}, "mode": "plan"})
-    assert r.status_code == 202, r.text
-    body = r.json()
-    assert body["status"] == "pending" and body["job_id"]
-    # the job is recorded in the mock's in-memory store
-    assert body["job_id"] in _JOBS
-    assert _JOBS[body["job_id"]]["kind"] == "runtime-containerize"
+def test_handle_dispatches_runtime_containerize(monkeypatch):
+    """_handle routes a runtime-containerize task to its worker."""
+    import asyncio
+    import idc.executor_mock.app as mock
+
+    async def fake_push(*a, **k):
+        pass
+    monkeypatch.setattr(mock, "_push", fake_push)
+    task = {"task_id": "tsk-rc", "kind": "runtime-containerize",
+            "payload": {"app_id": "a", "server_id": "s", "mode": "plan"},
+            "created_at": "2026-07-15T00:00:00Z"}
+    out = asyncio.run(mock._handle(task))
+    assert "inferred Dockerfile scaffold" in out["summary"]
 
 
 # -- DB-backed: backend trigger + modify confirm-gate -----------------------
@@ -176,29 +172,24 @@ def test_modify_confirm_gate_blocks_execute_for_runtime_derived():
 
 
 def test_modify_plan_mode_allowed_for_runtime_derived():
-    """Plan mode (dry-run) previews the scaffold — no confirm gate."""
+    """Plan mode (dry-run) previews the scaffold — no confirm gate, the task is
+    enqueued for an executor to pull."""
     app_id = f"app-rt-{_new_id('a')[-4:]}"
-    m.settings.executor_enabled = True
     import idc.backend.app as bapp
     bapp.settings.executor_enabled = True
-    # stub the executor client so we don't need a live executor
-    from idc.agent.executor_client import ExecutorClient
-    orig = ExecutorClient.modify
-    ExecutorClient.modify = lambda self, *a, **k: {"job_id": "cjob-plan", "status": "pending"}
     try:
         _seed_runtime_profile(app_id)
         r = client.post("/api/executor/trigger", json={
             "app_id": app_id, "repo_url": "", "branch": "",
             "action": "modify", "mode": "plan"})
-        # plan mode: either 200 (executor configured stub) or 409 (not configured)
-        # — but NOT the runtime-confirm 409. Allow 200/202/409-config but reject the
-        # confirm-gate 409 specifically.
-        if r.status_code == 409:
-            assert "runtime-derived" not in r.text.lower(), \
-                "plan mode must not hit the runtime confirm-gate"
-        assert r.status_code in (200, 409), r.text
+        # plan mode: NOT the runtime-confirm 409 — the task is enqueued (200).
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "pending"
+        tid = r.json()["task_id"]
+        t = m.STORE.get_task(tid)
+        assert t["kind"] == "modify" and t["payload"]["mode"] == "plan"
+        with m.STORE.tx() as cur:
+            cur.execute(m.STORE._x("DELETE FROM executor_tasks WHERE id=?"), (tid,))
     finally:
-        ExecutorClient.modify = orig
         _cleanup_profile(app_id)
-        m.settings.executor_enabled = False
         bapp.settings.executor_enabled = False

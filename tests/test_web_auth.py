@@ -117,3 +117,30 @@ def test_change_password_requires_current_and_session(_web_auth_on):
     assert c.post("/login", data={"password": "newpass123"}, follow_redirects=False).status_code == 303
     # the old one no longer does
     assert c.post("/login", data={"password": _web_auth_on["password"]}, follow_redirects=False).status_code == 401
+
+def test_bearer_accepts_any_registered_executor_token(_web_auth_on):
+    """With multiple executors configured, a push bearing ANY registered
+    executor's token validates on the contract surface — not just the
+    default's. (Every executor pushes back with its own token; idc-migrate
+    accepts any registered one.)"""
+    # the registry PUT is operator/session-gated, so log in first
+    client.post("/login", data={"password": _web_auth_on["password"]},
+                 follow_redirects=False)
+    client.put("/api/executors/named-x",
+               json={"url": "http://127.0.0.1:8091", "token": "named-tok",
+                     "enabled": True, "timeout": 300})
+    try:
+        c = TestClient(m.app)
+        h = {"Authorization": "Bearer named-tok", "content-type": "application/json"}
+        # the NAMED executor's token reaches a push route (not 401)
+        r = c.put("/api/code-profiles/app-x", json={"app_id": "app-x"}, headers=h)
+        assert r.status_code != 401, "named executor token rejected by the gate"
+        # the default's token still works too
+        assert c.get("/api/change-jobs",
+                      headers={"Authorization": "Bearer exec-tok"}).status_code != 401
+        # an unknown token is still rejected
+        assert c.get("/api/change-jobs",
+                      headers={"Authorization": "Bearer nope"}).status_code == 401
+    finally:
+        client.delete("/api/executors/named-x")
+        client.post("/logout", follow_redirects=False)

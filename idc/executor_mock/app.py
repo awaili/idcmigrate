@@ -1,20 +1,20 @@
-"""Mock of the external agent executor.
+"""Mock external agent executor — **pull mode**.
 
-Implements the executor-side contract from ``docs/agent-executor.md`` so the
-whole loop — scan → comb → modify → (raise question) → answer → done — can run
-locally without a real external service. It is a tiny FastAPI app that:
+The executor exposes **nothing** to the network: idc-migrate cannot reach it,
+so it cannot push triggers. Instead this mock **polls** idc-migrate's
+``POST /api/executor/tasks/claim`` for work, runs the canned scan/comb/modify/
+... logic, pushes results back over the unchanged ``/api/*`` feedback surface
+(``PUT /api/code-profiles/{app_id}``, ``POST /api/change-jobs``, ...), and marks
+the task complete via ``POST /api/executor/tasks/{id}/complete``. This is a
+reference loop a real executor can copy.
 
-* accepts ``POST /v1/scan | /v1/comb | /v1/modify | GET /v1/jobs/{id}``;
-* pushes results back to idc-migrate (``POST /api/change-jobs``,
-  ``PUT /api/code-profiles/{app_id}``) using the shared bearer token;
-* on ``modify``, if a change item has empty ``old``/``new`` (idc-migrate
-  couldn't derive the literal/replacement), it raises a Question via
-  ``POST /api/apps/{app_id}/questions`` — exactly what a real executor should
-  do instead of guessing.
+Run: ``idc executor-mock`` (poll loop). Config: ``IDC_MOCK_CALLBACK``
+(idc-migrate base, default http://localhost:8010), ``IDC_EXECUTOR_TOKEN``
+(shared secret, must match idc-migrate).
 
-Run: ``python -m idc.executor_mock`` (port 8090) or ``idc executor-mock``.
-Config: ``IDC_MOCK_CALLBACK`` (idc-migrate base, default http://localhost:8010),
-``IDC_EXECUTOR_TOKEN`` (shared secret, must match idc-migrate).
+The ``_fake_*`` functions are the canned answers (a real executor swaps them
+for a real scanner + repo writer); the ``_run_*`` runners are the per-kind
+workers; ``_handle`` dispatches a claimed task to its runner.
 """
 from __future__ import annotations
 
@@ -24,23 +24,9 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
-
-app = FastAPI(title="idc-executor-mock", version="0.1.0")
-
 CALLBACK = os.getenv("IDC_MOCK_CALLBACK", "http://localhost:8010").rstrip("/")
 TOKEN = os.getenv("IDC_EXECUTOR_TOKEN", "")
-
-# in-memory job store (the mock is single-process; fine for local/demo)
-_JOBS: Dict[str, Dict[str, Any]] = {}
-
-
-@app.get("/health")
-def health():
-    """Liveness + identity for the idc-migrate `doctor` / status-indicator probe."""
-    return {"ok": True, "service": "idc-executor-mock", "version": "0.1.0",
-            "callback": CALLBACK, "token_configured": bool(TOKEN)}
+POLL_INTERVAL = float(os.getenv("IDC_MOCK_POLL_INTERVAL", "2"))
 
 
 def _now() -> str:
@@ -58,21 +44,62 @@ def _headers() -> Dict[str, str]:
     return h
 
 
-async def _push(path: str, body: Dict[str, Any], method: str = "POST"):
-    """Best-effort push to idc-migrate; never raise into the request path."""
+async def _push(path: str, body: Dict[str, Any], method: str = "POST",
+                url: Optional[str] = None):
+    """Best-effort push to idc-migrate; never raise into the worker path.
+
+    ``url`` (when set) is a full callback URL idc-migrate baked into the task
+    payload — PUT/POST directly to it. When unset, fall back to the
+    ``IDC_MOCK_CALLBACK`` base + ``path``."""
     import httpx  # lazy
-    url = f"{CALLBACK}{path}"
+    target = url or f"{CALLBACK}{path}"
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.request(method, url, json=body, headers=_headers())
+            r = await c.request(method, target, json=body, headers=_headers())
             # httpx does NOT raise on 4xx/5xx by default — a 401 (token mismatch)
             # or 400/500 would otherwise silently drop the profile/results and the
             # job would look green while idc-migrate got nothing. Log non-2xx.
             if r.status_code >= 400:
-                print(f"[mock] push {method} {url} -> HTTP {r.status_code}: "
+                print(f"[mock] push {method} {target} -> HTTP {r.status_code}: "
                       f"{r.text[:200]}")
-    except Exception as e:  # idc-migrate down? log, don't crash the job
-        print(f"[mock] push {method} {url} failed: {e!r}")
+    except Exception as e:  # idc-migrate down? log, don't crash the worker
+        print(f"[mock] push {method} {target} failed: {e!r}")
+
+
+async def _post(path: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """POST to an idc-migrate control endpoint (claim/complete/lease). Returns
+    the parsed JSON or None on network/HTTP failure (logged, not raised)."""
+    import httpx  # lazy
+    target = f"{CALLBACK}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(target, json=body, headers=_headers())
+            if r.status_code >= 400:
+                print(f"[mock] post {target} -> HTTP {r.status_code}: {r.text[:200]}")
+                return None
+            return r.json()
+    except Exception as e:
+        print(f"[mock] post {target} failed: {e!r}")
+        return None
+
+
+def _app_id_of(p: Dict[str, Any]) -> str:
+    """The change-job's app_id is whichever identity the task carries."""
+    return (p.get("app_id") or p.get("db_server_id") or p.get("server_id")
+            or p.get("scope_id") or p.get("wave_id") or "")
+
+
+def _job(tid: str, kind: str, p: Dict[str, Any], status: str, *,
+         summary: str = "", patch_ref: str = "", error: str = "",
+         finished_at: str = "") -> Dict[str, Any]:
+    """Build a ChangeJob-shaped dict for the heartbeat/terminal push. The mock
+    no longer keeps an in-memory _JOBS table (pull mode has no server); the job
+    is reconstructed from the task payload + the status the worker is emitting."""
+    return {"id": tid, "app_id": _app_id_of(p), "kind": kind,
+            "repo_url": p.get("repo_url", ""), "branch": p.get("branch", ""),
+            "status": status, "patch_ref": patch_ref, "summary": summary,
+            "error": error, "created_at": p.get("created_at", _now()),
+            "finished_at": finished_at}
 
 
 def _fake_profile(app_id: str, repo_url: str, branch: str, scan_id: str) -> Dict[str, Any]:
@@ -116,305 +143,6 @@ def _fake_profile(app_id: str, repo_url: str, branch: str, scan_id: str) -> Dict
         ],
         "summary": "Spring Boot 2.1 on JDK8; needs DB host param + service-discovery swap.",
     }
-
-
-# ---------------------------------------------------------------------------
-# request schemas
-# ---------------------------------------------------------------------------
-class ScanReq(BaseModel):
-    app_id: str
-    repo_url: str
-    branch: str = ""
-    callback: str = ""
-
-
-class DBScanReq(BaseModel):
-    db_server_id: str
-    source_engine: str = ""
-    target_engine: str = ""
-    mode: str = "assess"      # assess (grade-only) | convert (also emit DDL + report)
-    callback: str = ""
-
-
-class RuntimeContainerizeReq(BaseModel):
-    app_id: str
-    server_id: str
-    inventory: Dict[str, Any] = {}
-    mode: str = "plan"        # plan (dry-run scaffold) | execute (write it)
-    callback: str = ""
-
-
-class ModifyReq(BaseModel):
-    app_id: str
-    repo_url: str
-    branch: str = ""
-    mode: str = "plan"
-    scope: List[str] = []
-    changes: List[Dict[str, Any]] = []
-    notes: List[str] = []
-
-
-class LegacyDispositionReq(BaseModel):
-    server_id: str
-    context: Dict[str, Any] = {}
-    callback: str = ""
-
-
-class DocReq(BaseModel):
-    wave_id: str
-    context: Dict[str, Any] = {}
-    callback: str = ""
-
-
-class IacEmitReq(BaseModel):
-    scope: str            # landing_zone | workload
-    scope_id: str         # lz:<arch> | wl:<server_id>
-    context: Dict[str, Any] = {}
-    callback: str = ""
-
-
-class PostMigReq(BaseModel):
-    server_id: str
-    context: Dict[str, Any] = {}
-    callback: str = ""
-
-
-class TestGenReq(BaseModel):
-    app_id: str
-    context: Dict[str, Any] = {}
-    callback: str = ""
-
-
-class TestRunReq(BaseModel):
-    app_id: str
-    phase: str          # pre | post
-    target: str         # endpoint base to hit
-    run_id: str = ""    # optional pre-set id (idc-migrate can mint it)
-    context: Dict[str, Any] = {}
-    callback: str = ""
-
-
-class TestCompareReq(BaseModel):
-    app_id: str
-    pre_run_id: str
-    post_run_id: str
-    callback: str = ""
-
-
-def _check_auth(authorization: Optional[str]):
-    if not TOKEN:
-        return  # no token configured → open (local dev)
-    if not (authorization or "").startswith("Bearer "):
-        raise HTTPException(401, "missing bearer")
-    if authorization.split(" ", 1)[1].strip() != TOKEN:
-        raise HTTPException(401, "bad token")
-
-
-# ---------------------------------------------------------------------------
-# endpoints
-# ---------------------------------------------------------------------------
-@app.post("/v1/scan", status_code=202)
-async def v1_scan(req: ScanReq, authorization: Optional[str] = Header(None)):
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.app_id, "kind": "scan", "repo_url": req.repo_url,
-                  "branch": req.branch, "status": "pending", "created_at": _now()}
-    asyncio.create_task(_run_scan(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/comb", status_code=202)
-async def v1_comb(req: ScanReq, authorization: Optional[str] = Header(None)):
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.app_id, "kind": "comb", "repo_url": req.repo_url,
-                  "branch": req.branch, "status": "pending", "created_at": _now()}
-    asyncio.create_task(_run_scan(req, jid))  # comb produces a profile too
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/db-scan", status_code=202)
-async def v1_db_scan(req: DBScanReq, authorization: Optional[str] = Header(None)):
-    """F5 — trigger a heterogeneous DB-scan. The mock derives a plausible
-    DBConversionProfile from the source engine and pushes it back to
-    ``PUT /api/db-profiles/{db_server_id}`` so the F5 enrich loop is testable
-    end-to-end without a real executor."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.db_server_id, "kind": "db-scan",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_db_scan(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/runtime-containerize", status_code=202)
-async def v1_runtime_containerize(req: RuntimeContainerizeReq,
-                                  authorization: Optional[str] = Header(None)):
-    """F9 — no-source containerization. The mock infers a Dockerfile scaffold +
-    a CodeProfile tagged ``source=runtime-derived`` from the runtime inventory
-    (process/port/software) and pushes the profile back to
-    ``PUT /api/code-profiles/{app_id}``. The patch_ref is a Dockerfile scaffold."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.app_id, "kind": "runtime-containerize",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_runtime_containerize(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/modify", status_code=202)
-async def v1_modify(req: ModifyReq, authorization: Optional[str] = Header(None)):
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.app_id, "kind": "modify", "repo_url": req.repo_url,
-                  "branch": req.branch, "status": "pending", "created_at": _now()}
-    asyncio.create_task(_run_modify(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/legacy-disposition", status_code=202)
-async def v1_legacy_disposition(req: LegacyDispositionReq,
-                                authorization: Optional[str] = Header(None)):
-    """F7 — analyze an EOL/unsupported-OS host and recommend
-    containerize/replatform/rewrite/retain. The mock decides from the workload
-    context (role / has_source_repo / runtime_inventory) and pushes a
-    LegacyDisposition back to ``PUT /api/legacy-dispositions/{server_id}``."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.server_id, "kind": "legacy-disposition",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_legacy_disposition(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/cutover-playbook", status_code=202)
-async def v1_cutover_playbook(req: DocReq, authorization: Optional[str] = Header(None)):
-    """F9 — generate a per-wave cutover playbook (ordered per-server cutover
-    steps) from the wave's members + downtime window + risk basis. Pushes a
-    DocArtifact (markdown) back to ``PUT /api/docs/cutover/{wave_id}``."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.wave_id, "kind": "cutover-playbook",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_doc(req, jid, "cutover", _fake_cutover_playbook))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/as-built", status_code=202)
-async def v1_as_built(req: DocReq, authorization: Optional[str] = Header(None)):
-    """F9 — generate a per-wave as-built doc from the executed stage_history,
-    gate results, and change jobs. Pushes a DocArtifact (markdown) back to
-    ``PUT /api/docs/as-built/{wave_id}``."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.wave_id, "kind": "as-built",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_doc(req, jid, "as_built", _fake_as_built))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/iac-emit", status_code=202)
-async def v1_iac_emit(req: IacEmitReq, authorization: Optional[str] = Header(None)):
-    """F5 — emit landing-zone / workload Terraform + run Well-Architected
-    guardrail checks. The mock emits 2-3 ``resource "tencentcloud_*"`` blocks
-    from the blueprint/match + 2 guardrail checks (one pass, one fail) so the
-    launch gate is exercisable. Pushes an IaCArtifact back to
-    ``PUT /api/iac-artifacts/{scope_id}``."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.scope_id, "kind": "iac-emit",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_iac_emit(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/postmig-optimize", status_code=202)
-async def v1_postmig_optimize(req: PostMigReq,
-                              authorization: Optional[str] = Header(None)):
-    """F10 — analyze a finalized host's post-mig cloud metrics + return
-    recommendations (right_size / reserved / anomaly / perf). The mock derives
-    one rec of each kind from the target spec + a canned metrics window and
-    pushes them back to ``PUT /api/postmig-recs/{server_id}/{kind}``."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.server_id, "kind": "postmig-optimize",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_postmig_optimize(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/test-gen", status_code=202)
-async def v1_test_gen(req: TestGenReq, authorization: Optional[str] = Header(None)):
-    """F11 — generate test cases from the app's CodeProfile. The mock emits a
-    health-check case + one endpoint case and pushes them to
-    ``PUT /api/test-cases/{app_id}`` (a list)."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.app_id, "kind": "test-gen",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_test_gen(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.post("/v1/test-run", status_code=202)
-async def v1_test_run(req: TestRunReq, authorization: Optional[str] = Header(None)):
-    """F11 — run an app's test set against a target (pre on-prem / post cloud).
-    The mock derives pass/fail outcomes from the phase + target and pushes a
-    TestRun to ``PUT /api/test-runs/{run_id}``."""
-    _check_auth(authorization)
-    jid = _jid()
-    run_id = req.run_id or f"trun-{jid[5:]}"
-    _JOBS[jid] = {"id": jid, "app_id": req.app_id, "kind": "test-run",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_test_run(req, jid, run_id))
-    return {"job_id": jid, "status": "pending", "run_id": run_id}
-
-
-@app.post("/v1/test-compare", status_code=202)
-async def v1_test_compare(req: TestCompareReq,
-                          authorization: Optional[str] = Header(None)):
-    """F11 — diff a pre-run vs a post-run. The mock derives per-case verdicts
-    (one regression to exercise the gate) and pushes a TestDiff to
-    ``PUT /api/test-diffs/{app_id}``."""
-    _check_auth(authorization)
-    jid = _jid()
-    _JOBS[jid] = {"id": jid, "app_id": req.app_id, "kind": "test-compare",
-                  "repo_url": "", "branch": "", "status": "pending",
-                  "created_at": _now()}
-    asyncio.create_task(_run_test_compare(req, jid))
-    return {"job_id": jid, "status": "pending"}
-
-
-@app.get("/v1/jobs/{job_id}")
-def v1_job(job_id: str):
-    j = _JOBS.get(job_id)
-    if not j:
-        raise HTTPException(404, "unknown job")
-    return j
-
-
-# ---------------------------------------------------------------------------
-# background runners (push results back to idc-migrate)
-# ---------------------------------------------------------------------------
-async def _run_scan(req: ScanReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running", "summary": "scanning…"})
-    await asyncio.sleep(0.5)  # pretend to work
-    profile = _fake_profile(req.app_id, req.repo_url, req.branch, jid)
-    job.update(status="done", finished_at=_now(),
-               summary=f"scanned {req.app_id}; 2 findings, pattern=replatform")
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    await _push(f"/api/code-profiles/{req.app_id}", profile, method="PUT")
 
 
 def _fake_db_profile(db_server_id: str, source_engine: str,
@@ -542,25 +270,6 @@ def _db_report_md(target_engine: str, objs: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-async def _run_db_scan(req: DBScanReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running", "summary": "db-scanning…"})
-    await asyncio.sleep(0.5)
-    prof = _fake_db_profile(req.db_server_id, req.source_engine,
-                            req.target_engine, jid)
-    # F6 — in convert mode, also attach the converted-schema artifact + the
-    # per-object compatibility report. assess mode stays grade-only (back-compat).
-    if (req.mode or "assess").lower() == "convert":
-        prof["conversion"] = _fake_db_conversion(req.db_server_id, req.source_engine,
-                                                 req.target_engine, jid)
-    job.update(status="done", finished_at=_now(),
-               summary=f"db-scan {req.db_server_id}; difficulty={prof['difficulty']}"
-                       + (" (+conversion)" if "conversion" in prof else ""))
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    await _push(f"/api/db-profiles/{req.db_server_id}", prof, method="PUT")
-
-
 def _fake_legacy_disposition(server_id: str, ctx: Dict[str, Any],
                              scan_id: str) -> Dict[str, Any]:
     """F7 — a plausible containerize/replatform/rewrite/retain recommendation
@@ -617,23 +326,6 @@ def _ld(server_id, disposition, rationale, conf, image, effort, prereqs,
             "summary": summary}
 
 
-async def _run_legacy_disposition(req: LegacyDispositionReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running",
-                                     "summary": "analyzing EOL workload…"})
-    await asyncio.sleep(0.4)
-    disp = _fake_legacy_disposition(req.server_id, req.context, jid)
-    job.update(status="done", finished_at=_now(),
-               summary=f"legacy-disposition {req.server_id}; {disp['disposition']}")
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    await _push(f"/api/legacy-dispositions/{req.server_id}", disp, method="PUT")
-
-
-# F9 — cutover playbook / as-built generators. The mock builds templated
-# markdown from the inputs idc-migrate sends; a real executor uses its LLM to
-# narrate, but the SHAPE (ordered per-server steps / what-moved-where) is the
-# same and is grounded in the wave's real data.
 def _fake_cutover_playbook(wave_id: str, ctx: Dict[str, Any]) -> str:
     members = ctx.get("members") or []
     window = ctx.get("downtime_window") or {}
@@ -679,7 +371,7 @@ def _fake_as_built(wave_id: str, ctx: Dict[str, Any]) -> str:
              "| Server | Role | Target | Final spec |", "|---|---|---|---|"]
     for t in targets:
         lines.append(f"| {t.get('server_id','?')} | {t.get('role','?')} | "
-                      f"{t.get('product','?')} | {t.get('spec','?')} |")
+                     f"{t.get('product','?')} | {t.get('spec','?')} |")
     lines += ["", "## Gate outcomes", ""]
     for g in gates:
         lines.append(f"- {g.get('name','?')}: **{g.get('status','?')}**"
@@ -693,29 +385,6 @@ def _fake_as_built(wave_id: str, ctx: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-async def _run_doc(req: DocReq, jid: str, doc_type: str, gen):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running",
-                                     "summary": f"generating {doc_type}…"})
-    await asyncio.sleep(0.4)
-    md = gen(req.wave_id, req.context)
-    job.update(status="done", finished_at=_now(),
-               summary=f"{doc_type} for {req.wave_id}")
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    slug = "as-built" if doc_type == "as_built" else doc_type
-    await _push(f"/api/docs/{slug}/{req.wave_id}", {
-        "doc_type": doc_type, "scope_id": req.wave_id, "doc_md": md,
-        "scan_id": jid, "scanned_at": _now(),
-        "summary": f"{doc_type} for wave {req.wave_id}",
-    }, method="PUT")
-
-
-# F5 — IaC generator. The mock emits real ``resource "tencentcloud_*"`` HCL
-# blocks from the blueprint (landing_zone) or match (workload) + runs 2
-# guardrail checks (one pass, one fail) so the launch gate is exercisable.
-# A real executor emits via its IaC library + a real guardrail engine (OPA /
-# terraform-plan scan); the SHAPE here is the contract.
 def _fake_iac_artifact(scope: str, scope_id: str, ctx: Dict[str, Any],
                       scan_id: str) -> Dict[str, Any]:
     arch = scope_id.split(":", 1)[1] if scope_id.startswith("lz:") else ""
@@ -735,7 +404,6 @@ def _fake_iac_artifact(scope: str, scope_id: str, ctx: Dict[str, Any],
         {"path": "variables.tf",
          "content": 'variable "region" { default = "ap-bangkok" }\n'},
     ]
-    # guardrails derived from the blueprint's policy_as_code (the rule ids).
     policy = blueprint.get("policy_as_code") or []
     guardrails = []
     # pass the security rule; WARN on the cost rule so the gate is PASSABLE by
@@ -762,24 +430,6 @@ def _fake_iac_artifact(scope: str, scope_id: str, ctx: Dict[str, Any],
             "summary": f"IaC for {scope_id}"}
 
 
-async def _run_iac_emit(req: IacEmitReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running",
-                                     "summary": "emitting IaC + guardrails…"})
-    await asyncio.sleep(0.5)
-    art = _fake_iac_artifact(req.scope, req.scope_id, req.context, jid)
-    job.update(status="done", finished_at=_now(),
-               summary=f"iac-emit {req.scope_id}; pass={art['guardrail_pass']}")
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    await _push(f"/api/iac-artifacts/{req.scope_id}", art, method="PUT")
-
-
-# F10 — post-mig recommendations. The mock derives one rec of each kind from
-# the host's matched target + a canned metrics window. A real executor pulls
-# the now-running cloud resource's metrics from Cloud Monitor / Prometheus and
-# reasons about them; the SHAPE (right_size/reserved/anomaly/perf + savings) is
-# the contract.
 def _fake_postmig_recs(server_id: str, ctx: Dict[str, Any],
                        scan_id: str) -> List[Dict[str, Any]]:
     spec = (ctx.get("target") or {}).get("spec") or "SA2.LARGE8"
@@ -823,23 +473,6 @@ def _fake_postmig_recs(server_id: str, ctx: Dict[str, Any],
     return recs
 
 
-async def _run_postmig_optimize(req: PostMigReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running",
-                                     "summary": "analyzing post-mig metrics…"})
-    await asyncio.sleep(0.5)
-    recs = _fake_postmig_recs(req.server_id, req.context, jid)
-    job.update(status="done", finished_at=_now(),
-               summary=f"postmig-optimize {req.server_id}; {len(recs)} recs")
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    for r in recs:
-        await _push(f"/api/postmig-recs/{req.server_id}/{r['kind']}", r, method="PUT")
-
-
-# F11 — test case generation + run + compare. The mock emits plausible cases
-# from the CodeProfile summary, derives pass/fail from phase+target, and
-# produces one regression in the diff to exercise the cutover gate.
 def _fake_test_cases(app_id: str, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
     # The integration case name is STABLE (not framework-derived) so the gen,
     # run and compare steps all reference the same case — _fake_test_results and
@@ -862,23 +495,6 @@ def _fake_test_cases(app_id: str, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
     ]
 
 
-async def _run_test_gen(req: TestGenReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running",
-                                     "summary": "generating test cases…"})
-    await asyncio.sleep(0.4)
-    cases = _fake_test_cases(req.app_id, req.context)
-    for c in cases:
-        c["scan_id"] = jid
-    job.update(status="done", finished_at=_now(),
-               summary=f"test-gen {req.app_id}; {len(cases)} cases")
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    # push the list of cases
-    await _push(f"/api/test-cases/{req.app_id}", {"app_id": req.app_id,
-                 "cases": cases}, method="PUT")
-
-
 def _fake_test_results(app_id: str, phase: str, target: str) -> List[Dict[str, Any]]:
     """Derive pass/fail per case from the phase. The post phase flips ONE case
     to fail so the compare step has a regression to surface."""
@@ -893,53 +509,6 @@ def _fake_test_results(app_id: str, phase: str, target: str) -> List[Dict[str, A
             results.append({"case": name, "status": "pass", "duration_ms": 35,
                             "response_summary": "200 OK", "error": ""})
     return results
-
-
-async def _run_test_run(req: TestRunReq, jid: str, run_id: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running",
-                                     "summary": f"running tests (phase={req.phase})…"})
-    await asyncio.sleep(0.5)
-    results = _fake_test_results(req.app_id, req.phase, req.target)
-    passed = sum(1 for r in results if r["status"] == "pass")
-    failed = sum(1 for r in results if r["status"] == "fail")
-    run = {"id": run_id, "app_id": req.app_id, "phase": req.phase,
-           "target": req.target, "results": results,
-           "passed": passed, "failed": failed, "errors": 0,
-           "run_at": _now(), "scan_id": jid}
-    job.update(status="done", finished_at=_now(),
-               summary=f"test-run {req.app_id} ({req.phase}); "
-                       f"{passed} pass / {failed} fail")
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    await _push(f"/api/test-runs/{run_id}", run, method="PUT")
-
-
-async def _run_test_compare(req: TestCompareReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running",
-                                     "summary": "comparing pre vs post…"})
-    await asyncio.sleep(0.4)
-    # derive the diff from the canned pre/post results: one regression
-    diff = [
-        {"case": "health", "pre_status": "pass", "post_status": "pass",
-         "verdict": "pass", "detail": ""},
-        {"case": "app_index_200", "pre_status": "pass", "post_status": "pass",
-         "verdict": "pass", "detail": ""},
-        {"case": "regression_orders_total", "pre_status": "pass",
-         "post_status": "fail", "verdict": "regression",
-         "detail": "500 NPE in OrderService.total() — new failure post-cutover"},
-    ]
-    regressions = sum(1 for d in diff if d["verdict"] in ("regression", "new_failure"))
-    td = {"app_id": req.app_id, "pre_run_id": req.pre_run_id,
-          "post_run_id": req.post_run_id, "diff": diff,
-          "regressions": regressions, "scan_id": jid, "scanned_at": _now(),
-          "summary": f"{regressions} regression(s) on cutover"}
-    job.update(status="done", finished_at=_now(),
-               summary=f"test-compare {req.app_id}; {regressions} regression(s)")
-    await _push("/api/change-jobs", {**job, "status": "done"})
-    await _push(f"/api/test-diffs/{req.app_id}", td, method="PUT")
 
 
 def _fake_runtime_profile(app_id: str, server_id: str, scan_id: str) -> Dict[str, Any]:
@@ -974,29 +543,52 @@ def _fake_runtime_profile(app_id: str, server_id: str, scan_id: str) -> Dict[str
     }
 
 
-async def _run_runtime_containerize(req: RuntimeContainerizeReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running",
-                                      "summary": "inferring scaffold from runtime…"})
+# ---------------------------------------------------------------------------
+# per-kind workers — take the task payload dict + task id, push results back,
+# and return {summary, result_ref} so the poller can mark the task complete.
+# ---------------------------------------------------------------------------
+async def _run_scan(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    app_id = p.get("app_id", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "scan", p, "running",
+                                         summary="scanning…"))
+    await asyncio.sleep(0.5)  # pretend to work
+    profile = _fake_profile(app_id, p.get("repo_url", ""), p.get("branch", ""), tid)
+    summary = f"scanned {app_id}; 2 findings, pattern=replatform"
+    await _push("/api/change-jobs", _job(tid, "scan", p, "done",
+                                         summary=summary, finished_at=_now()))
+    await _push(f"/api/code-profiles/{app_id}", profile, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
+
+
+async def _run_db_scan(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    db = p.get("db_server_id", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "db-scan", p, "running",
+                                         summary="db-scanning…"))
     await asyncio.sleep(0.5)
-    prof = _fake_runtime_profile(req.app_id, req.server_id, jid)
-    patch = f"dockerfile-scaffold-{jid}" if req.mode == "plan" else f"dockerfile-pr-{jid}"
-    job.update(status="done", finished_at=_now(), patch_ref=patch,
-               summary=f"runtime-containerize {req.mode}: inferred Dockerfile scaffold")
-    await _push("/api/change-jobs", {**job, "status": "done", "patch_ref": patch})
-    await _push(f"/api/code-profiles/{req.app_id}", prof, method="PUT")
+    prof = _fake_db_profile(db, p.get("source_engine", ""), p.get("target_engine", ""), tid)
+    if (p.get("mode") or "assess").lower() == "convert":
+        prof["conversion"] = _fake_db_conversion(db, p.get("source_engine", ""),
+                                                 p.get("target_engine", ""), tid)
+    summary = (f"db-scan {db}; difficulty={prof['difficulty']}"
+               + (" (+conversion)" if "conversion" in prof else ""))
+    await _push("/api/change-jobs", _job(tid, "db-scan", p, "done",
+                                         summary=summary, finished_at=_now()))
+    await _push(f"/api/db-profiles/{db}", prof, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
 
 
-async def _run_modify(req: ModifyReq, jid: str):
-    job = _JOBS[jid]
-    job["status"] = "running"
-    await _push("/api/change-jobs", {**job, "status": "running", "summary": "modifying…"})
+async def _run_modify(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    app_id = p.get("app_id", "")
+    changes = p.get("changes") or []
+    mode = p.get("mode", "plan")
+    await _push("/api/change-jobs", _job(tid, "modify", p, "running", summary="modifying…"))
     await asyncio.sleep(0.5)
 
     # for any change the caller couldn't fully resolve (empty old/new), raise a
     # question — the operator answers, and a real executor would poll for it.
-    unresolved = [c for c in req.changes if not (c.get("old") or "").strip()
+    unresolved = [c for c in changes if not (c.get("old") or "").strip()
                  or not (c.get("new") or "").strip()]
     for c in unresolved:
         ctx = {"category": c.get("category"), "kind": c.get("kind"),
@@ -1005,21 +597,237 @@ async def _run_modify(req: ModifyReq, jid: str):
                "title": c.get("title", ""), "evidence": c.get("evidence", "")}
         prompt = (f"What should {c.get('old') or 'this token'!r} in "
                   f"{c.get('file')}:{c.get('line') or '?'} ({c.get('category')}) become?")
-        await _push(f"/api/apps/{req.app_id}/questions", {
-            "job_id": jid, "kind": "choice", "prompt": prompt,
+        await _push(f"/api/apps/{app_id}/questions", {
+            "job_id": tid, "kind": "choice", "prompt": prompt,
             "options": [c.get("new") or "${PLACEHOLDER}"], "context": ctx})
 
-    patch = f"mock-patch-{jid}" if req.mode == "plan" else f"mock-pr-{jid}"
-    job.update(status="done", finished_at=_now(), patch_ref=patch,
-               summary=f"modify {req.mode}: {len(req.changes)} change(s), "
-                       f"{len(unresolved)} question(s) raised")
-    await _push("/api/change-jobs", {**job, "status": "done", "patch_ref": patch})
+    patch = f"mock-patch-{tid}" if mode == "plan" else f"mock-pr-{tid}"
+    summary = f"modify {mode}: {len(changes)} change(s), {len(unresolved)} question(s) raised"
+    await _push("/api/change-jobs", _job(tid, "modify", p, "done",
+                                         summary=summary, patch_ref=patch,
+                                         finished_at=_now()))
+    return {"summary": summary, "result_ref": patch}
+
+
+async def _run_runtime_containerize(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    app_id = p.get("app_id", "")
+    cb = p.get("callback") or None
+    mode = p.get("mode", "plan")
+    await _push("/api/change-jobs", _job(tid, "runtime-containerize", p, "running",
+                                         summary="inferring scaffold from runtime…"))
+    await asyncio.sleep(0.5)
+    prof = _fake_runtime_profile(app_id, p.get("server_id", ""), tid)
+    patch = f"dockerfile-scaffold-{tid}" if mode == "plan" else f"dockerfile-pr-{tid}"
+    summary = f"runtime-containerize {mode}: inferred Dockerfile scaffold"
+    await _push("/api/change-jobs", _job(tid, "runtime-containerize", p, "done",
+                                         summary=summary, patch_ref=patch,
+                                         finished_at=_now()))
+    await _push(f"/api/code-profiles/{app_id}", prof, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": patch}
+
+
+async def _run_legacy_disposition(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    sid = p.get("server_id", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "legacy-disposition", p, "running",
+                                         summary="analyzing EOL workload…"))
+    await asyncio.sleep(0.4)
+    disp = _fake_legacy_disposition(sid, p.get("context") or {}, tid)
+    summary = f"legacy-disposition {sid}; {disp['disposition']}"
+    await _push("/api/change-jobs", _job(tid, "legacy-disposition", p, "done",
+                                         summary=summary, finished_at=_now()))
+    await _push(f"/api/legacy-dispositions/{sid}", disp, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
+
+
+async def _run_doc(p: Dict[str, Any], tid: str, doc_type: str, gen) -> Dict[str, Any]:
+    wave_id = p.get("wave_id", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, doc_type, p, "running",
+                                         summary=f"generating {doc_type}…"))
+    await asyncio.sleep(0.4)
+    md = gen(wave_id, p.get("context") or {})
+    summary = f"{doc_type} for {wave_id}"
+    await _push("/api/change-jobs", _job(tid, doc_type, p, "done",
+                                         summary=summary, finished_at=_now()))
+    slug = "as-built" if doc_type == "as_built" else doc_type
+    await _push(f"/api/docs/{slug}/{wave_id}", {
+        "doc_type": doc_type, "scope_id": wave_id, "doc_md": md,
+        "scan_id": tid, "scanned_at": _now(),
+        "summary": f"{doc_type} for wave {wave_id}",
+    }, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
+
+
+async def _run_iac_emit(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    scope_id = p.get("scope_id", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "iac-emit", p, "running",
+                                         summary="emitting IaC + guardrails…"))
+    await asyncio.sleep(0.5)
+    art = _fake_iac_artifact(p.get("scope", ""), scope_id, p.get("context") or {}, tid)
+    summary = f"iac-emit {scope_id}; pass={art['guardrail_pass']}"
+    await _push("/api/change-jobs", _job(tid, "iac-emit", p, "done",
+                                         summary=summary, finished_at=_now()))
+    await _push(f"/api/iac-artifacts/{scope_id}", art, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
+
+
+async def _run_postmig_optimize(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    sid = p.get("server_id", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "postmig-optimize", p, "running",
+                                         summary="analyzing post-mig metrics…"))
+    await asyncio.sleep(0.5)
+    recs = _fake_postmig_recs(sid, p.get("context") or {}, tid)
+    summary = f"postmig-optimize {sid}; {len(recs)} recs"
+    await _push("/api/change-jobs", _job(tid, "postmig-optimize", p, "done",
+                                         summary=summary, finished_at=_now()))
+    for r in recs:
+        await _push(f"/api/postmig-recs/{sid}/{r['kind']}", r, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
+
+
+async def _run_test_gen(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    app_id = p.get("app_id", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "test-gen", p, "running",
+                                         summary="generating test cases…"))
+    await asyncio.sleep(0.4)
+    cases = _fake_test_cases(app_id, p.get("context") or {})
+    for c in cases:
+        c["scan_id"] = tid
+    summary = f"test-gen {app_id}; {len(cases)} cases"
+    await _push("/api/change-jobs", _job(tid, "test-gen", p, "done",
+                                         summary=summary, finished_at=_now()))
+    await _push(f"/api/test-cases/{app_id}", {"app_id": app_id, "cases": cases},
+                method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
+
+
+async def _run_test_run(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    app_id = p.get("app_id", "")
+    phase = p.get("phase", "pre")
+    target = p.get("target", "")
+    run_id = p.get("run_id") or f"trun-{tid[5:]}"
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "test-run", p, "running",
+                                         summary=f"running tests (phase={phase})…"))
+    await asyncio.sleep(0.5)
+    results = _fake_test_results(app_id, phase, target)
+    passed = sum(1 for r in results if r["status"] == "pass")
+    failed = sum(1 for r in results if r["status"] == "fail")
+    run = {"id": run_id, "app_id": app_id, "phase": phase,
+           "target": target, "results": results,
+           "passed": passed, "failed": failed, "errors": 0,
+           "run_at": _now(), "scan_id": tid}
+    summary = f"test-run {app_id} ({phase}); {passed} pass / {failed} fail"
+    await _push("/api/change-jobs", _job(tid, "test-run", p, "done",
+                                         summary=summary, finished_at=_now()))
+    await _push(f"/api/test-runs/{run_id}", run, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": run_id}
+
+
+async def _run_test_compare(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    app_id = p.get("app_id", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "test-compare", p, "running",
+                                         summary="comparing pre vs post…"))
+    await asyncio.sleep(0.4)
+    # derive the diff from the canned pre/post results: one regression
+    diff = [
+        {"case": "health", "pre_status": "pass", "post_status": "pass",
+         "verdict": "pass", "detail": ""},
+        {"case": "app_index_200", "pre_status": "pass", "post_status": "pass",
+         "verdict": "pass", "detail": ""},
+        {"case": "regression_orders_total", "pre_status": "pass",
+         "post_status": "fail", "verdict": "regression",
+         "detail": "500 NPE in OrderService.total() — new failure post-cutover"},
+    ]
+    regressions = sum(1 for d in diff if d["verdict"] in ("regression", "new_failure"))
+    td = {"app_id": app_id, "pre_run_id": p.get("pre_run_id", ""),
+          "post_run_id": p.get("post_run_id", ""), "diff": diff,
+          "regressions": regressions, "scan_id": tid, "scanned_at": _now(),
+          "summary": f"{regressions} regression(s) on cutover"}
+    summary = f"test-compare {app_id}; {regressions} regression(s)"
+    await _push("/api/change-jobs", _job(tid, "test-compare", p, "done",
+                                         summary=summary, finished_at=_now()))
+    await _push(f"/api/test-diffs/{app_id}", td, method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
+
+
+# map task kind -> worker
+_WORKERS = {
+    "scan": _run_scan,
+    "comb": _run_scan,           # comb produces a profile too (same shape)
+    "modify": _run_modify,
+    "db-scan": _run_db_scan,
+    "runtime-containerize": _run_runtime_containerize,
+    "legacy-disposition": _run_legacy_disposition,
+    "cutover-playbook": lambda p, tid: _run_doc(p, tid, "cutover", _fake_cutover_playbook),
+    "as-built": lambda p, tid: _run_doc(p, tid, "as_built", _fake_as_built),
+    "iac-emit": _run_iac_emit,
+    "postmig-optimize": _run_postmig_optimize,
+    "test-gen": _run_test_gen,
+    "test-run": _run_test_run,
+    "test-compare": _run_test_compare,
+}
+
+
+async def _handle(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Dispatch a claimed task to its per-kind worker. Returns the worker's
+    ``{summary, result_ref}`` so the poller can mark the task complete."""
+    kind = task.get("kind", "")
+    worker = _WORKERS.get(kind)
+    p = task.get("payload") or {}
+    p = dict(p)
+    p.setdefault("created_at", task.get("created_at", _now()))
+    if worker is None:
+        raise ValueError(f"mock has no worker for task kind {kind!r}")
+    return await worker(p, task["task_id"])
+
+
+async def _complete(tid: str, status: str, *, summary: str = "",
+                    result_ref: str = "", error: str = "") -> None:
+    await _post(f"/api/executor/tasks/{tid}/complete", {
+        "status": status, "summary": summary, "result_ref": result_ref,
+        "error": error})
+
+
+async def poll_once() -> bool:
+    """Claim + run one task. Returns True if a task was handled, False if idle.
+    On a worker error the task is marked ``error`` (never left claimed)."""
+    task = await _post("/api/executor/tasks/claim", {})
+    if not task or not task.get("task_id"):
+        return False
+    tid = task["task_id"]
+    try:
+        out = await _handle(task)
+        await _complete(tid, "done", summary=out.get("summary", ""),
+                        result_ref=out.get("result_ref", ""))
+    except Exception as e:  # never strand a claimed task
+        print(f"[mock] task {tid} failed: {e!r}")
+        await _complete(tid, "error", error=str(e))
+    return True
+
+
+async def run_forever() -> None:
+    """The poll loop ``idc executor-mock`` runs: claim → handle → complete,
+    sleeping ``IDC_MOCK_POLL_INTERVAL`` s when idle."""
+    print(f"[mock] pulling tasks from {CALLBACK}/api/executor/tasks/claim "
+          f"(token {'set' if TOKEN else 'NOT set'})")
+    while True:
+        try:
+            handled = await poll_once()
+        except Exception as e:  # a bug in the poller itself shouldn't kill it
+            print(f"[mock] poll_once error: {e!r}")
+            handled = False
+        if not handled:
+            await asyncio.sleep(POLL_INTERVAL)
 
 
 def main():
-    import uvicorn
-    uvicorn.run("idc.executor_mock.app:app", host="0.0.0.0", port=8090,
-                reload=False, log_level="info")
+    asyncio.run(run_forever())
 
 
 if __name__ == "__main__":

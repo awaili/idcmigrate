@@ -36,7 +36,7 @@ from ..core.models import (ALL_QUESTION_KINDS, ChangeJob, CodeProfile, DBConvers
                            TEST_KINDS, TEST_PHASES, TV_VERDICTS,
                            Question, ScanFinding, _now)
 from ..llm import get_client
-from ..agent import ExecutorError, build_context, get_executor_client, run_agent
+from ..agent import build_context, get_executor_client, run_agent
 from ..core.codeintel import app_targets, build_change_spec, resolve_value
 from ..core.match import warranty_bucket
 from ..core.eol import os_eol_bucket
@@ -79,10 +79,14 @@ def _web_auth_password() -> str:
 
 
 def _executor_bearer_ok(authorization: str) -> bool:
-    tok = _executor_settings().executor_token
-    if not tok or not authorization or not authorization.lower().startswith("bearer "):
+    # any registered executor may push back to idc-migrate (each has its own
+    # token); accept the bearer if it matches one of them.
+    from ..agent import registry
+    if not authorization or not authorization.lower().startswith("bearer "):
         return False
-    return secrets.compare_digest(authorization.split(" ", 1)[1].strip(), tok)
+    tok = authorization.split(" ", 1)[1].strip()
+    return any(secrets.compare_digest(tok, t)
+               for t in registry.valid_tokens(STORE, settings))
 
 
 # crude in-memory login throttle: >10 failures per IP in 60s -> 429. Process-
@@ -126,9 +130,9 @@ def _ws_session_authed(ws: WebSocket) -> bool:
 _PUBLIC_PREFIXES = ("/assets/",)
 _PUBLIC_PATHS = {"/login", "/logout", "/executor", "/favicon.ico"}
 # Paths where the executor bearer token is honored (the executor contract
-# surface: push callbacks + read-only context pulls). Everywhere else under
-# /api/ requires a browser session — so a leaked bearer can't change the
-# password, rewrite executor config, trigger scans, or drive migration jobs.
+# surface: push callbacks, read-only context pulls, and pull-dispatch). Everywhere
+# else under /api/ requires a browser session — so a leaked bearer can't change
+# the password, rewrite executor config, trigger scans, or drive migration jobs.
 _BEARER_PREFIXES = ("/api/code-profiles", "/api/db-profiles", "/api/change-jobs",
                     "/api/workloads/", "/api/apps/", "/api/questions",
                     # F5/F7/F9/F10/F11 executor push-back callbacks (PUT scoped).
@@ -137,7 +141,10 @@ _BEARER_PREFIXES = ("/api/code-profiles", "/api/db-profiles", "/api/change-jobs"
                     # through on the scoped PUT routes it pushes to.
                     "/api/legacy-dispositions/", "/api/docs/", "/api/iac-artifacts/",
                     "/api/postmig-recs/", "/api/test-cases/", "/api/test-runs/",
-                    "/api/test-diffs/")
+                    "/api/test-diffs/",
+                    # pull-dispatch: the executor pulls work + reports completion
+                    # (it exposes nothing, so this is its only way in).
+                    "/api/executor/tasks")
 
 
 async def _auth_dispatch(request: Request, call_next):
@@ -193,32 +200,55 @@ app.add_middleware(BaseHTTPMiddleware, dispatch=_nocache_assets)
 # ENABLED/TIMEOUT), but the web "Manage executor" panel can override it without
 # a redeploy. Overrides persist in the system_config table so they survive
 # restart; on startup we layer DB values over the env defaults.
-_EXEC_CFG_KEYS = ("executor_url", "executor_token", "executor_enabled", "executor_timeout")
 _EXEC_TRUTHY = ("1", "true", "yes", "on")
 
 
-def _executor_settings():
-    """A Settings copy with the executor fields overlaid from DB system_config
-    (operator-managed via /api/executor/config) on top of the CURRENT env
-    Settings. Read live on every call — no stale cache — so test monkeypatches
-    of ``settings.executor_*`` and runtime DB PUTs both take effect instantly.
-    The DB round-trip is fine: executor calls are infrequent operator actions /
-    push callbacks, not hot paths."""
-    import dataclasses
-    base = {k: getattr(settings, k) for k in _EXEC_CFG_KEYS}
-    ov = STORE.get_config_map(_EXEC_CFG_KEYS)
-    if "executor_url" in ov:
-        base["executor_url"] = ov["executor_url"]
-    if "executor_token" in ov:
-        base["executor_token"] = ov["executor_token"]
-    if "executor_enabled" in ov:
-        base["executor_enabled"] = str(ov["executor_enabled"]).strip().lower() in _EXEC_TRUTHY
-    if "executor_timeout" in ov:
-        try:
-            base["executor_timeout"] = int(ov["executor_timeout"])
-        except (TypeError, ValueError):
-            pass
-    return dataclasses.replace(settings, **base)
+def _executor_settings(executor_id: Optional[str] = None):
+    """Resolve the selected executor's Settings: env ``IDC_EXECUTOR_*`` overlaid
+    with the DB config (operator-managed via /api/executor/config for the
+    default, /api/executors/{id} for named ones). ``executor_id`` None/''/
+    'default' → the default executor; a named id → that registry entry (raises
+    KeyError if absent). ``public_url`` is global (one push target for every
+    executor). Read live on every call — no stale cache — so test monkeypatches
+    of ``settings.executor_*`` and runtime DB PUTs both take effect instantly."""
+    from ..agent import registry
+    return registry.resolve(STORE, settings, executor_id)
+
+
+def _resolve_executor(executor_id: Optional[str]):
+    """Same as _executor_settings but maps a missing named executor to a 404
+    (used by every trigger endpoint)."""
+    try:
+        return _executor_settings(executor_id)
+    except KeyError:
+        raise HTTPException(404, f"no such executor: {executor_id!r}")
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC ``...Z`` timestamp (codebase convention)."""
+    from datetime import datetime
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def _enqueue(kind: str, payload: Dict[str, Any],
+             executor_id: Optional[str]) -> Dict[str, Any]:
+    """Enqueue a task for an executor to pull (the executor exposes nothing, so
+    idc-migrate cannot push to it — see docs/agent-executor.md). ``executor_id``
+    None/''/'default' → the pool (any executor may claim); a named id targets
+    that executor. ``payload`` carries the work + the feedback ``callback`` URL
+    (built from IDC_PUBLIC_URL; empty → the executor falls back to its own
+    IDC_CALLBACK_BASE). Returns ``{task_id, job_id, status:"pending"}``
+    (``job_id`` is an alias for back-compat with the old push-trigger response)."""
+    from ..core.models import _new_id
+    from ..core.db import TASK_KINDS
+    if kind not in TASK_KINDS:
+        raise ValueError(f"unknown task kind: {kind!r}")
+    eid = (executor_id or "").strip()
+    # empty -> pool (any registered executor may claim); "default" or a named
+    # id targets that executor specifically.
+    tid = _new_id("tsk")
+    STORE.enqueue_task(tid, kind, payload, eid or None, _now_iso())
+    return {"task_id": tid, "job_id": tid, "status": "pending"}
 
 # Landing dir for uploaded source files (CSV/xlsx/JSON). Persisted so a later
 # non-upload ingest can re-read them if the operator points IDC_*_PATH here.
@@ -702,15 +732,19 @@ async def ingest_upload(source: str = Form(...), file: UploadFile = File(...)):
 #   push direction (executor → idc-migrate) is bearer-authed.
 # ---------------------------------------------------------------------------
 def _check_executor_auth(authorization: Optional[str]):
-    """Validate the bearer token against the configured executor token (live
-    config, so a token change via /api/executor/config takes effect immediately)."""
-    token = _executor_settings().executor_token
-    if not token:
+    """Validate the bearer token against ANY registered executor's token (live
+    config, so a token change via /api/executor/config or /api/executors/{id}
+    takes effect immediately). With multiple executors configured, each pushes
+    back with its own token; idc-migrate accepts any of them."""
+    from ..agent import registry
+    tokens = registry.valid_tokens(STORE, settings)
+    if not tokens:
         raise HTTPException(401, "IDC_EXECUTOR_TOKEN not configured; "
                                   "set it to accept executor push callbacks")
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing bearer token")
-    if not secrets.compare_digest(authorization.split(" ", 1)[1].strip(), token):
+    tok = authorization.split(" ", 1)[1].strip()
+    if not any(secrets.compare_digest(tok, t) for t in tokens):
         raise HTTPException(401, "invalid executor token")
 
 
@@ -995,6 +1029,7 @@ def delete_legacy_disposition(server_id: str, authorization: Optional[str] = Hea
 class LegacyDispositionReq(BaseModel):
     server_id: str
     context: Dict[str, Any] = {}
+    executor_id: Optional[str] = None
 
 
 @app.post("/api/legacy-disposition")
@@ -1003,15 +1038,13 @@ def legacy_disposition_trigger(req: LegacyDispositionReq):
     recommend containerize / re-platform / rewrite / retain (F7). The executor
     pushes a LegacyDisposition back to PUT /api/legacy-dispositions/{server_id};
     the next rebuild folds it into the host's match via apply_os_eol."""
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
-    try:
-        return ec.legacy_disposition(req.server_id, req.context)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    ec = get_executor_client(s)
+    payload = {"server_id": req.server_id, "context": req.context,
+               "callback": ec.cb(f"/api/legacy-dispositions/{req.server_id}")}
+    return _enqueue("legacy-disposition", payload, req.executor_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1105,7 @@ def delete_doc_artifact(doc_type: str, scope_id: str,
 class DocGenReq(BaseModel):
     wave_id: str
     context: Dict[str, Any] = {}
+    executor_id: Optional[str] = None
 
 
 def _wave_doc_context(wave_id: str) -> Dict[str, Any]:
@@ -1165,34 +1199,30 @@ def _wave_as_built_context(wave_id: str) -> Dict[str, Any]:
 def cutover_playbook_trigger(req: DocGenReq):
     """Ask the executor to generate a per-wave cutover playbook (F9). The
     executor pushes a DocArtifact back to PUT /api/docs/cutover/{wave_id}."""
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    ec = get_executor_client(s)
     # F9 — the backend builds the real wave context (members / risk / downtime
     # window) so the executor's doc is grounded, not empty.
     ctx = req.context or _wave_doc_context(req.wave_id)
-    try:
-        return ec.cutover_playbook(req.wave_id, ctx)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    payload = {"wave_id": req.wave_id, "context": ctx,
+               "callback": ec.cb(f"/api/docs/cutover/{req.wave_id}")}
+    return _enqueue("cutover-playbook", payload, req.executor_id)
 
 
 @app.post("/api/as-built")
 def as_built_trigger(req: DocGenReq):
     """Ask the executor to generate a per-wave as-built doc (F9). The executor
     pushes a DocArtifact back to PUT /api/docs/as-built/{wave_id}."""
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    ec = get_executor_client(s)
     ctx = req.context or _wave_as_built_context(req.wave_id)
-    try:
-        return ec.as_built(req.wave_id, ctx)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    payload = {"wave_id": req.wave_id, "context": ctx,
+               "callback": ec.cb(f"/api/docs/as-built/{req.wave_id}")}
+    return _enqueue("as-built", payload, req.executor_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1242,6 +1272,7 @@ class IacEmitReq(BaseModel):
     scope: str
     scope_id: str
     context: Dict[str, Any] = {}
+    executor_id: Optional[str] = None
 
 
 @app.post("/api/iac-emit")
@@ -1251,17 +1282,15 @@ def iac_emit_trigger(req: IacEmitReq):
     (scope_id = wl:<server_id>, context = match). The executor pushes an
     IaCArtifact back to PUT /api/iac-artifacts/{scope_id}; check_lz_gate then
     blocks workload launch until guardrails pass."""
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    ec = get_executor_client(s)
     if req.scope not in IAC_SCOPES:
         raise HTTPException(400, f"scope must be one of {IAC_SCOPES}")
-    try:
-        return ec.iac_emit(req.scope, req.scope_id, req.context)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    payload = {"scope": req.scope, "scope_id": req.scope_id, "context": req.context,
+               "callback": ec.cb(f"/api/iac-artifacts/{req.scope_id}")}
+    return _enqueue("iac-emit", payload, req.executor_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1316,6 +1345,7 @@ def postmig_savings():
 class PostMigReq(BaseModel):
     server_id: str
     context: Dict[str, Any] = {}
+    executor_id: Optional[str] = None
 
 
 @app.post("/api/postmig-optimize")
@@ -1323,15 +1353,16 @@ def postmig_optimize_trigger(req: PostMigReq):
     """Ask the executor to analyze a finalized host's post-mig metrics (F10).
     The executor pushes PostMigRecommendation records back to
     PUT /api/postmig-recs/{server_id}/{kind}."""
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
-    try:
-        return ec.postmig_optimize(req.server_id, req.context)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    ec = get_executor_client(s)
+    # postmig pushes one PostMigRecommendation per kind to
+    # /api/postmig-recs/{server_id}/{kind} — the {kind} isn't known at trigger
+    # time, so the per-task callback (a single full path) can't cover it. Left
+    # empty; the executor uses its own callback-base env (IDC_CALLBACK_BASE).
+    payload = {"server_id": req.server_id, "context": req.context, "callback": ""}
+    return _enqueue("postmig-optimize", payload, req.executor_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1436,21 +1467,20 @@ def put_test_diff(app_id: str, body: dict,
 class TestGenReqAPI(BaseModel):
     app_id: str
     context: Dict[str, Any] = {}
+    executor_id: Optional[str] = None
 
 
 @app.post("/api/test-gen")
 def test_gen_trigger(req: TestGenReqAPI):
     """Ask the executor to generate test cases (F11). The executor pushes the
     cases back to PUT /api/test-cases/{app_id}."""
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
-    try:
-        return ec.test_gen(req.app_id, req.context)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    ec = get_executor_client(s)
+    payload = {"app_id": req.app_id, "context": req.context,
+               "callback": ec.cb(f"/api/test-cases/{req.app_id}")}
+    return _enqueue("test-gen", payload, req.executor_id)
 
 
 class TestRunReqAPI(BaseModel):
@@ -1458,32 +1488,38 @@ class TestRunReqAPI(BaseModel):
     phase: str
     target: str
     context: Dict[str, Any] = {}
+    executor_id: Optional[str] = None
 
 
 @app.post("/api/test-run")
 def test_run_trigger(req: TestRunReqAPI):
-    """Ask the executor to run the app's tests against a target (F11). phase =
-    pre (baseline) / post (after cutover). The executor pushes a TestRun back to
-    PUT /api/test-runs/{run_id}."""
-    if not _executor_settings().executor_enabled:
+    """Enqueue a test-run task (F11). phase = pre (baseline) / post (after
+    cutover). The executor pulls the task and pushes a TestRun back to
+    PUT /api/test-runs/{run_id} (using its own IDC_CALLBACK_BASE)."""
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
     if req.phase not in TEST_PHASES:
         raise HTTPException(400, f"phase must be one of {TEST_PHASES}")
+    # pre-mint the run_id so idc-migrate knows which TestRun the async push will
+    # land under before the executor's callback arrives (contract §1.11). Baked
+    # into the task payload; the executor pushes back under it.
     from ..core.models import _new_id
     run_id = _new_id("trun")
-    try:
-        return ec.test_run(req.app_id, req.phase, req.target, req.context)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    # test-run pushes to /api/test-runs/{run_id} (IDC_CALLBACK_BASE — {run_id} is
+    # in the path, not a fixed per-task callback), so callback is left empty.
+    payload = {"app_id": req.app_id, "phase": req.phase, "target": req.target,
+               "context": req.context, "run_id": run_id, "callback": ""}
+    res = _enqueue("test-run", payload, req.executor_id)
+    res["run_id"] = run_id
+    return res
 
 
 class TestCompareReqAPI(BaseModel):
     app_id: str
     pre_run_id: str
     post_run_id: str
+    executor_id: Optional[str] = None
 
 
 @app.post("/api/test-compare")
@@ -1491,15 +1527,14 @@ def test_compare_trigger(req: TestCompareReqAPI):
     """Ask the executor to diff pre vs post (F11). The executor pushes a
     TestDiff back to PUT /api/test-diffs/{app_id}; the test_regression gate
     then blocks finalize on regressions."""
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
-    try:
-        return ec.test_compare(req.app_id, req.pre_run_id, req.post_run_id)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    ec = get_executor_client(s)
+    payload = {"app_id": req.app_id, "pre_run_id": req.pre_run_id,
+               "post_run_id": req.post_run_id,
+               "callback": ec.cb(f"/api/test-diffs/{req.app_id}")}
+    return _enqueue("test-compare", payload, req.executor_id)
 
 
 @app.get("/api/change-jobs")
@@ -1529,6 +1564,8 @@ class ExecutorScanReq(BaseModel):
     action: Literal["scan", "comb", "modify"] = "scan"
     mode: Literal["plan", "execute"] = "plan"   # for modify
     scope: Optional[List[str]] = None
+    # which named executor to drive (None / "default" → the default executor).
+    executor_id: Optional[str] = None
     # for modify: operator-supplied old→new value map (e.g.
     # {"10.0.4.20": "${DB_HOST}", "hunter2": "${DB_PASSWORD}"}). idc-migrate
     # folds these into the concrete change list it builds from the app's
@@ -1551,6 +1588,7 @@ class ExecutorConfigReq(BaseModel):
     token: Optional[str] = None
     enabled: Optional[bool] = None
     timeout: Optional[int] = None
+    public_url: Optional[str] = None
 
 
 def _executor_config_out(s=None) -> dict:
@@ -1564,6 +1602,7 @@ def _executor_config_out(s=None) -> dict:
         "token_set": bool(s.executor_token),
         "enabled": bool(s.executor_enabled),
         "timeout": int(s.executor_timeout or 0),
+        "public_url": s.public_url or "",
         "status": status,
     }
 
@@ -1595,6 +1634,11 @@ def executor_put_config(req: ExecutorConfigReq):
         if not (1 <= req.timeout <= 3600):
             raise HTTPException(400, "timeout must be between 1 and 3600 seconds")
         STORE.set_config("executor_timeout", str(int(req.timeout)))
+    if req.public_url is not None:
+        u = req.public_url.strip()
+        if u and not (u.startswith("http://") or u.startswith("https://")):
+            raise HTTPException(400, "public_url must be http(s)://...")
+        STORE.set_config("public_url", u)
     return _executor_config_out()
 
 
@@ -1616,69 +1660,159 @@ def executor_test_config(req: ExecutorConfigReq):
     return executor_status(s)
 
 
+# ---------------------------------------------------------------------------
+# Named-executor registry — drive N external executors, not just the default.
+# The default (id="default") is managed via /api/executor/config above; named
+# ones via this surface. All push back to the same idc-migrate public URL and
+# authenticate with their own token (any registered token validates).
+# ---------------------------------------------------------------------------
+def _executor_with_status(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Public registry entry: strip the token, attach a live /health probe."""
+    from ..agent import registry, executor_status
+    out = registry.public_view(entry)
+    try:
+        out["status"] = executor_status(registry.resolve(STORE, settings, entry["id"]))
+    except Exception as e:  # never let a probe error sink the list
+        out["status"] = {"reachable": False, "detail": f"probe error: {e!r}"}
+    return out
+
+
+@app.get("/api/executors")
+def list_executors_endpoint():
+    """All configured executors (default first) with a per-executor /health
+    probe. Token is never returned (only ``token_set``)."""
+    from ..agent import registry
+    return [_executor_with_status(e)
+            for e in registry.list_executors(STORE, settings)]
+
+
+class ExecutorUpsertReq(BaseModel):
+    # All optional except url; only provided fields change on update. Token is
+    # kept as-is when not supplied (so a re-save to toggle enabled doesn't drop
+    # the secret — same masking convention as the default executor).
+    url: Optional[str] = None
+    token: Optional[str] = None
+    enabled: Optional[bool] = None
+    timeout: Optional[int] = None
+
+
+@app.put("/api/executors/{executor_id}")
+def upsert_executor(executor_id: str, req: ExecutorUpsertReq):
+    """Add or update a NAMED executor (id != default). The default executor is
+    managed via /api/executor/config, not here. Persists to the ``executors``
+    JSON config row; takes effect immediately (read live)."""
+    from ..agent import registry
+    eid = executor_id.strip()
+    if eid == registry.DEFAULT_ID:
+        raise HTTPException(400, "the default executor is managed via /api/executor/config")
+    # build the entry from the existing one (if any) overlaid with provided fields
+    existing = next((e for e in registry.list_executors(STORE, settings)
+                     if e["id"] == eid), None) or {"id": eid, "url": "", "token": "",
+                                                    "enabled": True, "timeout": 600}
+    entry = dict(existing)
+    if req.url is not None:
+        entry["url"] = req.url
+    if req.token is not None and req.token != "":
+        entry["token"] = req.token
+    if req.enabled is not None:
+        entry["enabled"] = req.enabled
+    if req.timeout is not None:
+        entry["timeout"] = req.timeout
+    try:
+        saved = registry.upsert(STORE, entry)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _executor_with_status(saved)
+
+
+@app.delete("/api/executors/{executor_id}")
+def delete_executor(executor_id: str):
+    """Remove a NAMED executor. The default can't be deleted."""
+    from ..agent import registry
+    try:
+        removed = registry.delete(STORE, executor_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not removed:
+        raise HTTPException(404, f"no such executor: {executor_id!r}")
+    return {"id": executor_id, "deleted": True}
+
+
+@app.post("/api/executors/{executor_id}/test")
+def test_executor(executor_id: str):
+    """Probe one executor's /health (no persistence)."""
+    from ..agent import registry, executor_status
+    try:
+        s = registry.resolve(STORE, settings, executor_id)
+    except KeyError:
+        raise HTTPException(404, f"no such executor: {executor_id!r}")
+    return executor_status(s)
+
+
 @app.post("/api/executor/trigger")
 def executor_trigger(req: ExecutorScanReq):
-    """Ask the external executor to scan/comb/modify an app's repo (async).
+    """Enqueue a scan/comb/modify task for an executor to pull (async).
 
-    Returns the executor's ``{job_id, status}``. The executor calls back into
+    Returns ``{task_id, job_id, status:"pending"}``. An executor pulls the task
+    via ``POST /api/executor/tasks/claim`` and pushes results back into
     ``PUT /api/code-profiles/{app_id}`` / ``POST /api/change-jobs`` when done.
 
     For ``modify``: idc-migrate builds a concrete change list from the app's
-    stored ``CodeProfile`` (joined with the operator ``overrides``) and sends
-    it, so the executor knows *which file/line, which literal, which value* —
-    it does not re-scan or guess. If no profile exists yet the change list is
-    empty and the spec's ``notes`` tell the executor to scan first.
+    stored ``CodeProfile`` (joined with the operator ``overrides``) and bakes it
+    into the task payload, so the executor knows *which file/line, which
+    literal, which value* — it does not re-scan or guess. If no profile exists
+    yet the change list is empty and the spec's ``notes`` tell the executor to
+    scan first.
     """
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
-    # The callback base is configured on the executor side (it pushes back to
-    # this server's /api/code-profiles + /api/change-jobs endpoints).
-    try:
-        if req.action == "modify":
-            profile = STORE.get_code_profile(req.app_id)
-            # F9 — runtime-derived profiles (no source) must be operator-confirmed
-            # before the executor writes the inferred scaffold. In plan mode the
-            # scaffold is previewed freely; in execute mode the confirm-gate fires
-            # (a Question is raised; the operator answers, then re-triggers).
-            from ..core.codeintel import is_runtime_derived, runtime_confirm_question, SOURCE_RUNTIME
-            if is_runtime_derived(profile) and req.mode == "execute":
-                # The confirm-gate is a one-shot: once the operator has answered
-                # "confirmed — proceed with modify" we must NOT raise 409 again
-                # (otherwise every re-trigger mints a new question and the
-                # operator can never reach ec.modify()).
-                already_confirmed = any(
-                    q.app_id == req.app_id
-                    and (q.context or {}).get("source") == SOURCE_RUNTIME
-                    and q.status == "answered"
-                    and str(q.answer or "").lower().startswith("confirmed")
-                    for q in STORE.list_questions(app_id=req.app_id)
-                )
-                if not already_confirmed:
-                    q = runtime_confirm_question(req.app_id, profile)
-                    if q is not None:
-                        STORE.upsert_question(q)
-                        raise HTTPException(409, f"runtime-derived scaffold requires "
-                                                   f"operator confirmation (question {q.id}); "
-                                                   f"answer it then re-trigger modify")
-            spec = build_change_spec(profile, scope=req.scope,
-                                     overrides=req.overrides)
-            res = ec.modify(req.app_id, req.repo_url, req.branch,
-                             mode=req.mode, scope=req.scope,
-                             changes=spec.changes, notes=spec.notes)
-            # surface the concrete change list + notes back to the operator so
-            # they can see exactly what was sent to the executor (audit/preview).
-            if isinstance(res, dict):
-                res.setdefault("changes", spec.changes)
-                res.setdefault("notes", spec.notes)
-            return res
-        if req.action == "comb":
-            return ec.comb(req.app_id, req.repo_url, req.branch)
-        return ec.scan(req.app_id, req.repo_url, req.branch)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    ec = get_executor_client(s)
+    if req.action == "modify":
+        profile = STORE.get_code_profile(req.app_id)
+        # F9 — runtime-derived profiles (no source) must be operator-confirmed
+        # before the executor writes the inferred scaffold. In plan mode the
+        # scaffold is previewed freely; in execute mode the confirm-gate fires
+        # (a Question is raised; the operator answers, then re-triggers).
+        from ..core.codeintel import is_runtime_derived, runtime_confirm_question, SOURCE_RUNTIME
+        if is_runtime_derived(profile) and req.mode == "execute":
+            # The confirm-gate is a one-shot: once the operator has answered
+            # "confirmed — proceed with modify" we must NOT raise 409 again
+            # (otherwise every re-trigger mints a new question and the
+            # operator can never reach the enqueue).
+            already_confirmed = any(
+                q.app_id == req.app_id
+                and (q.context or {}).get("source") == SOURCE_RUNTIME
+                and q.status == "answered"
+                and str(q.answer or "").lower().startswith("confirmed")
+                for q in STORE.list_questions(app_id=req.app_id)
+            )
+            if not already_confirmed:
+                q = runtime_confirm_question(req.app_id, profile)
+                if q is not None:
+                    STORE.upsert_question(q)
+                    raise HTTPException(409, f"runtime-derived scaffold requires "
+                                               f"operator confirmation (question {q.id}); "
+                                               f"answer it then re-trigger modify")
+        spec = build_change_spec(profile, scope=req.scope,
+                                 overrides=req.overrides)
+        # modify pushes only the change-jobs heartbeat (no profile); it uses the
+        # executor's IDC_CALLBACK_BASE, so callback is left empty.
+        payload: Dict[str, Any] = {
+            "app_id": req.app_id, "repo_url": req.repo_url, "branch": req.branch,
+            "mode": req.mode, "scope": req.scope or [],
+            "changes": spec.changes, "notes": spec.notes, "callback": ""}
+        res = _enqueue("modify", payload, req.executor_id)
+        # surface the concrete change list + notes back to the operator so they
+        # can see exactly what was enqueued for the executor (audit/preview).
+        res["changes"] = spec.changes
+        res["notes"] = spec.notes
+        return res
+    # scan / comb push a CodeProfile back to /api/code-profiles/{app_id}.
+    cb = ec.cb(f"/api/code-profiles/{req.app_id}")
+    payload = {"app_id": req.app_id, "repo_url": req.repo_url,
+               "branch": req.branch, "callback": cb}
+    return _enqueue(req.action, payload, req.executor_id)
 
 
 class DBScanReq(BaseModel):
@@ -1686,6 +1820,7 @@ class DBScanReq(BaseModel):
     source_engine: str = ""    # oracle / sqlserver / mysql
     target_engine: str = ""   # tdsql / cdb_mysql / postgresql
     mode: Literal["assess", "convert"] = "assess"   # F6 — convert also emits DDL + report
+    executor_id: Optional[str] = None
 
 
 @app.post("/api/db-scan")
@@ -1696,16 +1831,14 @@ def db_scan_trigger(req: DBScanReq):
     back to ``PUT /api/db-profiles/{db_server_id}``. Rebuild then folds the
     grade into the host's match (confidence dip / replatform force) + wave risk.
     """
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
-    try:
-        return ec.db_scan(req.db_server_id, req.source_engine, req.target_engine,
-                          mode=req.mode)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    ec = get_executor_client(s)
+    payload = {"db_server_id": req.db_server_id, "source_engine": req.source_engine,
+               "target_engine": req.target_engine, "mode": req.mode,
+               "callback": ec.cb(f"/api/db-profiles/{req.db_server_id}")}
+    return _enqueue("db-scan", payload, req.executor_id)
 
 
 class RuntimeContainerizeReq(BaseModel):
@@ -1713,6 +1846,7 @@ class RuntimeContainerizeReq(BaseModel):
     server_id: str                 # host whose runtime inventory we infer from
     inventory: Dict[str, Any] = {}  # process / port / software (Zabbix/Prometheus)
     mode: Literal["plan", "execute"] = "plan"   # plan (dry-run) | execute (write)
+    executor_id: Optional[str] = None
 
 
 @app.get("/api/runtime-inventory/{server_id}")
@@ -1744,11 +1878,10 @@ def runtime_containerize_trigger(req: RuntimeContainerizeReq):
     When ``inventory`` is empty/partial, idc-migrate auto-gathers it from the
     server's match port + role/os + telemetry (see ``GET /api/runtime-inventory``)
     and merges the operator-provided fields on top (operator wins)."""
-    if not _executor_settings().executor_enabled:
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
         raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    ec = get_executor_client(s)
     # auto-gather + merge when the operator didn't supply a full inventory
     from ..core.runtime_inventory import gather_runtime_inventory, merge_inventory
     inventory = dict(req.inventory or {})
@@ -1756,34 +1889,181 @@ def runtime_containerize_trigger(req: RuntimeContainerizeReq):
     # gets a consistent shape regardless of how the form sent it
     sw = inventory.get("software")
     if isinstance(sw, str):
-        inventory["software"] = [s.strip() for s in sw.split(",") if s.strip()]
+        inventory["software"] = [x.strip() for x in sw.split(",") if x.strip()]
     # only hit telemetry (Zabbix/Prometheus round-trips) when the operator didn't
     # supply ports — the main runtime signal. Other gaps are filled from match/role.
+    srv = None
     if not inventory.get("ports"):
-        s = next((x for x in STORE.list_all_servers() if x.id == req.server_id), None)
-        if s:
+        srv = next((x for x in STORE.list_all_servers() if x.id == req.server_id), None)
+        if srv:
             matches = STORE.list_matches()
             m = next((x for x in matches if x.server_id == req.server_id), None)
-            profile = STORE.get_code_profile((s.app_ids or [""])[0]) if s.app_ids else None
-            gathered = gather_runtime_inventory(s, m, profile=profile, settings=settings)
+            profile = STORE.get_code_profile((srv.app_ids or [""])[0]) if srv.app_ids else None
+            gathered = gather_runtime_inventory(srv, m, profile=profile, settings=settings)
             inventory = merge_inventory(gathered, inventory)
-    try:
-        return ec.runtime_containerize(req.app_id, req.server_id,
-                                        inventory=inventory, mode=req.mode)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+    payload = {"app_id": req.app_id, "server_id": req.server_id,
+               "inventory": inventory, "mode": req.mode,
+               "callback": ec.cb(f"/api/code-profiles/{req.app_id}")}
+    return _enqueue("runtime-containerize", payload, req.executor_id)
 
 
 @app.get("/api/executor/jobs/{job_id}")
 def executor_job(job_id: str):
-    """Proxy a job-status poll to the executor."""
-    ec = get_executor_client(_executor_settings())
-    if not ec.configured:
-        raise HTTPException(409, "IDC_EXECUTOR_URL not configured")
+    """Look up a dispatched task's status. In pull mode the executor exposes
+    nothing, so there is no proxy poll — the task row in the queue is the
+    authoritative status (pending/claimed/running/done/error)."""
+    t = STORE.get_task(job_id)
+    if not t:
+        raise HTTPException(404, f"no such task: {job_id}")
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Pull dispatch — the executor pulls work from idc-migrate (it exposes nothing
+# to the network, so idc-migrate cannot push to it). The executor authenticates
+# with its bearer token; the token resolves to an executor id, which both
+# identifies the claimer (claimed_by) and gates routing (a task targets one
+# executor or the pool). See docs/agent-executor.md §2.2.
+# ---------------------------------------------------------------------------
+EXECUTOR_LEASE_SECONDS = 900   # 15-min claim lease; expired -> requeue to pending
+
+
+def _caller_executor_id(authorization: Optional[str]) -> str:
+    """Resolve the request's bearer token to an executor id. 401 if the token is
+    missing or matches no registered executor."""
+    from ..agent import registry
+    auth = authorization or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, "missing bearer token")
+    tok = auth.split(" ", 1)[1].strip()
+    eid = registry.resolve_by_token(STORE, settings, tok)
+    if not eid:
+        raise HTTPException(401, "invalid executor token")
+    return eid
+
+
+class ClaimReq(BaseModel):
+    lease_seconds: Optional[int] = None   # override the default claim lease
+
+
+@app.post("/api/executor/tasks/claim")
+def executor_claim_task(req: ClaimReq,
+                        authorization: Optional[str] = Header(None)):
+    """Executor pulls one eligible task. Eligible = a task targeting this
+    executor (by id) or a pool task (executor_id NULL), oldest first. The claim
+    is atomic and holds a lease; an expired lease is requeued first (so a dead
+    executor's stranded work is reclaimable). Returns the task (with the full
+    payload incl the feedback ``callback``) or ``{task_id: null, status:"idle"}``
+    when nothing is pending. Bearer auth — the token identifies the executor."""
+    eid = _caller_executor_id(authorization)
+    s = _executor_settings(eid)
+    if not s.executor_enabled:
+        raise HTTPException(409, "executor disabled")
+    lease = EXECUTOR_LEASE_SECONDS
+    if req.lease_seconds is not None:
+        if not (10 <= req.lease_seconds <= 86400):
+            raise HTTPException(400, "lease_seconds must be between 10 and 86400")
+        lease = req.lease_seconds
+    t = STORE.claim_next_task(eid, lease, _now_iso())
+    if not t:
+        return {"task_id": None, "status": "idle"}
+    return {"task_id": t["id"], "kind": t["kind"], "status": t["status"],
+            "payload": t["payload"], "executor_id": t["executor_id"],
+            "claimed_at": t["claimed_at"], "lease_until": t["lease_until"]}
+
+
+class CompleteReq(BaseModel):
+    status: Literal["done", "error"]
+    error: Optional[str] = None
+    result_ref: Optional[str] = None
+    summary: Optional[str] = None
+
+
+@app.post("/api/executor/tasks/{task_id}/complete")
+def executor_complete_task(task_id: str, req: CompleteReq,
+                           authorization: Optional[str] = Header(None)):
+    """Executor marks a claimed task terminal. Only the owning executor (the one
+    that claimed it) may complete it; a task whose lease already expired and was
+    reclaimed by another executor is a no-op here (returns 409 so the caller
+    knows its work was taken over). Bearer auth."""
+    eid = _caller_executor_id(authorization)
+    ok = STORE.complete_task(task_id, eid, req.status, _now_iso(),
+                             error=req.error, result_ref=req.result_ref,
+                             summary=req.summary)
+    if not ok:
+        raise HTTPException(409, f"task {task_id} not owned by this executor "
+                                   f"(expired/requeued) — work was reclaimed")
+    # mirror the terminal state into the ChangeJob audit trail so the existing
+    # /api/change-jobs UI (and any consumer of ChangeJob) still sees the run.
+    _mirror_task_change_job(task_id)
+    return {"task_id": task_id, "status": req.status}
+
+
+class LeaseReq(BaseModel):
+    lease_seconds: Optional[int] = None
+
+
+@app.post("/api/executor/tasks/{task_id}/lease")
+def executor_renew_lease(task_id: str, req: LeaseReq,
+                         authorization: Optional[str] = Header(None)):
+    """Executor heartbeat — extend the claim's lease while still working. Only
+    the owning executor may renew. Bearer auth."""
+    eid = _caller_executor_id(authorization)
+    lease = EXECUTOR_LEASE_SECONDS
+    if req.lease_seconds is not None:
+        if not (10 <= req.lease_seconds <= 86400):
+            raise HTTPException(400, "lease_seconds must be between 10 and 86400")
+        lease = req.lease_seconds
+    ok = STORE.renew_lease(task_id, eid, lease, _now_iso())
+    if not ok:
+        raise HTTPException(409, f"task {task_id} not owned by this executor "
+                                   f"(expired/requeued)")
+    return {"task_id": task_id, "status": "claimed",
+            "lease_until": _lease_expiry_pub(task_id)}
+
+
+def _lease_expiry_pub(task_id: str) -> Optional[str]:
+    t = STORE.get_task(task_id)
+    return t["lease_until"] if t else None
+
+
+def _mirror_task_change_job(task_id: str) -> None:
+    """Best-effort: also record the terminal task state as a ChangeJob so the
+    existing change-jobs UI/audit trail (keyed by job id == task id) keeps
+    working without every consumer learning the executor_tasks table."""
     try:
-        return ec.get_job(job_id)
-    except ExecutorError as e:
-        raise HTTPException(502, f"executor error: {e}")
+        t = STORE.get_task(task_id)
+        if not t:
+            return
+        p = t.get("payload") or {}
+        from ..core.models import ChangeJob
+        j = ChangeJob(
+            id=task_id,
+            app_id=p.get("app_id") or p.get("db_server_id") or p.get("server_id")
+                or p.get("scope_id") or p.get("wave_id") or "",
+            kind=t["kind"], repo_url=p.get("repo_url", ""), branch=p.get("branch", ""),
+            status=t["status"], patch_ref=t.get("result_ref") or "",
+            summary=t.get("summary") or "", error=t.get("error") or "",
+            created_at=t.get("created_at") or "", finished_at=t.get("finished_at") or "")
+        STORE.upsert_change_job(j)
+    except Exception:
+        pass   # audit mirror is best-effort; never fail the complete call
+
+
+@app.get("/api/executor/tasks")
+def list_executor_tasks(status: Optional[str] = None,
+                         executor_id: Optional[str] = None,
+                         limit: int = 200):
+    """List dispatched tasks (newest-first). Operator/UI view of the queue."""
+    return STORE.list_tasks(limit=limit, status=status, executor_id=executor_id)
+
+
+@app.get("/api/executor/tasks/{task_id}")
+def get_executor_task(task_id: str):
+    t = STORE.get_task(task_id)
+    if not t:
+        raise HTTPException(404, f"no such task: {task_id}")
+    return t
 
 
 @app.post("/api/rebuild")
