@@ -226,9 +226,27 @@ async function loadBusinessCase(save){
 }
 async function loadLatestBusinessCase(){
   try{
-    const bc = await api('/business-case');
+    const resp = await api('/business-case');
     // the snapshot payload is nested under 'payload'
-    _renderBusinessCase(bc.payload||bc);
+    const bc = resp.payload||resp;
+    _renderBusinessCase(bc);
+    // server never recomputes synchronously now; if the saved snapshot is
+    // stale vs the current estate it flags stale + we prompt an explicit
+    // Refresh (the ~58s recompute only runs on POST).
+    const stale = bc && bc.stale;
+    const old = document.getElementById('bcStaleBanner');
+    if(old) old.remove();
+    if(stale){
+      const tiles = $('bcTiles');
+      if(tiles){
+        const b = document.createElement('div');
+        b.id = 'bcStaleBanner';
+        b.className = 'bc-wi';
+        b.style.cssText = 'color:var(--amber)';
+        b.innerHTML = '⚠ this snapshot is stale vs the current estate — click <b>Refresh + save snapshot</b> to recompute.';
+        tiles.parentNode.insertBefore(b, tiles);
+      }
+    }
   }catch(e){
     // no saved snapshot yet — compute one without saving (the Refresh button saves)
     loadBusinessCase(false);

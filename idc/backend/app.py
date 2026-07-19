@@ -48,6 +48,13 @@ from ..core.eol import os_eol_bucket
 
 load_dotenv()
 settings = get_settings()
+
+# Install OpenTelemetry tracing BEFORE open_store + FastAPI() so PyMySQL +
+# httpx instrumentation wraps the first calls (env-gated: no-op when
+# IDC_TRACE_FILE is empty, so tests + idle runs pay nothing).
+from ..observability import setup_tracing, instrument_app
+setup_tracing(settings)
+
 STORE = open_store(settings.db_url)
 LLM = get_client(settings)
 
@@ -55,6 +62,7 @@ LLM = get_client(settings)
 _EVENT_BUS: Dict[str, "asyncio.Queue"] = {}
 
 app = FastAPI(title="idc-migrate", version="0.1.0")
+instrument_app(app)  # no-op when tracing is OFF
 
 # ---------------------------------------------------------------------------
 # Web auth — shared-password login gate over the UI + API.
@@ -328,9 +336,17 @@ class AgentReq(BaseModel):
 # helpers
 # ---------------------------------------------------------------------------
 def _server_out(s, profiles_by_app=None, strategies_by_app=None,
-                dispositions_by_key=None, book=None):
+                dispositions_by_key=None, book=None, matches_by_id=None):
     d = s.to_dict()
-    m = STORE.get_match(s.id)
+    # Prefer a caller-preloaded {server_id -> Match} map (the paginated list
+    # builds one in a single SELECT to avoid an N+1: 50 rows were doing 50
+    # separate `SELECT * FROM matches WHERE server_id=?` round-trips, the
+    # slowest traced at ~175ms). Fall back to the per-row fetch for callers
+    # that didn't preload (single-server drawer etc.).
+    if matches_by_id is not None:
+        m = matches_by_id.get(s.id)
+    else:
+        m = STORE.get_match(s.id)
     d["match"] = m.to_dict() if m else None
     # data-gap — precomputed support buckets so the inventory list + drawer can
     # render warranty / OS-EOL badges without duplicating the EOL table in JS.
@@ -506,12 +522,18 @@ def list_servers(role: Optional[str] = None, env: Optional[str] = None,
                               with_facets=facets)
     # preload the small strategy + disposition maps ONCE (not per row) so each
     # row's 7R policy is an O(1) lookup — the Inventory "7R" column reads the
-    # same source of truth as the Business case + drawer.
+    # same source of truth as the Business case + drawer. Matches are scoped
+    # to the PAGE: one `SELECT * FROM matches WHERE server_id IN (...)` fetches
+    # only the ~50 rows on this page, killing the per-row get_match N+1 (was
+    # 50 round-trips, slowest ~175ms) without the cost of loading the whole
+    # 13K-row matches table + parsing every JSON blob.
     strategies_by_app = {s2.app_id: s2 for s2 in STORE.list_app_strategies()}
     dispositions_by_key = {d.server_id: d.disposition
                             for d in STORE.list_legacy_dispositions()}
+    matches_by_id = STORE.get_matches_for(s.id for s in res["items"])
     items = [_server_out(s, strategies_by_app=strategies_by_app,
-                         dispositions_by_key=dispositions_by_key)
+                         dispositions_by_key=dispositions_by_key,
+                         matches_by_id=matches_by_id)
              for s in res["items"]]
     return {"items": items, "total": res["total"], "page": res["page"],
             "page_size": res["page_size"], "facets": res["facets"]}
@@ -640,11 +662,14 @@ def list_matches():
 
 @app.get("/api/waves")
 def list_waves():
-    servers = {s.id: s for s in STORE.list_servers(limit=200000)}
+    # only id->hostname is needed to render wave members — a 2-column SELECT
+    # (was: list_servers(limit=200000) doing SELECT * + building 13K+ Server
+    # objects just to read .hostname, traced ~3.6s).
+    hosts = STORE.server_hostnames_by_id()
     out = []
     for w in STORE.list_waves():
         d = w.to_dict()
-        d["members"] = [servers[sid].hostname for sid in w.server_ids if sid in servers]
+        d["members"] = [hosts.get(sid, "") for sid in w.server_ids if sid in hosts]
         out.append(d)
     return out
 
@@ -3399,7 +3424,11 @@ def _portfolio_inputs():
 @app.post("/api/business-case")
 def business_case(req: BusinessCaseReq):
     """Compute the portfolio TCO + per-strategy rollup (F2). Optionally save
-    an immutable snapshot to ``business_case_snapshots``."""
+    an immutable snapshot to ``business_case_snapshots``.
+
+    This is the explicit Refresh path — the only place the ~58s
+    ``estimate_portfolio`` runs. Populates the in-process cache so subsequent
+    GETs are instant instead of serving the (now-stale) saved snapshot."""
     from ..core.cost import estimate_portfolio, load_pricebook
     from ..core.models import _new_id
     servers, matches, strategies, host_dispositions = _portfolio_inputs()
@@ -3410,7 +3439,48 @@ def business_case(req: BusinessCaseReq):
         sid = _new_id("bc")
         STORE.save_business_case(sid, payload)
         payload["snapshot_id"] = sid
+    _BC_CACHE.clear()
+    _BC_CACHE[_bc_signature()] = {
+        "id": payload.get("snapshot_id", ""),
+        "created_at": payload.get("generated_at", ""),
+        "payload": payload,
+    }
     return payload
+
+
+# In-process cache for the computed business-case payload. estimate_portfolio
+# is ~58s over 13,855 servers and holds the GIL the whole time; the GET path
+# must NEVER recompute synchronously (it used to when the saved snapshot was
+# stale — traced monopolizing the GIL and cascading /api/lz/archetypes to
+# 75s, an endpoint that runs 2.1s in isolation). Keyed by a cheap staleness
+# signature; a miss serves the saved DB snapshot + a ``stale`` flag so the UI
+# prompts an explicit Refresh (POST), which recomputes + repopulates this.
+_BC_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _bc_signature() -> str:
+    """Cheap staleness signature over the portfolio inputs (servers / matches
+    / app_strategies / legacy_dispositions / pricebook). A change here means
+    the cached payload no longer describes the estate. A few MAX() queries
+    (~100ms total) — far cheaper than the ~58s recompute."""
+    from pathlib import Path as _P
+    parts = [
+        str(STORE._scalar("SELECT COALESCE(MAX(updated_at),'') FROM servers") or ""),
+        # matches is immutable-per-row (created_at), so its max reflects the
+        # latest match set (replaced wholesale on Rebuild).
+        str(STORE._scalar("SELECT COALESCE(MAX(created_at),'') FROM matches") or ""),
+        str(STORE._scalar("SELECT COALESCE(MAX(updated_at),'') FROM app_strategies") or ""),
+        str(STORE._scalar("SELECT COALESCE(MAX(updated_at),'') FROM legacy_dispositions") or ""),
+    ]
+    # pricebook identity: live url | override path + the override file mtime
+    pb = f"{settings.pricing_url}|{settings.pricing_override_path}"
+    if settings.pricing_override_path:
+        try:
+            pb += f"|m{int(_P(settings.pricing_override_path).stat().st_mtime)}"
+        except Exception:
+            pass
+    parts.append(pb)
+    return "|".join(parts)
 
 
 def _business_case_stale(payload: Dict[str, Any]) -> bool:
@@ -3465,29 +3535,24 @@ def _business_case_stale(payload: Dict[str, Any]) -> bool:
 def latest_business_case():
     """Return the most recently saved business-case snapshot, or 404.
 
-    A snapshot is immutable, so once the estate changes (new inventory load /
-    Rebuild) it goes stale and would display a *previous* estate's per-server
-    list. Detect that by comparing the snapshot's matched-server count to the
-    live ``matches`` count and, when stale, recompute from the current estate
-    in place (without persisting — the Refresh button saves a fresh snapshot).
-    This keeps the UI from ever serving a stale demo-fixture snapshot."""
+    NEVER recomputes synchronously (estimate_portfolio is ~58s over 13,855
+    servers and would monopolize the GIL, starving concurrent requests —
+    traced cascading /api/lz/archetypes to 75s). Serves the in-process cache
+    when its signature is still current; else serves the saved DB snapshot
+    and flags it ``stale`` so the UI prompts an explicit Refresh
+    (POST /api/business-case), which recomputes + repopulates the cache."""
+    cached = _BC_CACHE.get(_bc_signature())
+    if cached:
+        return cached
     snaps = STORE.list_business_cases(limit=1)
     if not snaps:
         raise HTTPException(404, "no saved business case; POST /api/business-case first")
     snap = STORE.get_business_case(snaps[0]["id"])
-    payload = snap["payload"]
-    if _business_case_stale(payload):
-        from ..core.cost import estimate_portfolio, load_pricebook
-        servers, matches, strategies, host_dispositions = _portfolio_inputs()
-        book = load_pricebook(settings)
-        payload = estimate_portfolio(servers, matches, book, strategies=strategies,
-                                     host_dispositions=host_dispositions)
-        # keep the saved snapshot's id for reference, and flag that this response
-        # was recomputed live (not a saved snapshot) so the UI can hint a save.
-        payload["snapshot_id"] = snap["id"]
-        payload["recomputed"] = True
-        snap = {"id": snap["id"], "created_at": snap["created_at"], "payload": payload}
-    return snap
+    payload = dict(snap["payload"])
+    payload["snapshot_id"] = snap["id"]
+    # flag staleness so the UI prompts a Refresh — do NOT recompute here.
+    payload["stale"] = _business_case_stale(payload)
+    return {"id": snap["id"], "created_at": snap["created_at"], "payload": payload}
 
 
 @app.get("/api/business-case/{snapshot_id}")
@@ -3624,9 +3689,15 @@ def launch_wave_exec(wave_id: str, kind: Literal["host", "db", "code"] = "host")
 
 @app.get("/api/migration-jobs")
 def list_migration_jobs(wave_id: Optional[str] = None, status: Optional[str] = None,
-                        server_id: Optional[str] = None):
-    return [j.to_dict() for j in STORE.list_migration_jobs(
-        wave_id=wave_id, status=status, server_id=server_id)]
+                        server_id: Optional[str] = None,
+                        page: int = 1, page_size: int = 50):
+    # Paginated (was: returned ALL ~14K jobs in one shot, ~3.8s — 340ms DB
+    # filesort on ORDER BY updated_at + 3.5s building 14K MigrationJob objects
+    # + asdict). Shape mirrors /api/servers so the frontend paginates the same
+    # way. The rail only needs the count, which it gets from /api/stats.
+    return STORE.query_migration_jobs(wave_id=wave_id, status=status,
+                                       server_id=server_id,
+                                       page=page, page_size=page_size)
 
 
 @app.get("/api/migration-jobs/{job_id}")
@@ -3751,12 +3822,25 @@ def lz_archetypes():
     operator's authored design if one is active, else the built-in
     ``LZ_BLUEPRINTS`` default. The web forwards ``archetypes[<arch>]`` as the
     ``context`` to ``POST /api/iac-emit``, so emitting IaC for an archetype
-    always uses the active design's blueprint (Phase A)."""
+    always uses the active design's blueprint (Phase A).
+
+    Cached by a cheap estate+design signature: the classifier + per_server build
+    over 13,855 servers is ~1.3s of pure Python (GIL-holding) and was the top
+    contention source — concurrent requests starved each other to 25-84s. A
+    cache hit returns the prebuilt result in ~0.4s (just JSON serialize) with
+    no GIL-holding compute. First call after a change recomputes."""
+    sig = _lz_archetypes_signature()
+    cached = _LZ_ARCH_CACHE.get(sig)
+    if cached:
+        return cached
     from ..core.lz import (active_lz_archetypes, archetypes_for_servers,
                            resolve_all_archetype_blueprints, get_active_lz_design,
                            active_classifier)
-    servers = STORE.list_all_servers()
-    matches = STORE.list_matches()
+    # light projection: the classifier + per_server rows read only identity +
+    # role + app_ids (no ips/disks/utilization). matches is accepted by
+    # archetype_for but unused (kept for future region-aware placement).
+    servers = STORE.list_all_servers_light()
+    matches = []
     archetypes = active_lz_archetypes(STORE)
     blueprints = resolve_all_archetype_blueprints(STORE)
     classifier = active_classifier(STORE)
@@ -3782,14 +3866,39 @@ def lz_archetypes():
                            "app_ids": list(s.app_ids or []),
                            "placement": placements.get(key)})
     design = get_active_lz_design(STORE)
-    return {"archetypes": {a: blueprints[a] for a in archetypes},
-            "counts": counts, "per_server": per_server,
-            "design": {"design_id": design.design_id, "name": design.name,
-                       "is_active": design.is_active,
-                       "is_builtin": design.design_id.startswith("builtin"),
-                       "onprem_cidrs": design.onprem_cidrs,
-                       "has_classifier": classifier is not None},
-            "network_active": nd is not None}
+    result = {"archetypes": {a: blueprints[a] for a in archetypes},
+              "counts": counts, "per_server": per_server,
+              "design": {"design_id": design.design_id, "name": design.name,
+                          "is_active": design.is_active,
+                          "is_builtin": design.design_id.startswith("builtin"),
+                          "onprem_cidrs": design.onprem_cidrs,
+                          "has_classifier": classifier is not None},
+              "network_active": nd is not None}
+    _LZ_ARCH_CACHE.clear()
+    _LZ_ARCH_CACHE[sig] = result
+    return result
+
+
+# In-process cache for /api/lz/archetypes. The per-server classification over
+# 13,855 servers is ~1.3s of GIL-holding Python and was the biggest contention
+# source on the read path (concurrent requests starved each other to 25-84s).
+# Keyed by a cheap estate+design signature; a miss recomputes + repopulates.
+_LZ_ARCH_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _lz_archetypes_signature() -> str:
+    """Cheap staleness signature for the /api/lz/archetypes result: covers
+    every input the per-server classification + blueprint set depend on —
+    the estate (servers.updated_at), the active LZ design (archetype set +
+    blueprints + classifier + onprem_cidrs), and the active network design
+    (placements + archetype_overrides). ~3 short queries (~30ms)."""
+    parts = [str(STORE._scalar(
+        "SELECT COALESCE(MAX(updated_at),'') FROM servers") or "")]
+    lz = STORE.get_active_lz_design()
+    parts.append(f"lz:{lz.design_id}|{lz.updated_at}" if lz else "lz:builtin")
+    nd = STORE.get_active_network_design()
+    parts.append(f"nd:{nd.design_id}|{nd.updated_at}" if nd else "nd:none")
+    return "|".join(parts)
 
 
 @app.get("/api/lz/readiness")
@@ -3798,8 +3907,8 @@ def lz_readiness_endpoint():
     the persisted lz_status. Feeds the wave-launch placement gate + F10
     readiness heatmap."""
     from ..core.lz import lz_readiness
-    servers = STORE.list_all_servers()
-    matches = STORE.list_matches()
+    servers = STORE.list_all_servers_light()  # classifier reads only light fields
+    matches = []                              # unused by lz_readiness signals
     return lz_readiness(STORE, servers, matches)
 
 

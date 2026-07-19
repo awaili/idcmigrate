@@ -226,10 +226,10 @@ def test_launch_wave_then_advance_validate_complete():
         assert r.status_code == 200, r.text
         assert r.json()["status"] == MJS_FINALIZED
 
-        # list migration-jobs for the wave
+        # list migration-jobs for the wave (paginated: {items,total,...})
         r = client.get(f"/api/migration-jobs?wave_id={wid}")
         assert r.status_code == 200
-        assert any(j["id"] == job_id for j in r.json())
+        assert any(j["id"] == job_id for j in r.json()["items"])
     finally:
         _cleanup(st, wid, sid, job_ids)
 
@@ -259,7 +259,7 @@ def test_revert_endpoint():
     try:
         client.post(f"/api/waves/{wid}/execute?kind=host")
         r = client.get(f"/api/migration-jobs?wave_id={wid}")
-        job_id = r.json()[0]["id"]
+        job_id = r.json()["items"][0]["id"]
         job_ids.append(job_id)
         client.post(f"/api/migration-jobs/{job_id}/advance", json={"to": MJS_REPLICATING})
         r = client.post(f"/api/migration-jobs/{job_id}/revert", json={"to": MJS_PLANNED})

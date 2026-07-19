@@ -5,8 +5,10 @@ changes (new inventory load, a Rebuild, or any edit to servers/matches) it goes
 stale and would display a *previous* estate's per-server list — e.g. the old
 demo/scale fixture's ``db-``/``app-``/``web-`` hosts after the real
 ``inventory_draft`` was loaded. GET /api/business-case must detect that
-(matched-server count drift) and recompute from the current estate instead of
-serving the stale snapshot. These tests pin that behaviour.
+(matched-server count drift / 7R-policy drift) and flag the response ``stale``
+so the UI prompts an explicit Refresh. GET must NOT recompute synchronously —
+estimate_portfolio is ~58s over 13,855 servers and would monopolize the GIL,
+starving concurrent requests. These tests pin that behaviour.
 """
 import pytest
 
@@ -35,6 +37,7 @@ def _save_snapshot(sid: str, per_server_n: int, priced: int = 0, unpriced: int =
 
 
 def _cleanup(sid: str):
+    m._BC_CACHE.clear()  # avoid cross-test in-process cache hits
     with m.STORE.tx() as cur:
         cur.execute(m.STORE._x("DELETE FROM business_case_snapshots WHERE id=?"), (sid,))
 
@@ -60,49 +63,54 @@ def test_stale_helper_flags_emptied_estate(monkeypatch):
         {"per_server": [], "priced_servers": 0, "unpriced_servers": 0}) is False
 
 
-def test_get_recomputes_stale_snapshot(monkeypatch):
-    """GET /api/business-case recomputes when the saved snapshot is stale, and
-    flags the response so the UI can hint a save. _portfolio_inputs is stubbed
-    to empty inputs so the recompute is deterministic + fast."""
+def test_get_serves_stale_snapshot_with_flag_not_recompute(monkeypatch):
+    """GET /api/business-case serves a stale saved snapshot AS-IS and flags it
+    ``stale`` — it does NOT recompute (the ~58s recompute only runs on the
+    explicit POST Refresh). _portfolio_inputs is stubbed so the test FAILS if
+    GET tries to call it."""
     _save_snapshot("bc-stale-test", per_server_n=999, priced=999)
     monkeypatch.setattr(m.STORE, "stats", lambda: {"matches": 10})  # 999 != 10 -> stale
-    monkeypatch.setattr(m, "_portfolio_inputs", lambda: ([], [], {}, {}))
+
+    def _boom(*a, **k):
+        raise AssertionError("GET must not call _portfolio_inputs (no synchronous recompute)")
+    monkeypatch.setattr(m, "_portfolio_inputs", _boom)
+    m._BC_CACHE.clear()
     try:
         r = client.get("/api/business-case")
         assert r.status_code == 200
         payload = r.json()["payload"]
-        assert payload.get("recomputed") is True
-        # recomputed from the (stubbed empty) live estate -> no per-server rows
-        assert payload["per_server"] == []
+        assert payload.get("stale") is True
+        # served as-is — the 999 stale rows are still there (NOT recomputed to [])
+        assert len(payload["per_server"]) == 999
+        assert "recomputed" not in payload
     finally:
         _cleanup("bc-stale-test")
 
 
 def test_get_returns_fresh_snapshot_unchanged(monkeypatch):
-    """When the snapshot's matched count == live, GET returns it as-is (no
-    recompute flag)."""
+    """When the snapshot's matched count == live, GET returns it as-is (not
+    stale)."""
     _save_snapshot("bc-fresh-test", per_server_n=10, priced=10)
     monkeypatch.setattr(m.STORE, "stats", lambda: {"matches": 10})  # 10 == 10 -> fresh
+    m._BC_CACHE.clear()
     try:
         r = client.get("/api/business-case")
         assert r.status_code == 200
         payload = r.json()["payload"]
+        assert payload.get("stale") is False
         assert "recomputed" not in payload
         assert len(payload["per_server"]) == 10
     finally:
         _cleanup("bc-fresh-test")
 
 
-def test_get_recomputes_when_7r_policy_changed_after_snapshot(monkeypatch):
+def test_get_flags_stale_when_7r_policy_changed_after_snapshot(monkeypatch):
     """A 7R-policy change (app_strategies / legacy_dispositions updated_at)
     AFTER the snapshot was generated makes the snapshot stale EVEN WHEN the
-    matched-server count is unchanged — so GET recomputes and the Business
-    case 7R matches the live Inventory 7R. Without this, a snapshot saved
-    before a retain/retire / app-strategy change shows stale 7R that differs
-    from the Inventory 7R column (the bug this pins)."""
+    matched-server count is unchanged — so GET flags it ``stale`` (the UI
+    prompts Refresh, whose recompute regenerates 7R matching the Inventory).
+    GET must NOT recompute synchronously."""
     live_n = int(m.STORE.stats().get("matches") or 0)
-    # snapshot: count matches live (count check passes) but generated_at is in
-    # the past, BEFORE the 7R change we make below.
     payload = {
         "currency": "USD", "pricing_source": "fixture",
         "generated_at": "2020-01-01T00:00:00Z",
@@ -112,17 +120,20 @@ def test_get_recomputes_when_7r_policy_changed_after_snapshot(monkeypatch):
         "per_product": {}, "per_region": {}, "per_strategy": {},
     }
     m.STORE.save_business_case("bc-7r-drift-test", payload, created_at=_FUTURE)
-    # a host disposition written AFTER the snapshot (updated_at = now) -> 7R drift
     from idc.core.models import LegacyDisposition
     m.STORE.upsert_legacy_disposition(LegacyDisposition(
         server_id="bc-7r-drift-test-host", disposition="retain",
         rationale="t", confidence=1.0, summary="t"))
-    monkeypatch.setattr(m, "_portfolio_inputs", lambda: ([], [], {}, {}))
+    monkeypatch.setattr(m, "_portfolio_inputs",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("GET must not recompute")))
+    m._BC_CACHE.clear()
     try:
         r = client.get("/api/business-case")
         assert r.status_code == 200
         p = r.json()["payload"]
-        assert p.get("recomputed") is True   # stale by 7R drift -> recompute
+        assert p.get("stale") is True   # 7R drift -> stale flag (no recompute)
+        assert "recomputed" not in p
     finally:
         m.STORE.delete_legacy_disposition("bc-7r-drift-test-host")
         _cleanup("bc-7r-drift-test")
@@ -130,7 +141,7 @@ def test_get_recomputes_when_7r_policy_changed_after_snapshot(monkeypatch):
 
 def test_get_fresh_when_no_7r_change_after_snapshot(monkeypatch):
     """A snapshot whose generated_at is AFTER the newest 7R-policy write is
-    NOT stale by 7R drift — GET serves it as-is (no recompute)."""
+    NOT stale by 7R drift — GET serves it as-is (stale=False)."""
     live_n = int(m.STORE.stats().get("matches") or 0)
     payload = {
         "currency": "USD", "pricing_source": "fixture",
@@ -141,11 +152,37 @@ def test_get_fresh_when_no_7r_change_after_snapshot(monkeypatch):
         "per_product": {}, "per_region": {}, "per_strategy": {},
     }
     m.STORE.save_business_case("bc-7r-fresh-test", payload, created_at=_FUTURE)
-    monkeypatch.setattr(m, "_portfolio_inputs", lambda: ([], [], {}, {}))
+    m._BC_CACHE.clear()
     try:
         r = client.get("/api/business-case")
         assert r.status_code == 200
         p = r.json()["payload"]
-        assert "recomputed" not in p   # generated_at newer than any 7R write -> fresh
+        assert p.get("stale") is False   # generated_at newer than any 7R write -> fresh
+        assert "recomputed" not in p
     finally:
         _cleanup("bc-7r-fresh-test")
+
+
+def test_post_populates_cache_and_get_hits_it(monkeypatch):
+    """POST /api/business-case recomputes + populates the in-process cache; the
+    next GET with the same estate signature returns the cached payload
+    instantly (no DB snapshot read, no recompute)."""
+    m._BC_CACHE.clear()
+    # stub the expensive inputs so the POST is fast + deterministic
+    monkeypatch.setattr(m, "_portfolio_inputs", lambda: ([], [], {}, {}))
+    try:
+        r = client.post("/api/business-case", json={"save": False})
+        assert r.status_code == 200, r.text
+        posted = r.json()
+        assert "stale" not in posted and "recomputed" not in posted
+        # cache now populated for the current signature
+        assert m._BC_CACHE, "POST should populate _BC_CACHE"
+        g = client.get("/api/business-case")
+        assert g.status_code == 200
+        gp = g.json()["payload"]
+        # cache hit returns the POSTed payload (same cloud_yearly), not a stale
+        # saved snapshot, and no stale flag.
+        assert gp.get("cloud_yearly") == posted.get("cloud_yearly")
+        assert "stale" not in gp
+    finally:
+        m._BC_CACHE.clear()

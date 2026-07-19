@@ -111,7 +111,7 @@ def test_handoff_csv_shape():
     job_ids = []
     try:
         client.post(f"/api/waves/{wid}/execute?kind=host")
-        job_ids = [j["id"] for j in client.get(f"/api/migration-jobs?wave_id={wid}").json()]
+        job_ids = [j["id"] for j in client.get(f"/api/migration-jobs?wave_id={wid}").json()["items"]]
         r = client.get(f"/api/waves/{wid}/handoff.csv")
         assert r.status_code == 200
         assert "text/csv" in r.headers.get("content-type", "")

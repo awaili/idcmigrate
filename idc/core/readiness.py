@@ -270,13 +270,24 @@ def _build_readiness_state(store) -> Dict[str, Any]:
     signals need. Makes ``portfolio_readiness`` O(waves + servers + jobs)
     instead of O(waves * (servers + jobs)) per wave."""
     waves = store.list_waves()
-    servers = store.list_all_servers()
-    matches = store.list_matches()
+    # light projection: readiness signals + the LZ classifier read only identity
+    # + role + app_ids + tags + EOL fields — NOT ips/disks/utilization/source_refs.
+    # Skips 4 of 6 per-row JSON parses; SELECT * was the ~6.3s bottleneck here.
+    servers = store.list_all_servers_light()
+    # matches are NOT consumed by the readiness signals: archetype_for() accepts
+    # a match arg but ignores it (kept for future region-aware placement), so
+    # the old list_matches() here loaded 13K+ rows + JSON-parsed each for
+    # nothing. Pass [] so wave_archetypes gets an empty m_by_id (identical
+    # output, since match is never read).
+    matches = []
     workloads = store.list_workloads()
     profiles = store.list_code_profiles()
     db_profiles = store.list_db_profiles()
     changejobs = store.list_change_jobs(status="done")
-    mjobs_all = store.list_migration_jobs()
+    # light: signals read only j.wave_id / j.server_id / j.status — NOT the
+    # stage_history / validation_gates JSON columns. Avoids the full
+    # list_migration_jobs() (14K rows × JSON loads + asdict).
+    mjobs_all = store.list_migration_jobs_light()
     lz_statuses = store.list_lz_status()
 
     srv_by_id = {s.id: s for s in servers}
@@ -390,13 +401,13 @@ def wave_readiness(store, wave_id: str) -> Dict[str, Any]:
             break
     if wave is None:
         return {"wave_id": wave_id, "error": "wave not found"}
-    servers = store.list_all_servers()
-    matches = store.list_matches()
+    servers = store.list_all_servers_light()  # light proj — see _build_readiness_state
+    matches = []  # unused by signals — see _build_readiness_state
     workloads = store.list_workloads()
     profiles = store.list_code_profiles()
     db_profiles = store.list_db_profiles()
     changejobs = store.list_change_jobs(status="done")
-    mjobs = store.list_migration_jobs(wave_id=wave_id)
+    mjobs = store.list_migration_jobs_light(wave_id=wave_id)
 
     srv_by_id = {s.id: s for s in servers}
     members = [srv_by_id[sid] for sid in (wave.server_ids or []) if sid in srv_by_id]

@@ -474,6 +474,11 @@ ALTER TABLE servers ADD COLUMN IF NOT EXISTS warranty_status VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS hardware_eol VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS warranty_bucket VARCHAR(16);
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS os_eol_bucket VARCHAR(16);
+-- index on hostname so the default ORDER BY hostname (the /api/servers sort
+-- over 13K+ rows) is an index walk instead of a filesort. _exec_schema
+-- tolerates "Duplicate key name" on re-run (MariaDB 10.5 has no ADD KEY IF
+-- NOT EXISTS). Covers ORDER BY hostname ASC/DESC.
+ALTER TABLE servers ADD KEY idx_srv_hostname (hostname);
 
 -- F6 — db_profiles conversion artifact (None for assess-mode profiles). JSON
 -- so the whole DBConversion (ddl[] + objects[] + report_md) rides one column.
@@ -496,6 +501,12 @@ ALTER TABLE network_designs ADD COLUMN IF NOT EXISTS account_overrides JSON;
 -- policy ``notes``, surfaced in the Saved network designs table). Pre-AI / default
 -- rows stay empty.
 ALTER TABLE network_designs ADD COLUMN IF NOT EXISTS summary VARCHAR(512) DEFAULT '';
+
+-- index on migration_jobs.updated_at so the default ORDER BY updated_at DESC
+-- (the /api/migration-jobs listing over 14K+ rows) is an index walk instead of
+-- a filesort. updated_at is an ISO-8601 VARCHAR so lexicographic order == time
+-- order. _exec_schema tolerates "Duplicate key name" on re-run.
+ALTER TABLE migration_jobs ADD KEY idx_mjob_updated (updated_at);
 
 -- F7 — legacy / unsupported-OS disposition (one row per EOL host, keyed by the
 -- stable hostname). The executor's containerize/replatform/rewrite/retain call
@@ -960,6 +971,50 @@ class Store:
         rows = self._fetchall("SELECT * FROM servers LIMIT ?", (limit,))
         return [self._row_to_server(r) for r in rows]
 
+    # Light projection columns for read-only aggregation/classification paths
+    # (readiness, LZ archetype mix). Omits the heavy JSON columns (ips, disks,
+    # utilization, source_refs) — 4 `json.loads` per row × 13K+ rows dominated
+    # the old ``SELECT *`` (traced ~6.3s on /api/readiness). app_ids + tags stay
+    # (the LZ classifier reads them); the skipped fields default to [] / {}
+    # via the Server dataclass and are never read on these paths.
+    _SERVER_LIGHT_COLS = (
+        "id, hostname, fqdn, source_type, role, os, os_version, cpu_cores, "
+        "mem_gb, subnet, vlan, datacenter, cluster, env, app_ids, tags, "
+        "business_criticality, migration_tier, status, sizing_basis, "
+        "assessment_confidence, warranty_status, hardware_eol, "
+        "warranty_bucket, os_eol_bucket"
+    )
+
+    def list_all_servers_light(self) -> List[Server]:
+        """Full estate, light projection (no ips/disks/utilization/source_refs).
+
+        For read-only paths that only need identity + classification + EOL
+        fields (readiness rollup, LZ archetype mix). ~5-10x faster than
+        ``list_all_servers`` because it skips 4 of the 6 per-row JSON parses
+        + the big-column network transfer.
+        """
+        rows = self._fetchall(
+            f"SELECT {self._SERVER_LIGHT_COLS} FROM servers")
+        out: List[Server] = []
+        for r in rows:
+            d = dict(r)
+            d["ips"] = []
+            d["disks"] = []
+            d["app_ids"] = loads(d.get("app_ids")) or []
+            d["tags"] = loads(d.get("tags")) or []
+            d["utilization"] = {}
+            d["source_refs"] = []
+            out.append(Server.from_dict(d))
+        return out
+
+    def server_hostnames_by_id(self) -> Dict[str, str]:
+        """``{server_id -> hostname}`` from a 2-column SELECT — for callers that
+        only need to resolve wave/membership ids to names (e.g. /api/waves).
+        Avoids building 13K+ Server objects (a full ``list_all_servers`` was
+        ~3.6s there just to read ``.hostname``)."""
+        return {r["id"]: (r["hostname"] or "") for r in
+                self._fetchall("SELECT id, hostname FROM servers")}
+
     def resolve_server_ids(self, tokens: List[str]) -> Dict[str, Any]:
         """Map free-text host tokens (each a server_id, hostname, or fqdn,
         case-insensitive) to existing server_ids. Returns
@@ -1133,16 +1188,15 @@ class Store:
         jr = self._jq("json_extract(target,'$.region')")
         by_target = dist(f"SELECT {jp} AS c, COUNT(*) AS n FROM matches GROUP BY {jp}")
         by_region = dist(f"SELECT {jr} AS c, COUNT(*) AS n FROM matches GROUP BY {jr}")
-        # match confidence distribution
+        # match confidence distribution — SQL-side CASE bucketing (was: fetch
+        # all 13K+ confidence rows + bucket in Python, traced at ~4.8s).
         conf = {"high(>=0.85)": 0, "medium(0.7-0.85)": 0, "low(<0.7)": 0}
-        for c in self._fetchall("SELECT confidence AS c FROM matches"):
-            v = c["c"] or 0
-            if v >= 0.85:
-                conf["high(>=0.85)"] += 1
-            elif v >= 0.7:
-                conf["medium(0.7-0.85)"] += 1
-            else:
-                conf["low(<0.7)"] += 1
+        for r in self._fetchall(
+            "SELECT CASE WHEN confidence >= 0.85 THEN 'high(>=0.85)' "
+            "WHEN confidence >= 0.7 THEN 'medium(0.7-0.85)' "
+            "ELSE 'low(<0.7)' END AS bucket, COUNT(*) AS n "
+            "FROM matches GROUP BY bucket"):
+            conf[r["bucket"]] = int(r["n"])
         cm_mem = self._cast_real("json_extract(utilization,'$.mem_p95')")
         cm_disk = self._cast_real("json_extract(utilization,'$.disk_used_pct')")
         high_util = self._scalar(
@@ -1152,35 +1206,39 @@ class Store:
                  for r in self._fetchall(
             f"SELECT id, name, stage, COALESCE({self._json_array_len('server_ids')},0) AS n "
             "FROM waves ORDER BY stage, name")]
-        # per-application rollup: servers / cores / mem grouped by app_id (the
-        # JSON array in servers.app_ids, expanded in Python — MariaDB 10.5 lacks
-        # JSON_TABLE), enriched with app name/tier/env (workloads) + 7R strategy
-        # + target product (app_strategies). Sorted by server count desc so the
-        # dashboard's "By application" card shows the biggest apps first.
-        app_acc: Dict[str, list] = {}
-        for r in self._fetchall("SELECT app_ids, cpu_cores, mem_gb FROM servers"):
-            ids = loads(r["app_ids"]) if r["app_ids"] else None
-            if not ids:
-                continue
-            cpu = r["cpu_cores"] or 0
-            mem = r["mem_gb"] or 0
-            for aid in ids:
-                a = app_acc.setdefault(aid, [0, 0, 0])
-                a[0] += 1; a[1] += cpu; a[2] += mem
+        # per-application rollup: servers / cores / mem grouped by app_id. The
+        # JSON array in servers.app_ids is expanded in SQL via a recursive CTE
+        # (MariaDB 10.5 lacks JSON_TABLE) and aggregated server-side — was a
+        # 13K-row Python fetch + json.loads loop (~2.3s), now ~0.15s. seq depth
+        # 0..19 covers multi-app hosts (live estate max array length is 1, but
+        # the bound tolerates up to 20 apps/host). Enriched in Python with the
+        # small workloads + app_strategies dicts.
+        ai = self._jq("JSON_EXTRACT(s.app_ids, CONCAT('$[',seq.n,']'))")
+        app_rows = self._fetchall(
+            "WITH RECURSIVE seq(n) AS ("
+            "SELECT 0 UNION ALL SELECT n+1 FROM seq WHERE n < 19) "
+            f"SELECT {ai} AS app_id, COUNT(*) AS nsrv, "
+            "COALESCE(SUM(s.cpu_cores),0) AS cores, COALESCE(SUM(s.mem_gb),0) AS mem "
+            "FROM servers s, seq "
+            f"WHERE JSON_EXTRACT(s.app_ids, CONCAT('$[',seq.n,']')) IS NOT NULL "
+            "GROUP BY app_id ORDER BY nsrv DESC")
         wl = {r["app_id"]: r for r in self._fetchall(
             "SELECT app_id, name, tier, env FROM workloads")}
         st = {r["app_id"]: r for r in self._fetchall(
             "SELECT app_id, strategy, target FROM app_strategies")}
         by_app = []
-        for aid, (cnt, cores_a, mem_a) in sorted(app_acc.items(),
-                                                 key=lambda kv: kv[1][0], reverse=True):
+        for r in app_rows:
+            aid = r["app_id"]
+            if not aid:
+                continue
             w = wl.get(aid, {})
             s = st.get(aid, {})
             by_app.append({"app_id": aid, "name": w.get("name") or aid,
                            "tier": w.get("tier") or "", "env": w.get("env") or "",
                            "strategy": s.get("strategy") or "",
-                           "target": s.get("target") or "", "servers": cnt,
-                           "cores": int(cores_a or 0), "mem_gb": int(mem_a or 0)})
+                           "target": s.get("target") or "",
+                           "servers": int(r["nsrv"]),
+                           "cores": int(r["cores"] or 0), "mem_gb": int(r["mem"] or 0)})
         return {"servers": n, "cores": cores, "mem_gb": mem,
                 "by_role": by_role, "by_env": by_env, "by_os": by_os,
                 "by_target": by_target, "by_region": by_region,
@@ -1353,6 +1411,29 @@ class Store:
             out.append(Match(server_id=d["server_id"], target=tgt, confidence=d["confidence"],
                              method=d["method"], rationale=d["rationale"], alternatives=alts,
                              created_at=d["created_at"]))
+        return out
+
+    def get_matches_for(self, server_ids) -> Dict[str, Match]:
+        """Load matches for a SET of server_ids in ONE query (kills the N+1).
+
+        Paginated list endpoints pass the page's ~50 ids; this fetches exactly
+        those rows (vs ``list_matches`` which pulls the whole table + parses
+        13K+ JSON blobs). Returns ``{server_id -> Match}``.
+        """
+        ids = [i for i in server_ids if i]
+        if not ids:
+            return {}
+        ph = ",".join("?" * len(ids))
+        out: Dict[str, Match] = {}
+        for r in self._fetchall(f"SELECT * FROM matches WHERE server_id IN ({ph})",
+                                tuple(ids)):
+            d = dict(r)
+            tgt = Target.from_dict(loads(d.get("target")) or {})
+            alts = loads(d.get("alternatives")) or []
+            out[d["server_id"]] = Match(
+                server_id=d["server_id"], target=tgt, confidence=d["confidence"],
+                method=d["method"], rationale=d["rationale"], alternatives=alts,
+                created_at=d["created_at"])
         return out
 
     # -- waves -------------------------------------------------------------
@@ -2544,6 +2625,61 @@ class Store:
             f"SELECT * FROM migration_jobs{where} ORDER BY updated_at DESC",
             tuple(args))
         return [self._row_to_migration_job(r) for r in rows]
+
+    def list_migration_jobs_light(self, wave_id: Optional[str] = None) -> List[MigrationJob]:
+        """MigrationJob objects carrying only wave_id / server_id / status.
+
+        The readiness signals read just those three fields (cutover rehearsal
+        per server, dominant status per wave) — never the stage_history /
+        validation_gates JSON. Loading 14K+ full rows + JSON-parsing both
+        columns + asdict dominated the readiness path; this skips all of it.
+        """
+        clauses: List[str] = []
+        args: List[Any] = []
+        if wave_id:
+            clauses.append("wave_id=?"); args.append(wave_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        out: List[MigrationJob] = []
+        for r in self._fetchall(
+            f"SELECT wave_id, server_id, status FROM migration_jobs{where}",
+            tuple(args)):
+            out.append(MigrationJob(wave_id=r["wave_id"] or "",
+                                     server_id=r["server_id"] or "",
+                                     status=r["status"] or ""))
+        return out
+
+    def query_migration_jobs(self, wave_id: Optional[str] = None,
+                             status: Optional[str] = None,
+                             server_id: Optional[str] = None,
+                             page: int = 1, page_size: int = 50) -> Dict[str, Any]:
+        """Paginated migration-jobs query — the listing endpoint shape.
+
+        ``list_migration_jobs`` returns the WHOLE result set (used by the
+        wave-scoped as-built context, where a wave has tens of jobs). The HTTP
+        endpoint must NOT load all 14K+ jobs + ``asdict`` each one every call
+        (traced at ~3.8s: 340ms DB filesort + 3.5s building 14K MigrationJob
+        objects). This returns one page + a cheap COUNT(*) total, mirroring
+        ``query_servers``'s shape so the frontend paginates the same way.
+        """
+        clauses: List[str] = []
+        args: List[Any] = []
+        if wave_id:
+            clauses.append("wave_id=?"); args.append(wave_id)
+        if status:
+            clauses.append("status=?"); args.append(status)
+        if server_id:
+            clauses.append("server_id=?"); args.append(server_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        total = self._scalar(f"SELECT COUNT(*) FROM migration_jobs{where}",
+                             tuple(args))
+        ps = max(1, min(page_size, 500))
+        off = max(0, (page - 1) * ps)
+        rows = self._fetchall(
+            f"SELECT * FROM migration_jobs{where} ORDER BY updated_at DESC "
+            f"LIMIT ? OFFSET ?",
+            tuple(args) + (ps, off))
+        return {"items": [self._row_to_migration_job(r).to_dict() for r in rows],
+                "total": int(total or 0), "page": page, "page_size": ps}
 
     # -- business case snapshots (F2 — immutable run history) --------------
     def save_business_case(self, snapshot_id: str, payload: Dict[str, Any],

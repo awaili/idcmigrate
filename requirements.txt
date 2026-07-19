@@ -10,5 +10,13 @@ typer>=0.9
 rich>=13
 # MariaDB backend (IDC_DB_URL=mysql://...)
 PyMySQL>=1.1
+# OpenTelemetry APM / perf logs. Env-gated via IDC_TRACE_FILE (off by default,
+# so these are only imported when tracing is on). HTTP + DB + outbound httpx
+# spans stream as JSONL to the configured file for later collection.
+opentelemetry-api>=1.20
+opentelemetry-sdk>=1.20
+opentelemetry-instrumentation-fastapi>=0.40b0
+opentelemetry-instrumentation-pymysql>=0.40b0
+opentelemetry-instrumentation-httpx>=0.40b0
 # Optional: openpyxl for reading RVTools .xlsx exports (CSV needs nothing)
 # openpyxl>=3.1

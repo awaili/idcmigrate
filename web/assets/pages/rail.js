@@ -15,12 +15,11 @@ async function loadRail(){
   const el = $('rail'); if(!el) return;
   el.innerHTML = '<span class="rail-loading">loading flow…</span>';
   // parallel fetch — each guarded so one endpoint failure doesn't blank the rail
-  const [stats, agg, strat, dbs, mjobs, rdy] = await Promise.all([
+  const [stats, agg, strat, dbs, rdy] = await Promise.all([
     api('/stats').catch(()=>null),
     api('/aggregations').catch(()=>null),
     api('/strategies').catch(()=>null),
     api('/db-profiles').catch(()=>null),
-    api('/migration-jobs').catch(()=>null),
     api('/readiness').catch(()=>null),
   ]);
   const s = stats || {};
@@ -30,7 +29,10 @@ async function loadRail(){
   const profiles = s.code_profiles || 0;
   const assigned = Array.isArray(strat) ? strat.length : 0;
   const dbN = Array.isArray(dbs) ? dbs.length : 0;
-  const jobsN = Array.isArray(mjobs) ? mjobs.length : 0;
+  // migration-jobs count comes from /api/stats (a COUNT(*)) — NOT from fetching
+  // the whole /api/migration-jobs list just to read .length (was loading 14K+
+  // full job objects + asdict each, ~3.8s on every rail render).
+  const jobsN = s.migration_jobs || 0;
   // readiness worst-case rollup across waves (red > yellow > green)
   let rdyLevel = null;
   if(Array.isArray(rdy) && rdy.length){

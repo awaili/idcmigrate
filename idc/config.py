@@ -236,6 +236,15 @@ class Settings:
         error/empty, like the inventory adapters)."""
         return (self.netdep_source or "").strip().lower() not in ("", "off")
 
+    # OpenTelemetry tracing (APM / perf logs). OFF by default (empty path):
+    # no TracerProvider is installed and the instrumentations are skipped,
+    # so the test suite and idle runs pay zero cost. Set IDC_TRACE_FILE to a
+    # writable path to enable — finished spans (HTTP / DB / outbound httpx)
+    # stream there as one JSONL line each, ready for a collector to ship later.
+    trace_file: str = field(default_factory=lambda: _env("IDC_TRACE_FILE"))
+    trace_service_name: str = field(default_factory=lambda: _env(
+        "IDC_TRACE_SERVICE_NAME", "idc-migrate"))
+
 
 _settings: Optional[Settings] = None
 
