@@ -400,6 +400,41 @@ def test_operator_disposition_endpoint_set_retain_then_retire_then_clear():
         st.close()
 
 
+def test_servers_endpoint_exposes_seven_r_matching_disposition():
+    """The Inventory list + detail endpoints expose a per-row ``seven_r``
+    policy that honors the host-level disposition override (retain/retire set
+    via the drawer) — the SAME source of truth as the Business case, so the
+    Inventory's 7R column matches the Business case's 7R for a given host.
+    With no override + no app strategy the host defaults to rehost."""
+    sid, host = _seed_server()
+    try:
+        # baseline: no override, no app strategy -> rehost (both list + detail)
+        d = client.get(f"/api/servers/{sid}").json()
+        assert d["seven_r"] == "rehost"
+        row = next((x for x in client.get("/api/servers").json()["items"]
+                   if x["id"] == sid), None)
+        assert row is not None and row["seven_r"] == "rehost"
+
+        # set retain -> seven_r flips to retain on both list + detail
+        client.put(f"/api/servers/{sid}/disposition", json={"disposition": "retain"})
+        d = client.get(f"/api/servers/{sid}").json()
+        assert d["disposition"] == "retain"
+        assert d["seven_r"] == "retain"
+        row = next((x for x in client.get("/api/servers").json()["items"]
+                   if x["id"] == sid), None)
+        assert row["seven_r"] == "retain"
+
+        # clear -> back to rehost
+        client.put(f"/api/servers/{sid}/disposition", json={"disposition": ""})
+        assert client.get(f"/api/servers/{sid}").json()["seven_r"] == "rehost"
+    finally:
+        _disp_cleanup(host)
+        st = open_store(get_settings().db_url)
+        with st.tx() as cur:
+            cur.execute(st._x("DELETE FROM servers WHERE id=?"), (sid,))
+        st.close()
+
+
 def test_operator_disposition_endpoint_rejects_invalid():
     sid, host = _seed_server()
     try:

@@ -82,6 +82,32 @@ class Settings:
     claude_timeout: int = field(default_factory=lambda: _env_int("IDC_CLAUDE_TIMEOUT", 600))
     claude_default_mode: str = field(default_factory=lambda: _env("IDC_CLAUDE_DEFAULT_MODE", "plan"))
 
+    # agent runner selection + the Codex CLI backend (openai/codex, Apache-2.0).
+    # IDC_AGENT_RUNNER picks which CLI backs the agentic layer (Terraform emit,
+    # runbooks, pre-flight checks): "claude" (Claude Code CLI, the original) or
+    # "codex" (codex exec). Default "claude" preserves prior behavior; set
+    # "codex" to switch — the two runners share the same public surface so
+    # call sites (CLI + /api/agent/run) don't change.
+    agent_runner: str = field(default_factory=lambda: _env("IDC_AGENT_RUNNER", "claude"))
+    # codex backend. IDC_CODEX_MODEL is the Ollama model the agent uses — pick
+    # from the Ollama Cloud catalog (e.g. glm-5.2:cloud, kimi-k2:cloud,
+    # qwen3.5:cloud); :cloud models are routed via Ollama Cloud, no local pull.
+    # Default mirrors the MigraQ LLMClient model so one model powers both the
+    # chat copilot and the agentic layer.
+    codex_bin: str = field(default_factory=lambda: _env("IDC_CODEX_BIN", "codex"))
+    codex_timeout: int = field(default_factory=lambda: _env_int("IDC_CODEX_TIMEOUT", 600))
+    codex_model: str = field(default_factory=lambda: _env("IDC_CODEX_MODEL", "glm-5.2:cloud"))
+    # ollama (the box's setup, 127.0.0.1:11434) | lmstudio — the local OSS
+    # provider codex talks to via --oss --local-provider.
+    codex_provider: str = field(default_factory=lambda: _env("IDC_CODEX_PROVIDER", "ollama"))
+
+    # IDC_SKILLS_DIR = optional operator overlay dir for LLM skills. Built-in
+    # skills live in idc/skills/*.md; this dir is loaded AFTER the built-ins and
+    # overrides by name — the edit surface for customizing 7R / waveplan / audit
+    # / lz / ... behavior as markdown, no Python edit. Empty (default) = built-ins
+    # + registered _FALLBACKS only. See idc/llm/skills.py + idc/llm/runner.py.
+    skills_dir: str = field(default_factory=lambda: _env("IDC_SKILLS_DIR"))
+
     # external agent executor (code scan / comb / modify)
     # IDC_EXECUTOR_URL = base URL of the executor (idc→executor direction).
     # IDC_EXECUTOR_TOKEN = shared bearer secret (also validates push callbacks).
@@ -97,6 +123,13 @@ class Settings:
     # own callback-base env (back-compat). Overridable at runtime via the
     # Manage-executor panel (DB system_config `public_url`).
     public_url: str = field(default_factory=lambda: _env("IDC_PUBLIC_URL"))
+    # IDC_ENROLL_SECRET = optional gate on executor self-registration
+    # (POST /api/executors/register). When set (env or DB `enroll_secret`
+    # override), an executor must send X-Enroll-Secret matching this to enroll.
+    # When empty, self-registration is open — but every enrollment lands
+    # pending and inert until an operator approves it (the approval gate is
+    # the security control; this secret only caps pending-list spam).
+    enroll_secret: str = field(default_factory=lambda: _env("IDC_ENROLL_SECRET"))
 
     # web UI password gate. IDC_WEB_PASSWORD = the shared login password; when
     # empty (and no DB override), auth is OFF and the UI/API are open. A DB

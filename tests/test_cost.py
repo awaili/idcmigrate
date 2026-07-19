@@ -8,10 +8,11 @@ import pytest
 from idc.config import get_settings, reset_settings
 from idc.core.cost import (
     PriceBook, _lookup, _spec_price_key, estimate_portfolio, estimate_server,
-    load_pricebook, strategies_from_tags, what_if, TAG_RETAIN, TAG_RETIRE,
+    host_disposition_for, load_pricebook, strategies_from_tags, what_if,
+    TAG_RETAIN, TAG_RETIRE,
 )
 from idc.core.models import (
-    AppStrategy, CostEstimate, Match, Server, Target,
+    AppStrategy, CostEstimate, LegacyDisposition, Match, Server, Target,
     PATTERN_RETAIN, PATTERN_RETIRE, PATTERN_REHOST, STRATEGY_SOURCE_OPERATOR,
 )
 
@@ -103,6 +104,62 @@ def test_estimate_portfolio_retain_retire_contribute_zero_cloud_cost():
     assert out["cloud_yearly"] == pytest.approx(650, abs=0.5)
     assert out["per_strategy"]["retire"]["yearly"] == 0.0
     assert out["per_strategy"]["rehost"]["yearly"] == pytest.approx(650, abs=0.5)
+
+
+def test_estimate_portfolio_host_disposition_overrides_app_strategy():
+    """The Business case 7R policy must match the Inventory drawer's Disposition
+    row: a host the operator set to retain/retire (legacy_dispositions, surfaced
+    in the drawer) overrides the app-level AI strategy in the per-server row —
+    NOT just the app-level strategy / tag-driven path. Otherwise a retain/retire
+    host shows up as ``rehost`` in the Business case while the Inventory shows
+    retain/retire (the gap this pins)."""
+    reset_settings()
+    book = load_pricebook(get_settings(), refresh=True)
+    s1 = _srv("a1", app_ids=["app1"])   # would default to rehost (650/yr)
+    s2 = _srv("a2", app_ids=["app2"])   # app-level AI says rehost, host says retain
+    matches = [_mat(s1, "CVM", "SA5.MEDIUM4", "ap-bangkok"),
+               _mat(s2, "CVM", "SA5.MEDIUM4", "ap-bangkok")]
+    strategies = {"app2": AppStrategy(app_id="app2", strategy=PATTERN_REHOST,
+                                     source="ai")}
+    # host-level override: s2 -> retain (as if set via the drawer)
+    host_dispositions = {s2.id: PATTERN_RETAIN}
+    out = estimate_portfolio([s1, s2], matches, book, strategies=strategies,
+                             host_dispositions=host_dispositions)
+    rows = {r["server_id"]: r for r in out["per_server"]}
+    assert rows[s1.id]["strategy"] == "rehost"
+    # s2's host-level retain wins over its app-level rehost AI strategy
+    assert rows[s2.id]["strategy"] == PATTERN_RETAIN
+    # retain host excluded from cloud cost (same as the tag/app-strategy path)
+    assert out["cloud_yearly"] == pytest.approx(650, abs=0.5)
+    assert out["per_strategy"]["retain"]["servers"] == 1
+    assert out["per_strategy"]["retain"]["yearly"] == 0.0
+
+
+def test_estimate_portfolio_host_disposition_empty_is_noop():
+    """An empty host_dispositions map (no overrides set) leaves the app-level
+    strategy unchanged — back-compatible with every caller that passes {}."""
+    reset_settings()
+    book = load_pricebook(get_settings(), refresh=True)
+    s1 = _srv("a1", app_ids=["app1"])
+    matches = [_mat(s1, "CVM", "SA5.MEDIUM4", "ap-bangkok")]
+    out = estimate_portfolio([s1], matches, book, strategies={}, host_dispositions={})
+    assert out["per_server"][0]["strategy"] == "rehost"
+
+
+def test_host_disposition_for_matches_drawer_key_precedence():
+    """``host_disposition_for`` tries the same stable-identity keys the Inventory
+    drawer + wave planner use (hostname lowercased → identity_key → server id),
+    first hit wins, and only retain/retire count (a containerize disposition
+    describes *how* to migrate, not *whether*, so it must not override the 7R)."""
+    s = _srv("HostA", app_ids=["app1"])
+    retain = LegacyDisposition(server_id="hosta", disposition=PATTERN_RETAIN)
+    # lookup keyed by hostname lowercased matches first
+    assert host_disposition_for(s, lambda k: retain if k == "hosta" else None) == PATTERN_RETAIN
+    # a non-migrating-but-not-retain/retire disposition is ignored
+    cont = LegacyDisposition(server_id="hosta", disposition="containerize")
+    assert host_disposition_for(s, lambda k: cont if k == "hosta" else None) == ""
+    # no override set -> migrate
+    assert host_disposition_for(s, lambda k: None) == ""
 
 
 # -- what-if ----------------------------------------------------------------

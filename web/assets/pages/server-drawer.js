@@ -1,7 +1,6 @@
 /* ---------- server drawer ---------- */
-const _7R_COLORS = {'rehost':'var(--green)','rehost-container':'var(--green)',
-  'relocate':'var(--green)','replatform':'#3b8eea','refactor':'var(--amber)',
-  'repurchase':'#a06bff','retain':'#888','retire':'#e5484d'};
+// _7R_COLORS lives in app.js now (shared with code.js — both used to
+// redeclare it, which aborted the page script).
 function _stratBadge(s){ if(!s) return '<span class="muted">-</span>'; return `<span style="color:${_7R_COLORS[s]||'var(--fg)'};font-weight:600">${esc(s)}</span>`; }
 function _disksHtml(disks, u){
   // per-partition list with three columns — Label | Mount | Size — plus a total.
@@ -74,6 +73,7 @@ function _codeSection(code){
     const ends = (c.network_endpoints||[]).slice(0,8).map(e=>`<span class="tag">${esc(e)}</span>`).join(' ')||'-';
     const deps = (c.code_deps||[]).slice(0,8).map(d=>`<span class="tag">${esc(d)}</span>`).join(' ')||'-';
     const blockers = (c.blockers||[]).length ? `<div style="color:var(--amber)">⚠ blockers: ${esc(c.blockers.join('; '))}</div>` : '';
+    const agentBlockers = (c.agent_blockers||[]).length ? `<div style="color:var(--amber);margin-top:2px">🤖 agent blockers (read from repo, weight HIGHER): ${esc(c.agent_blockers.join('; '))}</div>` : '';
     return `<div class="mcard" style="padding:6px 8px;margin-top:6px">
       <div class="row" style="justify-content:space-between;align-items:baseline">
         <b>${esc(c.app_id)}</b>
@@ -85,6 +85,7 @@ function _codeSection(code){
         <span><span class="muted">effort</span> ${esc((c.ai_strategy||{}).effort||c.refactor_effort||'-')}</span>
         <span><span class="muted">readiness</span> ${c.cloud_readiness==null?'-':c.cloud_readiness.toFixed(2)}</span>
         <span><span class="muted">findings</span> ${c.findings_count||0}</span>
+        ${(c.agent_findings_count||0)?`<span><span class="muted">🤖 agent</span> ${c.agent_findings_count}</span>`:''}
         <span><span class="muted">changes</span> ${c.required_changes_count||0}</span>
       </div>
       ${c.ai_strategy&&c.ai_strategy.rationale?`<div class="muted" style="font-size:11px;margin:2px 0">AI: ${esc(c.ai_strategy.rationale)}</div>`:''}
@@ -92,15 +93,31 @@ function _codeSection(code){
       <div class="muted" style="font-size:11px;margin-bottom:2px">calls (code-discovered endpoints)</div><div style="margin-bottom:4px">${ends}</div>
       <div class="muted" style="font-size:11px;margin-bottom:2px">code deps (other apps)</div><div style="margin-bottom:4px">${deps}</div>
       ${blockers}
+      ${agentBlockers}
       ${c.summary?`<div class="muted" style="font-size:11px;margin-top:3px">${esc(c.summary)}</div>`:''}
       <div class="row" style="margin-top:4px;gap:6px"><button class="sm primary" onclick="drawerSevenR('${attr(c.app_id)}')">7R strategy</button><span class="muted" style="font-size:11px">scanned ${esc(c.scanned_at||'-')}</span></div>
     </div>`;
   }).join('');
   return `<div style="margin-top:8px"><div class="muted" style="font-size:12px;margin-bottom:2px">Code scan (executor feedback — migration-strategy reference)</div>${cards}</div>`;
 }
+// render the git sources bound to a host (via the Code tab) as chips, mirroring
+// the Tags / Provenance rows. repo shape: {repo_id, url, branch, name}.
+function _gitSourceHtml(repos){
+  if(!repos || !repos.length) return '-';
+  return repos.map(r=>{
+    const label = esc(r.name || r.url);
+    const branch = r.branch ? ` <span class="muted" style="font-size:11px">@${esc(r.branch)}</span>` : '';
+    return `<span class="tag" title="${attr(r.url)}">${label}${branch}</span>`;
+  }).join(' ');
+}
 function openServer(id){
   // fetch fresh full record (the row in state.last may be a partial list row)
-  fetch(API+'/servers/'+id).then(r=>r.json()).then(s=>{
+  // in parallel, fetch the git sources bound to this host from the Code tab
+  // (the /servers/{id} record carries AI-scan strategy, NOT the bound repos).
+  Promise.all([
+    fetch(API+'/servers/'+id).then(r=>r.json()),
+    api('/hosts/'+encodeURIComponent(id)+'/repos').catch(()=>[]),   // best-effort: empty on error
+  ]).then(([s, repos])=>{
     const m=s.match||{}, u=s.utilization||{};
     window._drawerServer = s;   // current record for setDisposition pre-select
     $('dTitle').textContent=s.hostname;
@@ -114,18 +131,23 @@ function openServer(id){
         ${kv('Network', `${esc((s.ips||[]).join(', ')||'-')} · ${esc(s.subnet||'-')} · ${esc(s.vlan||'-')}`)}
         ${kv('Env / Crit', `${esc(s.env||'-')} <span class="pill ${esc(s.business_criticality||'')}">${esc(s.business_criticality||'-')}</span>`)}
         ${kv('Apps', esc((s.app_ids||[]).join(', ')||'-'))}
+        ${kv('Git source', _gitSourceHtml(repos))}
         ${kv('Tags', (s.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join(' ')||'-')}
         ${kv('Utilization', `cpu ${u.cpu_p95??'-'}% · mem ${u.mem_p95??'-'}% · disk ${u.disk_used_pct??'-'}% <span class="muted">(${esc(u.source||'-')})</span>`)}
         ${kv('Provenance', (s.source_refs||[]).map(r=>`<span class="tag">${esc(r.source)}:${esc(r.source_id)}</span>`).join(' ')||'-')}
         ${kv('Coverage', _coverageBadge(s, m))}
         ${kv('Warranty', _warrantyBadge(s))}
         ${kv('OS support', _osEolBadge(s))}
+        ${kv('7R policy', `${_stratBadge(s.seven_r)} <span class="muted">· ${esc(s.seven_r_source||'-')}</span>`)}
         ${kv('Disposition', _dispositionBadge(s))}
+        ${kv('Wave(s)', ((s.waves||[]).length?(s.waves||[]).map(w=>`<span class="tag">${esc(w.name||w.id)}<span class="muted" style="font-size:10px"> · ${esc(w.stage||'-')}</span></span>`).join(' '):'<span class="muted">-</span>'))}
         ${kv('Target', `<b>${m.target?esc(m.target.product):'-'}</b> ${m.target?esc(m.target.spec):''} <span class="muted">@ ${m.target?esc(m.target.region):''}</span>`)}
+        ${kv('Cost', _costBadge(s.cost))}
         ${kv('Rule', m.rationale?esc(m.rationale):'-')}
+        ${kv('Alternatives', (m.alternatives&&m.alternatives.length)?m.alternatives.map(a=>`<span class="tag" style="color:var(--muted)">${esc(a)}</span>`).join(' '):'<span class="muted">-</span>')}
       </div>
       ${_codeSection(s.code)}
-      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">MigraQ explain match</button><button onclick="rightSize('${s.id}')">right-size</button><button onclick="drawerAudit('${s.id}')">audit target</button><button onclick="setWarranty('${s.id}')">set warranty</button><button onclick="setDisposition('${s.id}')">set disposition</button></div>
+      <div class="row"><button class="primary" onclick="explainServer('${s.id}')">MigraQ explain match</button><button class="primary" onclick="drawerSevenRHost('${s.id}')">Analyze 7R</button><button onclick="rightSize('${s.id}')">right-size</button><button onclick="drawerAudit('${s.id}')">audit target</button><button onclick="setWarranty('${s.id}')">set warranty</button><button onclick="setDisposition('${s.id}')">set disposition</button></div>
       <pre id="dExplain" style="margin-top:10px"></pre>`;
     openDrawer();
   }).catch(e=>{ $('dTitle').textContent='Error'; $('dBody').innerHTML='<span class="ev-err">'+esc(String(e))+'</span>'; openDrawer(); });
@@ -144,6 +166,36 @@ async function drawerSevenR(appId){
     $('dExplain').textContent =
       `${r.app_id} → ${r.strategy} (target ${r.target||'-'}, effort ${r.effort||'-'}, conf ${r.confidence!=null?r.confidence.toFixed(2):'-'})\n`+
       `${r.rationale||''}\n` + (kc?`key changes:\n${kc}`:'');
+  }catch(e){ $('dExplain').innerHTML='<span class="ev-err">Error: '+esc(e)+'</span>'; }
+}
+async function drawerSevenRHost(id){
+  // per-host 7R analysis (sibling of the per-app drawerSevenR). Asks the MigraQ
+  // what 7R fits THIS host, grounded in the host's full context, and shows
+  // current-vs-recommended. Advisory — does not mutate; the hint tells the
+  // operator which action button to use to act on the recommendation.
+  $('dExplain').innerHTML = `<span class="spinner"></span> asking the MigraQ for a 7R strategy for this host…`;
+  try{
+    const r = await api('/strategy/host',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({server_id:id})});
+    if(!r.ok){ $('dExplain').innerHTML = `<span class="ev-err">7R analysis failed: ${esc(r.error||'unknown')}</span>`; return; }
+    const kc = (r.key_changes||[]).map(k=>`  • ${esc(k)}`).join('\n');
+    const same = r.strategy === r.current_7r;
+    const sameTxt = same ? '<span class="muted">(same as current — no change needed)</span>'
+                         : '<span style="color:var(--amber)">(differs from current)</span>';
+    const actHint = ['retain','retire'].includes(r.strategy)
+      ? `use <b>set disposition</b> to keep this host ${esc(r.strategy)}.`
+      : `use the per-app <b>7R strategy</b> button in the code scan card (a migrating R affects every host of the app).`;
+    $('dExplain').innerHTML =
+      `<div class="mcard" style="padding:10px">
+        <div class="row" style="gap:14px;flex-wrap:wrap;align-items:baseline">
+          <span><span class="muted">current 7R</span> ${_stratBadge(r.current_7r)}</span>
+          <span><span class="muted">recommended</span> ${_stratBadge(r.strategy)}</span>
+          ${sameTxt}
+        </div>
+        <div style="margin-top:6px">${_stratBadge(r.strategy)} → ${esc(r.target||'-')} <span class="muted">· effort ${esc(r.effort||'-')} · conf ${r.confidence!=null?r.confidence.toFixed(2):'-'}</span></div>
+        <div class="muted" style="font-size:12px;margin-top:4px">${esc(r.rationale||'')}</div>
+        ${kc?`<pre class="muted" style="font-size:11px;margin-top:4px;white-space:pre-wrap">key changes:\n${esc(kc)}</pre>`:''}
+        <div class="muted" style="font-size:11px;margin-top:6px">Advisory. To act: ${actHint}</div>
+      </div>`;
   }catch(e){ $('dExplain').innerHTML='<span class="ev-err">Error: '+esc(e)+'</span>'; }
 }
 async function drawerAudit(id){
@@ -196,6 +248,18 @@ async function saveWarranty(id){
     $('dExplain').innerHTML='';
     openServer(id);  // re-open to refresh the badge
   }catch(e){ toast('set warranty failed: '+e, 'err'); }
+}
+
+// ---------- run-cost (F2) ----------
+function _money(n){ return '$'+Number(n||0).toLocaleString(undefined,{maximumFractionDigits:0}); }
+function _costBadge(c){
+  // c = {monthly,yearly,product,spec,region,basis,pricing_source} or null (no
+  // pricebook / no match). Renders the host's cloud run-cost + sizing basis.
+  if(!c) return '<span class="muted">-</span>';
+  const zero = !(c.monthly||0) && !(c.yearly||0);
+  const val = zero ? '<span class="muted">unpriced</span>'
+    : `<b>${_money(c.yearly)}/yr</b> <span class="muted">· ${_money(c.monthly)}/mo</span>`;
+  return `${val} <span class="muted">· ${esc(c.basis||'-')} · ${esc(c.pricing_source||'-')}</span>`;
 }
 
 // ---------- host disposition (retain / retire) ----------

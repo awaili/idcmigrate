@@ -543,6 +543,28 @@ def _fake_runtime_profile(app_id: str, server_id: str, scan_id: str) -> Dict[str
     }
 
 
+def _fake_discover_repos(url: str) -> List[Dict[str, Any]]:
+    """A plausible discovery: parse a git group/org url and synthesize the child
+    repositories inside it. A real executor calls the SCM REST API (GitLab
+    ``/groups/:id/projects?include_subgroups=true``, GitHub ``/orgs/:org/repos``)
+    or walks ``git ls-remote`` refs with its own credentials; this mock just
+    derives deterministic child urls from the group path so the discovery UI is
+    demoable without SCM access. A single-repo url (``.git``) yields itself."""
+    u = (url or "").strip().rstrip("/")
+    base = u[:-4] if u.endswith(".git") else u
+    name = base.rsplit("/", 1)[-1] if "/" in base else base
+    # single-repo url -> just that repo (its own default branch)
+    if u.endswith(".git"):
+        return [{"url": u, "name": name, "branch": "main",
+                 "description": f"{name} (single repository)",
+                 "web_url": base}]
+    # group/org url -> a deterministic set of child repos under it
+    children = ["api", "web", "worker", "shared", "migrations"]
+    return [{"url": f"{base}/{c}.git", "name": c, "branch": "main",
+             "description": f"{name}/{c} service",
+             "web_url": f"{base}/{c}"} for c in children]
+
+
 # ---------------------------------------------------------------------------
 # per-kind workers — take the task payload dict + task id, push results back,
 # and return {summary, result_ref} so the poller can mark the task complete.
@@ -756,6 +778,26 @@ async def _run_test_compare(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
     return {"summary": summary, "result_ref": ""}
 
 
+async def _run_discover_repos(p: Dict[str, Any], tid: str) -> Dict[str, Any]:
+    """Discover the repositories inside a git group/org url (the Code tab's
+    "scan a git group" action). Pushes the discovered list back to
+    ``PUT /api/repos/discover/{scan_id}/result``. The mock derives deterministic
+    child repos; a real executor walks the SCM API / ls-remote with its creds."""
+    scan_id = p.get("scan_id", "")
+    url = p.get("url", "")
+    cb = p.get("callback") or None
+    await _push("/api/change-jobs", _job(tid, "discover-repos", p, "running",
+                                         summary="discovering repositories…"))
+    await asyncio.sleep(0.5)
+    repos = _fake_discover_repos(url)
+    summary = f"discover-repos {url}; {len(repos)} repo(s) found"
+    await _push("/api/change-jobs", _job(tid, "discover-repos", p, "done",
+                                         summary=summary, finished_at=_now()))
+    await _push(f"/api/repos/discover/{scan_id}/result", {"repos": repos},
+                method="PUT", url=cb)
+    return {"summary": summary, "result_ref": ""}
+
+
 # map task kind -> worker
 _WORKERS = {
     "scan": _run_scan,
@@ -771,6 +813,7 @@ _WORKERS = {
     "test-gen": _run_test_gen,
     "test-run": _run_test_run,
     "test-compare": _run_test_compare,
+    "discover-repos": _run_discover_repos,
 }
 
 

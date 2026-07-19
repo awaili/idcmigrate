@@ -323,9 +323,60 @@ def _strategy_for(server: Server, strategies: Dict[str, AppStrategy],
     return "rehost"
 
 
+def host_disposition_for(server: Server, get_disp) -> str:
+    """Per-host retain/retire override for a server, or "" (migrate).
+
+    ``get_disp(key)`` is a lookup that returns either a ``LegacyDisposition``
+    (the store's per-key row) OR a bare disposition string (from a preloaded
+    ``{key: "retain"|"retire"}`` map), or None. Tries the SAME stable-identity
+    keys the Inventory drawer's Disposition row + the wave planner match by
+    (hostname lowercased, identity_key, server id), so every consumer reads
+    the SAME override the operator set in the Inventory — the 7R policy shown
+    on both pages is then identical. Only retain/retire are host-level 7R
+    outcomes; other legacy dispositions (containerize/replatform/rewrite)
+    describe *how* to migrate, not *whether*, so they don't override the
+    app-level 7R strategy here.
+    """
+    for k in (server.hostname.lower().strip(),
+              getattr(server, "identity_key", ""), server.id):
+        if not k:
+            continue
+        d = get_disp(k)
+        if d is None:
+            continue
+        disp = getattr(d, "disposition", None)
+        if disp is None and isinstance(d, str):
+            disp = d
+        if disp in (PATTERN_RETAIN, PATTERN_RETIRE):
+            return disp
+    return ""
+
+
+def seven_r_for(server: Server, strategies: Dict[str, AppStrategy],
+                get_disp=None) -> str:
+    """The 7R policy for one host — the SINGLE source of truth shared by the
+    Inventory list, the Business case, and the CLI so all three show the same
+    7R for a given host.
+
+    Precedence (identical to ``estimate_portfolio``'s per-host logic):
+      1. host-level retain/retire override (``legacy_dispositions`` — the
+         Inventory drawer's "set disposition" button) when ``get_disp`` is
+         provided — wins over the app-level AI strategy, matching the drawer's
+         "Override the app-level 7R rule for this host" contract;
+      2. else the first of the host's apps that has an AI strategy;
+      3. else ``rehost``.
+    """
+    if get_disp is not None:
+        hd = host_disposition_for(server, get_disp)
+        if hd:
+            return hd
+    return _strategy_for(server, strategies)
+
+
 def estimate_portfolio(servers: List[Server], matches: List[Match],
                        book: PriceBook,
-                       strategies: Optional[Dict[str, AppStrategy]] = None
+                       strategies: Optional[Dict[str, AppStrategy]] = None,
+                       host_dispositions: Optional[Dict[str, str]] = None,
                        ) -> Dict[str, Any]:
     """Portfolio TCO + per-strategy rollup (F2).
 
@@ -334,6 +385,7 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
     / per-region / per-strategy breakdowns.
     """
     strategies = strategies or {}
+    host_dispositions = host_dispositions or {}
     match_by_id = {m.server_id: m for m in matches}
     per_server: List[Dict[str, Any]] = []
     cloud_monthly = cloud_yearly = 0.0
@@ -350,6 +402,15 @@ def estimate_portfolio(servers: List[Server], matches: List[Match],
             continue
         est = estimate_server(s, m, book)
         strat = _strategy_for(s, strategies)
+        # host-level disposition override (retain/retire) set via the Inventory
+        # drawer's "set disposition" button wins over the app-level AI 7R
+        # strategy — same precedence the drawer documents ("Override the
+        # app-level 7R rule for this host") and the wave planner honors. This
+        # keeps the 7R policy shown in the Business case identical to the one
+        # shown in the Inventory for a given host.
+        hd = host_dispositions.get(s.id)
+        if hd in (PATTERN_RETAIN, PATTERN_RETIRE):
+            strat = hd
         migrating = strat not in (PATTERN_RETAIN, PATTERN_RETIRE)
         # non-migrating strategies (retain/retire) contribute 0 cloud cost AND
         # are excluded from the on-prem baseline: a retain host stays on-prem
@@ -420,7 +481,8 @@ def what_if(servers: List[Server], matches: List[Match], book: PriceBook,
             region: Optional[str] = None,
             sizing: Optional[str] = None,
             byol: Optional[bool] = None,
-            strategies: Optional[Dict[str, AppStrategy]] = None) -> Dict[str, Any]:
+            strategies: Optional[Dict[str, AppStrategy]] = None,
+            host_dispositions: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Re-estimate the portfolio under alternate assumptions (F3 driver).
 
     Supports three independent overrides (composable), applied without
@@ -439,7 +501,8 @@ def what_if(servers: List[Server], matches: List[Match], book: PriceBook,
     """
     import dataclasses
     from . import match as match_mod
-    baseline = estimate_portfolio(servers, matches, book, strategies)
+    baseline = estimate_portfolio(servers, matches, book, strategies,
+                                  host_dispositions=host_dispositions)
     applied: Dict[str, Any] = {"region": region, "sizing": sizing, "byol": byol}
     if not region and not sizing and byol is None:
         return {"baseline": baseline, "alternate": None, "delta": None,
@@ -459,7 +522,8 @@ def what_if(servers: List[Server], matches: List[Match], book: PriceBook,
                                              az=match_mod._az(region))
             nm = dataclasses.replace(nm, target=new_target)
         alt_matches.append(nm)
-    alternate = estimate_portfolio(servers, alt_matches, book, strategies)
+    alternate = estimate_portfolio(servers, alt_matches, book, strategies,
+                                   host_dispositions=host_dispositions)
     delta = round(alternate["cloud_yearly"] - baseline["cloud_yearly"], 2)
     return {"baseline": baseline, "alternate": alternate, "delta": delta,
             "applied": applied}

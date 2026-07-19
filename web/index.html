@@ -15,7 +15,8 @@
     <div class="tab" data-tab="inventory">Inventory</div>
     <div class="tab" data-tab="lz">Landing Zone</div>
     <div class="tab" data-tab="waves">Waves</div>
-    <div class="tab" data-tab="code">Code &amp; DB</div>
+    <div class="tab" data-tab="sources">Code</div>
+    <div class="tab" data-tab="code">Scan &amp; Migrate</div>
     <div class="tab" data-tab="business-case">Business Case</div>
     <div class="tab" data-tab="execution">Execution</div>
     <div class="tab" data-tab="testing">Testing</div>
@@ -23,6 +24,7 @@
     <div class="tab" data-tab="readiness">Readiness</div>
     <div class="tab" data-tab="data-quality">Data Quality</div>
     <div class="tab" data-tab="copilot">Copilot</div>
+    <div class="tab" data-tab="skills">Skills</div>
   </div>
   <div class="stats" id="stats"></div>
   <div class="row">
@@ -94,7 +96,25 @@
         <button class="sm" onclick="resetFilters()">reset</button>
         <span style="flex:1"></span>
         <span id="activeChips" class="row"></span>
+        <button class="sm" onclick="toggleInvBatch7R()">Analyze all 7R</button>
         <button class="sm primary" onclick="exportCsv()">Export CSV</button>
+      </div>
+      <!-- bulk per-host 7R analysis (AI / seven_r skill) over the current filter -->
+      <div id="invBatch7R" class="mcard" style="margin-top:10px;display:none">
+        <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center">
+          <b>Analyze all 7R</b>
+          <span class="muted" id="invBatch7RCount">— hosts (current filter)</span>
+          <label class="muted" title="Apply each host's recommended 7R (retain/retire → host disposition; migrating R → clear override + fill the app's missing strategy). Off = dry-run preview.">
+            <input type="checkbox" id="invBatch7RApply" style="vertical-align:middle"/> apply recommendations
+          </label>
+          <label class="muted">batch size
+            <input type="number" id="invBatch7RLimit" value="50" min="1" max="500" style="width:70px" title="hosts per batch — committed before the next batch; the run resumes from the last committed batch if interrupted"/>
+          </label>
+          <button class="sm primary" id="invBatch7RRun" onclick="runInvBatch7R()">Run</button>
+          <button class="sm" onclick="toggleInvBatch7R()">close</button>
+          <span class="muted" style="font-size:11px">MigraQ <b>seven_r</b> skill · ~3s/host · processes the whole filter in batches, committed per batch, resumable.</span>
+        </div>
+        <div id="invBatch7ROut" style="margin-top:8px"></div>
       </div>
     </div>
     <div class="grid2">
@@ -293,141 +313,359 @@
     </div>
   </section>
 
-  <!-- ===================== CODE (external agent executor) ===================== -->
-  <section id="tab-code" class="tabsec hidden">
+  <!-- ===================== SKILLS (LLM skill management) ==================== -->
+  <section id="tab-skills" class="tabsec hidden">
     <div class="card" style="padding:8px 14px;background:var(--card)">
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <b>Executor contract guide</b>
-        <a class="sm" href="/executor" target="_blank" rel="noopener">Open the full contract ↗</a>
-        <span class="muted" style="font-size:12px">what an executor must implement: the actions, push callbacks, schemas, auth, and how to connect one or more executors. Also in <code>docs/agent-executor.md</code>.</span>
+      <div style="font-size:12px" class="muted">Manage the <b>LLM skills</b> that drive 7R / audit / wave-runbook / plan-review / LZ / network / waveplan. A skill = a system prompt + config (and, for codex skills, bundled reference files + python scripts). Edit one here to change the AI's behavior — no Python, no restart. <b>Try</b> runs an unsaved edit before you commit; <b>Diff</b> shows what you changed vs the default; <b>Undo</b> reverts the last save.</div>
+    </div>
+    <div id="skillsBanner" class="card" style="display:none;padding:8px 14px"></div>
+    <div class="row cols" style="gap:14px;align-items:flex-start">
+      <!-- LEFT: catalog -->
+      <div style="flex:0 0 280px">
+        <div class="card">
+          <h2>Skills</h2>
+          <input id="skSearch" placeholder="search skills…" style="width:100%;margin-bottom:8px" oninput="renderSkillCatalog()">
+          <div id="skillsList" class="muted">Loading…</div>
+          <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+            <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">new skill from template</div>
+            <div class="row" style="gap:6px;flex-wrap:wrap">
+              <button class="sm" onclick="newSkill('chat')">chat</button>
+              <button class="sm" onclick="newSkill('codex')">codex</button>
+              <button class="sm" onclick="newSkill('codex_resources')">codex + files</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- MIDDLE: editor -->
+      <div style="flex:1;min-width:0">
+        <div class="card">
+          <h2><span id="skName">Select a skill</span> <span id="skBadge" class="muted"></span></h2>
+          <div id="skWarn" class="card" style="display:none;padding:6px 10px;border-left:3px solid var(--amber);background:rgba(210,153,34,.08);font-size:12px;margin-bottom:8px"></div>
+          <!-- config form -->
+          <div id="skConfig" style="display:none;border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:10px">
+            <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">config</div>
+            <div class="row cols" style="gap:10px;flex-wrap:wrap">
+              <label style="flex:1;min-width:120px"><span class="muted" style="font-size:11px">backend</span>
+                <select id="skBackend" onchange="onBackendChange()"><option value="chat">chat (one LLM call)</option><option value="codex">codex (agent + tools)</option></select></label>
+              <label style="flex:1;min-width:120px"><span class="muted" style="font-size:11px">output</span>
+                <select id="skOutput"><option value="json">json</option><option value="text">text</option></select></label>
+              <label id="skModeWrap" style="flex:1;min-width:120px;display:none"><span class="muted" style="font-size:11px">mode (codex)</span>
+                <select id="skMode"><option value="plan">plan (read-only)</option><option value="execute">execute (write+run)</option></select></label>
+              <label style="flex:1;min-width:120px"><span class="muted" style="font-size:11px">max_rounds</span>
+                <input id="skRounds" type="number" min="1" step="1" value="1" style="width:100%"></label>
+              <label style="flex:1;min-width:120px"><span class="muted" style="font-size:11px">model (override)</span>
+                <input id="skModel" placeholder="default" style="width:100%"></label>
+              <label style="flex:1;min-width:120px"><span class="muted" style="font-size:11px">validator</span>
+                <input id="skValidator" placeholder="—" style="width:100%"></label>
+            </div>
+            <label style="display:block;margin-top:6px"><span class="muted" style="font-size:11px">description (when it fires)</span>
+              <input id="skDesc" style="width:100%" placeholder="one-line summary"></label>
+          </div>
+          <!-- prompt body -->
+          <div class="row" style="margin-bottom:6px;align-items:center;gap:8px">
+            <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.05em">system prompt body</span>
+            <span id="skTokMeter" class="muted" style="font-size:11px;font-family:var(--mono)"></span>
+          </div>
+          <textarea id="skEditor" rows="16" style="width:100%;font-family:var(--mono);font-size:12px" placeholder="the system-prompt body — what the LLM/agent receives" oninput="updateTokenMeter()" disabled></textarea>
+          <div id="skDiff" style="display:none;margin-top:8px;border:1px solid var(--border);border-radius:6px;padding:8px;max-height:260px;overflow:auto;font-family:var(--mono);font-size:11px;white-space:pre-wrap"></div>
+          <div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap;align-items:center">
+            <button class="primary" id="skTryBtn" onclick="trySkill()" disabled>Try…</button>
+            <button class="primary" id="skSaveBtn" onclick="saveSkill()" disabled>Save</button>
+            <button class="sm" id="skDiffBtn" onclick="toggleDiff()" disabled>Diff vs default</button>
+            <button class="sm" id="skUndoBtn" onclick="undoSkill()" disabled>Undo last save</button>
+            <button class="sm" id="skResetBtn" onclick="resetSkill()" disabled>Reset to default</button>
+            <span id="skStatus" class="muted"></span>
+          </div>
+          <!-- try panel -->
+          <div id="skTryPanel" style="display:none;margin-top:10px;border:1px solid var(--border);border-radius:6px;padding:8px 10px">
+            <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">try — runs the current (unsaved) prompt</div>
+            <textarea id="skTryInput" rows="3" style="width:100%;font-size:12px" placeholder="free-text input for this skill (a host/app for wired skills — use the Inventory drawer instead)"></textarea>
+            <div class="row" style="margin-top:6px;gap:6px;align-items:center">
+              <button class="sm" onclick="runTry()">run</button>
+              <button class="sm" onclick="closeTry()">close</button>
+              <span id="skTryStatus" class="muted"></span>
+            </div>
+            <pre id="skTryOut" style="display:none;margin-top:8px;max-height:300px;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px;font-size:11px;white-space:pre-wrap"></pre>
+          </div>
+          <div class="muted" style="margin-top:6px;font-size:12px" id="skDefaultHint"></div>
+        </div>
+      </div>
+      <!-- RIGHT: context -->
+      <div style="flex:0 0 300px">
+        <div class="card">
+          <h2>I/O & resources</h2>
+          <div id="skIOCard" class="muted" style="font-size:12px">select a skill</div>
+          <div id="skFilesCard" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;display:none">
+            <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">bundled files <span id="skFilesHint"></span></div>
+            <div id="skFilesList" class="muted" style="font-size:12px"></div>
+            <div class="row" style="margin-top:8px;gap:6px;align-items:flex-end;flex-wrap:wrap">
+              <div><div class="muted" style="font-size:11px">kind</div>
+                <select id="skFileKind"><option value="references">reference</option><option value="scripts">script (.py)</option></select></div>
+              <div><div class="muted" style="font-size:11px">filename</div>
+                <input id="skFileName" placeholder="notes.md" style="width:140px"></div>
+              <button class="sm" onclick="addSkillFile()">add</button>
+            </div>
+            <div id="skFileEditor" style="display:none;margin-top:10px">
+              <div class="muted" style="font-size:11px;margin-bottom:4px"><span id="skFilePath"></span> <span id="skFileKindBadge"></span></div>
+              <textarea id="skFileBody" rows="8" style="width:100%;font-family:var(--mono);font-size:12px"></textarea>
+              <div class="row" style="margin-top:6px;gap:6px">
+                <button class="primary sm" onclick="saveSkillFile()">save file</button>
+                <button class="sm" id="skFileRunBtn" onclick="runSkillFile()" style="display:none">▶ run</button>
+                <button class="sm" onclick="deleteSkillFile()">delete file</button>
+                <button class="sm" onclick="closeSkillFile()">close</button>
+                <span id="skFileStatus" class="muted"></span>
+              </div>
+              <pre id="skFileOutput" style="display:none;margin-top:6px;background:var(--card);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-family:var(--mono);font-size:11px;white-space:pre-wrap;max-height:240px;overflow:auto"></pre>
+            </div>
+          </div>
+          <div id="skLastRun" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;display:none">
+            <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">last run (try)</div>
+            <div id="skLastRunBody" class="muted" style="font-size:12px"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== CODE (git sources + host↔source N:N) ============== -->
+  <section id="tab-sources" class="tabsec hidden">
+    <div class="card" style="padding:8px 14px;background:var(--card)">
+      <div style="font-size:12px" class="muted">Manage the <b>source code</b> each application runs. An app's sources are derived from its hosts — add a source to an app here and it's linked to every host in that app. Prefer the <b>App → sources</b> view; the per-host and catalog views are for edge cases.</div>
+    </div>
+    <div class="card">
+      <h2>App → sources <span class="muted">(which source code an application runs — the migration view)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+        <input id="arApp" list="appList" placeholder="app id (e.g. APP_0001)" style="flex:1 1 240px;min-width:180px"/>
+        <button class="sm primary" onclick="loadAppSources()">Show sources</button>
+        <span class="muted" style="font-size:12px">pick an app to see its sources + which hosts carry each. Adding a source links it to every host in the app.</span>
+      </div>
+      <div id="arResult" class="hidden">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+          <b id="arAppLabel"></b>
+          <span class="muted" style="font-size:12px" id="arMeta"></span>
+        </div>
+        <div class="xscroll"><table class="tbl mcard" id="arTbl"><thead><tr>
+          <th>source</th><th>url</th><th>branch</th><th>carried by (hosts)</th><th>remove</th>
+        </tr></thead><tbody></tbody></table></div>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
+          <input id="arAddRepo" list="repoIdList" placeholder="add a source (pick from the catalog)" style="flex:1 1 280px;min-width:200px"/>
+          <button class="sm primary" onclick="addAppRepo()">Add to this app</button>
+          <span class="muted" style="font-size:12px" id="arHint"></span>
+        </div>
+        <div class="out" id="arOut" style="margin-top:6px"></div>
       </div>
     </div>
     <div class="card">
-      <h2>Trigger executor <span class="muted">(scan / comb / modify an app's repo)</span> <span id="execStatus" class="muted" style="font-size:12px;float:right">checking executor…</span></h2>
-      <div class="row" style="flex-wrap:wrap;gap:8px">
-        <input id="exApp" placeholder="app_id" style="flex:0 1 160px;min-width:120px"/>
-        <input id="exRepo" placeholder="git url" style="flex:1 1 260px;min-width:180px"/>
-        <input id="exBranch" placeholder="branch (opt)" style="flex:0 1 140px;min-width:120px"/>
-        <select id="exAction" onchange="toggleModifyFields()" style="flex:0 1 auto"><option value="scan">scan</option><option value="comb">comb</option><option value="modify">modify</option></select>
-        <select id="exMode" style="flex:0 1 auto"><option value="plan">plan</option><option value="execute">execute</option></select>
-        <select id="exExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
-        <button class="primary" onclick="doExecutorScan()">Run</button>
+      <h2>Scan a git group <span class="muted">(discover the repositories inside a group / org url)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+        <input id="discUrl" placeholder="git group / org url (https://gitlab…/mygroup  or  https://github.com/myorg)" style="flex:1 1 360px;min-width:240px"/>
+        <button class="sm primary" onclick="scanRepos()">Scan</button>
+        <span class="muted" style="font-size:12px" id="discExecHint">the executor enumerates the repos inside the url (it holds the git/SCM creds — idc-migrate never touches git); then pick the ones to register.</span>
       </div>
-      <div id="exModifyFields" class="hidden grid2col" style="margin-top:8px">
-        <div>
-          <div class="muted" style="font-size:11px;margin-bottom:3px">scope (categories to change; comma-sep; empty = all)</div>
-          <input id="exScope" placeholder="db_connection,service_discovery" style="width:100%"/>
+      <div id="discResult" class="hidden">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+          <b id="discUrlLabel"></b>
+          <span class="muted" style="font-size:12px" id="discMeta"></span>
         </div>
-        <div>
-          <div class="muted" style="font-size:11px;margin-bottom:3px">overrides — one per line: old=new (e.g. 10.0.4.20=${DB_HOST})</div>
-          <textarea id="exOverrides" rows="2" style="width:100%" placeholder="10.0.4.20:3306=${ORDERS_DB_HOST}:3306&#10;hunter2=${ORDERS_DB_PASSWORD}"></textarea>
+        <div class="xscroll"><table class="tbl mcard" id="discTbl"><thead><tr>
+          <th style="width:34px"><input type="checkbox" id="discAll" onclick="discToggleAll(this)"/></th>
+          <th>repository</th><th>branch</th><th>description</th>
+        </tr></thead><tbody></tbody></table></div>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
+          <button class="sm primary" onclick="registerDiscovered()">Register selected</button>
+          <span class="muted" style="font-size:12px" id="discHint"></span>
         </div>
+        <div class="out" id="discOut" style="margin-top:6px"></div>
       </div>
-      <div class="out" id="exOut" style="margin-top:8px"><span class="muted">Requires IDC_EXECUTOR_URL. Results arrive async via callback → Rebuild to fold into waves.</span></div>
     </div>
     <div class="card">
-      <h2>Manage executors <span class="muted">(connect one or more external executors — each trigger picks one)</span></h2>
-      <div class="muted" style="font-size:12px;margin-bottom:8px">A trigger sends its request to one executor (pick per trigger below); every executor pushes results back to this server's one public URL. The <b>default</b> executor is the single connection from <code>IDC_EXECUTOR_URL</code> / this panel; add named executors (e.g. a DB-conversion specialist) below. Push direction auth accepts any registered executor's token.</div>
+      <h2>Git sources <span class="muted">(catalog of all registered git urls)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+        <input id="repoUrl" placeholder="git url (https://…/foo.git)" style="flex:1 1 280px;min-width:200px"/>
+        <input id="repoBranch" placeholder="branch (opt)" style="flex:0 1 140px;min-width:120px"/>
+        <input id="repoName" placeholder="name (opt)" style="flex:0 1 160px;min-width:120px"/>
+        <button class="sm primary" onclick="addRepo()">Add source</button>
+      </div>
+      <div class="xscroll"><table class="tbl mcard" id="repoTbl"><thead><tr>
+        <th>source / url</th><th>branch</th><th>hosts</th><th>apps (derived)</th><th>edit hosts</th><th>delete</th>
+      </tr></thead><tbody></tbody></table></div>
+      <div id="repoHostEditor" class="hidden" style="margin-top:8px;padding:8px;border:1px solid var(--border);border-radius:6px">
+        <div style="font-size:12px;margin-bottom:6px" class="muted">hosts that deploy <b id="rheName"></b> — add a hostname (or server id), remove a chip, then save. Unmatched tokens are reported back.</div>
+        <div id="rheChips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px"></div>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+          <div style="position:relative;flex:1 1 220px;min-width:160px">
+            <input id="rheAdd" placeholder="hostname or server id — type to search the estate" autocomplete="off" style="width:100%"/>
+            <div id="rheSuggest" class="hidden" style="position:absolute;left:0;right:0;top:100%;z-index:30;background:var(--card);border:1px solid var(--border);border-radius:4px;max-height:240px;overflow:auto;box-shadow:0 4px 10px rgba(0,0,0,.18)"></div>
+          </div>
+          <button class="sm" onclick="rheAddChip()">Add</button>
+          <button class="sm primary" onclick="rheSave()">Save</button>
+          <button class="sm" onclick="rheCancel()">Cancel</button>
+        </div>
+        <div class="out" id="rheOut" style="margin-top:6px"></div>
+      </div>
+      <div class="out" id="repoOut" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2>Advanced: Host → sources <span class="muted">(per-host — which sources one host deploys; use when a host isn't in an app)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+        <div style="position:relative;flex:1 1 240px;min-width:160px">
+          <input id="hrHost" placeholder="hostname or server_id — type to search" autocomplete="off" style="width:100%"/>
+          <div id="hrSuggest" class="hidden" style="position:absolute;left:0;right:0;top:100%;z-index:30;background:var(--card);border:1px solid var(--border);border-radius:4px;max-height:240px;overflow:auto;box-shadow:0 4px 10px rgba(0,0,0,.18)"></div>
+        </div>
+        <button class="sm" onclick="loadHostRepos()">Show sources</button>
+        <span class="muted" style="font-size:12px">type a hostname (or server id) to view/edit the sources deployed on it.</span>
+      </div>
+      <div id="hrResult" class="hidden">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+          <b id="hrHostLabel"></b>
+          <span class="muted" style="font-size:12px" id="hrHostMeta"></span>
+        </div>
+        <div class="xscroll"><table class="tbl mcard" id="hrTbl"><thead><tr>
+          <th>source</th><th>url</th><th>branch</th><th>remove</th>
+        </tr></thead><tbody></tbody></table></div>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
+          <input id="hrAddRepo" list="repoIdList" placeholder="add a source (pick from the catalog)" style="flex:1 1 280px;min-width:200px"/>
+          <datalist id="repoIdList"></datalist>
+          <button class="sm primary" onclick="addHostRepo()">Add to this host</button>
+          <span class="muted" style="font-size:12px">add / remove save immediately (the host's source set is re-sent each time).</span>
+        </div>
+        <div class="out" id="hrOut" style="margin-top:6px"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== SCAN & MIGRATE (executor-driven assessment) ====== -->
+  <section id="tab-code" class="tabsec hidden">
+    <!-- entrance to the dedicated Executor management page -->
+    <div class="card" style="padding:10px 14px;background:var(--card);display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:18px">⚙️</span>
+      <div style="flex:1 1 320px;min-width:220px">
+        <b>Executor management</b>
+        <div class="muted" style="font-size:12px">register / approve / rotate executors, set the push-back public URL, and read the executor contract. All executors connect to idc-migrate (pull mode) — idc-migrate never calls them.</div>
+      </div>
+      <button class="primary" onclick="goExecMgmt()">Manage executors →</button>
+    </div>
+    <div class="card">
+      <div class="muted" style="font-size:13px;line-height:1.6">Assess one <b>workload</b> (an app + its git sources + servers + DBs) end-to-end: what will break in the cloud, what is already EOL / expired / vulnerable, what the migration impacts, and what to do about it. Pick an app — everything below is scoped to it. Git sources are bound on the <b>Code</b> tab. <span id="execStatus" class="muted" style="float:right">checking executor…</span></div>
+    </div>
+    <datalist id="appList"></datalist>
+
+    <!-- ============ Card A — Workload scope ============ -->
+    <div class="card">
+      <h2>Workload <span class="muted">(pick an app — everything below is scoped to it)</span></h2>
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <input id="wlApp" placeholder="app_id (e.g. APP_0001)" list="appList" style="flex:1 1 240px;min-width:180px" onkeydown="if(event.key==='Enter')selectWorkload()"/>
+        <button class="primary" onclick="selectWorkload()">Load workload</button>
+        <span class="muted" style="font-size:12px" id="wlCtx"></span>
+      </div>
+      <div id="wlSources" style="margin-top:8px"></div>
+
+      <div id="wlScope" class="hidden" style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+          <button class="primary" onclick="scanWorkload()" title="scan every git source bound to this app for migration blockers + EOL">⚙ Scan workload</button>
+          <span class="muted" style="font-size:12px">scans every bound git source → findings below</span>
+        </div>
+
+        <details style="margin-top:8px">
+          <summary class="muted" style="font-size:12px;cursor:pointer">▸ advanced (executor / action / modify scope + overrides / batch 7R)</summary>
+          <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
+            <select id="wlExecutor" class="execPicker" title="which executor to drive (blank = pool)" style="flex:0 1 auto"></select>
+            <select id="wlAction" onchange="toggleModifyFields()" style="flex:0 1 auto"><option value="scan">scan</option><option value="comb">comb</option><option value="modify">modify</option></select>
+            <select id="wlMode" style="flex:0 1 auto"><option value="plan">plan</option><option value="execute">execute</option></select>
+            <button class="sm" onclick="scanWorkload()" title="run the selected action across the bound sources">Run advanced</button>
+          </div>
+          <div id="wlModifyFields" class="hidden grid2col" style="margin-top:8px">
+            <div>
+              <div class="muted" style="font-size:11px;margin-bottom:3px">scope (categories to change; comma-sep; empty = all)</div>
+              <input id="wlScopeCats" placeholder="db_connection,service_discovery" style="width:100%"/>
+            </div>
+            <div>
+              <div class="muted" style="font-size:11px;margin-bottom:3px">overrides — one per line: old=new</div>
+              <textarea id="wlOverrides" rows="2" style="width:100%" placeholder="10.0.4.20:3306=${ORDERS_DB_HOST}:3306&#10;hunter2=${ORDERS_DB_PASSWORD}"></textarea>
+            </div>
+          </div>
+          <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px;border-top:1px dashed var(--border);padding-top:8px">
+            <span class="muted" style="font-size:12px">batch 7R across ALL apps (streamed):</span>
+            <label class="muted" style="white-space:nowrap;font-size:12px"><input type="checkbox" id="srApply"> apply</label>
+            <button class="sm" onclick="assignStrategyAll()">batch all apps</button>
+          </div>
+        </details>
+
+        <div class="out" id="wlScanOut" style="margin-top:8px"></div>
+      </div>
+    </div>
+
+    <!-- ============ Card B — Scan status & blocked questions ============ -->
+    <div class="card" id="wlStatusCard">
+      <h2>Scan status &amp; blocked questions <span class="muted" style="font-size:12px;float:right" id="wlJobStatus"></span></h2>
+      <div id="wlQuestions"><span class="muted">No pending questions. The executor raises one here when it can't resolve a change (e.g. an unknown hardcoded IP).</span></div>
+    </div>
+
+    <!-- ============ Card C — Findings (the hero) ============ -->
+    <div class="card">
+      <h2>Findings <span class="muted" style="font-size:12px;float:right" id="wlProfileHdr"></span></h2>
+      <div id="wlFindings"><span class="muted">Pick a workload above and hit <b>Scan workload</b> to see what blocks migration, what is EOL / expired / vulnerable, and the migration impact.</span></div>
+    </div>
+
+    <!-- ============ Card D — Decisions & actions (scoped to this app) ============ -->
+    <div class="card">
+      <h2>Decisions &amp; actions <span class="muted">(scoped to this workload)</span></h2>
+      <div id="wlDecisions"><span class="muted">Load a workload to assign a 7R strategy, assess its DBs, analyze EOL hosts, infer a container scaffold, or emit IaC + guardrails.</span></div>
+    </div>
+
+    <!-- detail sinks (filled on demand) -->
+    <div id="wlDbConvDetail" class="out hidden" style="margin-top:8px"></div>
+    <div id="wlIacDetail" class="out hidden" style="margin-top:8px"></div>
+  </section>
+
+  <!-- ===================== EXECUTOR MANAGEMENT (dedicated page) =========== -->
+  <section id="tab-execmgmt" class="tabsec hidden">
+    <div class="card" style="padding:10px 14px;background:var(--card);display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <button class="sm" onclick="backToCode()">← back to Scan &amp; Migrate</button>
+      <h2 style="margin:0">Executor management</h2>
+      <span class="muted" style="font-size:12px">executors connect to idc-migrate (pull mode) — idc-migrate never initiates a connection</span>
+    </div>
+
+    <div class="card">
+      <h2>Status <span class="muted">(at a glance)</span></h2>
+      <div id="mgmtExecOverview"><span class="spinner"></span> loading…</div>
+    </div>
+
+    <div class="card">
+      <h2>Connection model <span class="muted">(how executors talk to idc-migrate)</span></h2>
+      <div class="muted" style="font-size:13px;line-height:1.6">Executors <b>connect to idc-migrate</b> — they poll <code>POST /api/executor/tasks/claim</code> and push results back over the internet to this server's public URL (<code>IDC_PUBLIC_URL</code>). <b>idc-migrate never initiates a connection</b> to any executor, so an executor may sit behind NAT/firewall with only outbound access. The <b>connected</b> dot means the executor <b>polled idc-migrate recently</b> (claim/lease/complete), not that idc-migrate reached it — there is no Test button because idc-migrate has nothing to reach out with.</div>
+      <div class="muted" style="font-size:13px;line-height:1.6;margin-top:6px">A trigger <b>targets</b> one executor (pick per trigger on the Scan &amp; Migrate page): empty = the <b>pool</b> (any approved executor may claim it), or a named id = target that executor. <b>Named executors self-register</b>: an executor calls <code>POST /api/executors/register</code> (optionally gated by <code>IDC_ENROLL_SECRET</code>), lands <b style="color:var(--amber)">pending</b> with no token, and you <b>Approve</b> it here — idc-migrate then <b>mints its token and shows it once</b> for you to relay out-of-band. The <b>default</b> executor is the single operator-configured one (<code>IDC_EXECUTOR_TOKEN</code>). Push-back auth accepts any approved executor's token.</div>
+    </div>
+
+    <div class="card">
+      <h2>Executors <span class="muted">(registry — one default + N named; approve pending here)</span></h2>
       <div id="execList"><span class="muted">loading executors…</span></div>
-      <div class="out" id="execCfgOut" style="margin-top:8px"><span class="muted">Saved to the DB and applied immediately (no redeploy). The default's <b>public URL</b> (IDC_PUBLIC_URL) is the address every executor pushes back to over the internet. Start a mock with <span class="kbd">idc executor-mock --port 8090</span>.</span></div>
+      <div class="out" id="execCfgOut" style="margin-top:8px"><span class="muted">Saved to the DB and applied immediately (no redeploy). The default's <b>public URL</b> (IDC_PUBLIC_URL) is the address every executor pushes back to over the internet. The <b>connected</b> dot reflects the executor polling idc-migrate, not idc-migrate reaching it. Start a mock with <span class="kbd">idc executor-mock --port 8090</span>.</span></div>
       <details style="margin-top:8px">
-        <summary class="muted">+ add a named executor</summary>
+        <summary class="muted">+ add a named executor manually (if you already hold a token; otherwise let it self-register above)</summary>
         <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">
           <input id="newExecId" placeholder="id (e.g. db-specialist)" style="flex:0 1 160px;min-width:120px"/>
-          <input id="newExecUrl" placeholder="executor URL (https://...)" style="flex:1 1 260px;min-width:180px"/>
-          <input id="newExecToken" type="password" placeholder="token" style="flex:0 1 160px;min-width:120px"/>
+          <input id="newExecToken" type="password" placeholder="token (what this executor will poll /claim with)" style="flex:1 1 220px;min-width:160px"/>
           <label class="muted" style="white-space:nowrap"><input type="checkbox" id="newExecEnabled" checked> enabled</label>
           <input id="newExecTimeout" type="number" min="1" step="1" value="600" style="width:70px" title="timeout (s)"/>
           <button class="sm primary" onclick="addExecutor()">Add</button>
         </div>
+        <div class="muted" style="font-size:11px;margin-top:4px">No executor URL in pull mode — idc-migrate never calls the executor; it polls <code>/api/executor/tasks/claim</code> with this token. Give the token to the executor out-of-band.</div>
       </details>
     </div>
-    <div class="card">
-      <h2>7R strategy <span class="muted">(AI assigns 6R + rehost-container per app after reconsolidate)</span></h2>
-      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
-        <input id="srApp" placeholder="app_id" style="flex:0 1 200px;min-width:140px" list="srAppList"/>
-        <datalist id="srAppList"></datalist>
-        <label class="muted" style="white-space:nowrap"><input type="checkbox" id="srApply"> apply to profile</label>
-        <button class="primary" onclick="assignStrategy()">Assign 7R</button>
-        <button class="sm" onclick="assignStrategyAll()" title="assign a 7R strategy to every app (one MigraQ call each — slow)">batch all</button>
-      </div>
-      <div class="out" id="srOut" style="margin-top:8px"><span class="muted">Pick an app (or click 7R on a profile row). The MigraQ picks one of rehost / rehost-container / replatform / refactor / repurchase / retain / retire, with rationale + target + key changes.</span></div>
-    </div>
-    <div class="card"><h2>Code profiles <span class="muted">(pushed by executor)</span></h2>
-      <div class="xscroll"><table class="tbl mcard" id="codeTbl"><thead><tr>
-        <th>app_id</th><th>pattern</th><th>effort</th><th>readiness</th>
-        <th>code_deps</th><th>blockers</th><th>findings</th><th>scanned</th><th>7R</th>
-      </tr></thead><tbody></tbody></table></div>
-    </div>
-    <div class="card">
-      <h2>DB conversion profiles <span class="muted">(F5/F6 — executor pushes a grade per DB host; Convert emits DDL + a compatibility report)</span></h2>
-      <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
-        <input id="dbScanId" placeholder="db hostname" style="flex:0 1 200px;min-width:140px" title="stable DB host identity (hostname) to scan"/>
-        <select id="dbSrcEng" style="flex:0 1 auto" title="source engine"><option value="oracle">oracle</option><option value="sqlserver">sqlserver</option><option value="mysql">mysql</option></select>
-        <span class="muted">→</span>
-        <select id="dbTgtEng" style="flex:0 1 auto" title="target engine"><option value="tdsql">tdsql</option><option value="cdb_mysql">cdb_mysql</option><option value="postgresql">postgresql</option></select>
-        <select id="dbExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
-        <button class="sm" onclick="doDbScan('assess')" title="grade-only (A/B/C + man-days)">Assess</button>
-        <button class="sm primary" onclick="doDbScan('convert')" title="also emit converted DDL + per-object compatibility report">Convert</button>
-        <span class="muted" style="font-size:12px">Assess = grade only; Convert = also pushes DDL + a per-object compatibility report (auto/manual/blocked). Rebuild folds the grade into the match + wave risk.</span>
-      </div>
-      <div class="xscroll"><table class="tbl mcard" id="dbTbl"><thead><tr>
-        <th>hostname</th><th>conversion</th><th>grade</th><th>man-days</th><th>auto %</th><th>review</th><th>blockers</th><th>rev-repl</th><th>conv?</th><th>scanned</th>
-      </tr></thead><tbody></tbody></table></div>
-      <div id="dbConvDetail" class="out hidden" style="margin-top:8px"></div>
-    </div>
-    <div class="card">
-      <h2>IaC + Well-Architected guardrails <span class="muted">(F5 — executor emits Terraform + guardrail checks; gate blocks launch until pass)</span></h2>
-      <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px;align-items:center">
-        <select id="iacScope" style="flex:0 1 auto" title="scope"><option value="landing_zone">landing_zone</option><option value="workload">workload</option></select>
-        <input id="iacScopeId" placeholder="scope_id (lz:corp | wl:&lt;server_id&gt;)" style="flex:0 1 220px;min-width:160px"/>
-        <select id="iacExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
-        <button class="sm primary" onclick="doIacEmit()">Emit IaC + guardrails</button>
-        <span class="muted" style="font-size:12px">executor emits Tencent HCL + runs the guardrail checks; <code>lz:&lt;arch&gt;</code> guardrails gate workload launch.</span>
-      </div>
-      <div class="xscroll"><table class="tbl mcard" id="iacTbl"><thead><tr>
-        <th>scope_id</th><th>scope</th><th>guardrails</th><th>modules</th><th>scanned</th><th>show</th>
-      </tr></thead><tbody></tbody></table></div>
-      <div id="iacDetail" class="out hidden" style="margin-top:8px"></div>
-    </div>
-    <div class="card">
-      <h2>Legacy / unsupported-OS disposition <span class="muted">(F7 — executor recommends containerize / replatform / rewrite / retain per EOL host)</span></h2>
-      <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px;align-items:center">
-        <input id="ldServer" placeholder="server_id (hostname)" style="flex:0 1 200px;min-width:140px"/>
-        <select id="ldRole" style="flex:0 1 auto"><option value="">role…</option><option value="app">app</option><option value="web">web</option><option value="db">db</option><option value="cache">cache</option></select>
-        <input id="ldOs" placeholder="os (e.g. centos 6)" style="flex:0 1 160px;min-width:120px"/>
-        <input id="ldRuntime" placeholder="runtime (e.g. jdk7)" style="flex:0 1 140px;min-width:100px"/>
-        <label class="muted" style="white-space:nowrap;font-size:12px"><input type="checkbox" id="ldHasRepo"> has source repo</label>
-        <select id="ldExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
-        <button class="sm primary" onclick="doLegacyAnalyze()">Analyze</button>
-        <span class="muted" style="font-size:12px">replaces the fixed "replatform" string on EOL hosts; next Rebuild folds the rec into the match.</span>
-      </div>
-      <div class="xscroll"><table class="tbl mcard" id="ldTbl"><thead><tr>
-        <th>server_id</th><th>disposition</th><th>confidence</th><th>effort(d)</th><th>base image</th><th>rationale</th><th>scanned</th>
-      </tr></thead><tbody></tbody></table></div>
-    </div>
-    <div class="card">
-      <h2>Runtime containerize <span class="muted">(F9 — no source repo: infer a Dockerfile scaffold from runtime telemetry)</span></h2>
-      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
-        <input id="rtApp" placeholder="app_id" style="flex:0 1 160px;min-width:120px"/>
-        <input id="rtServer" placeholder="server_id (host)" style="flex:0 1 160px;min-width:120px"/>
-        <input id="rtProc" placeholder="process (e.g. java -jar app.jar)" style="flex:1 1 200px;min-width:160px"/>
-        <input id="rtPort" placeholder="port (e.g. 8080)" style="flex:0 1 90px;min-width:70px"/>
-        <input id="rtSoft" placeholder="software (e.g. openjdk-8)" style="flex:0 1 140px;min-width:100px"/>
-        <select id="rtMode" style="flex:0 1 auto"><option value="plan">plan (dry-run)</option><option value="execute">execute (writes)</option></select>
-        <select id="rtExecutor" class="execPicker" title="which executor to drive" style="flex:0 1 auto"></select>
-        <button class="sm" onclick="prefillRuntimeInventory()">Pre-fill from server</button>
-        <button class="sm primary" onclick="doRuntimeContainerize()">Infer scaffold</button>
-      </div>
-      <div class="muted" style="font-size:12px;margin-top:6px">The executor infers a Dockerfile + pushes a <code>source=runtime-derived</code> CodeProfile (confidence capped at 0.5). <b>Pre-fill from server</b> assembles process/port/software from the match + role/OS + Zabbix/Prometheus telemetry; empty fields are auto-gathered on submit. <b>execute</b> mode requires operator confirmation (a Question is raised) before the scaffold is written.</div>
-    </div>
-    <div class="card"><h2>Executor jobs</h2>
+
+    <div class="card"><h2>Executor jobs <span class="muted">(recent /change-jobs — executor pushes results back here)</span></h2>
       <div class="xscroll"><table class="tbl mcard" id="jobTbl"><thead><tr>
         <th>id</th><th>app_id</th><th>kind</th><th>status</th><th>summary</th><th>patch_ref</th><th>created</th>
       </tr></thead><tbody></tbody></table></div>
     </div>
-    <div class="card"><h2>Pending questions <span class="muted">(executor blocked — answer to unblock)</span></h2>
-      <div id="qList"><span class="muted">No pending questions. The executor raises one here when it can't resolve a change (e.g. an unknown hardcoded IP).</span></div>
+
+    <div class="card">
+      <h2>Executor contract guide</h2>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <a class="sm" href="/executor?v=3" target="_blank" rel="noopener">Open the full contract ↗</a>
+        <span class="muted" style="font-size:12px">what an executor must implement: the actions, push callbacks, schemas, auth, and how to connect one or more executors. Also in <code>docs/agent-executor.md</code>.</span>
+      </div>
     </div>
   </section>
 
@@ -479,7 +717,7 @@
     <h2>Automated testing <span class="muted">(F11 — generate / run pre-vs-post / compare; regression blocks cutover)</span></h2>
     <div class="card">
       <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
-        <input id="tcApp" placeholder="app_id" style="flex:0 1 200px;min-width:140px"/>
+        <input id="tcApp" placeholder="app_id" list="appList" style="flex:0 1 200px;min-width:140px"/>
         <button class="sm" onclick="doTestGen()">Generate cases</button>
         <button class="sm" onclick="doTestRun('pre')" title="baseline before cutover">Run pre</button>
         <button class="sm" onclick="doTestRun('post')" title="after cutover">Run post</button>
@@ -557,23 +795,24 @@
 </div>
 
 <!-- core first (shared globals/helpers), then per-page modules, then init -->
-<script src="/assets/app.js?v=14"></script>
+<script src="/assets/app.js?v=18"></script>
 <script src="/assets/pages/dashboard.js?v=12"></script>
-<script src="/assets/pages/inventory.js?v=12"></script>
-<script src="/assets/pages/server-drawer.js?v=17"></script>
+<script src="/assets/pages/inventory.js?v=15"></script>
+<script src="/assets/pages/server-drawer.js?v=22"></script>
 <script src="/assets/pages/waves.js?v=15"></script>
 <script src="/assets/pages/lz.js?v=15"></script>
 <script src="/assets/pages/plan.js?v=16"></script>
 <script src="/assets/pages/copilot.js?v=12"></script>
-<script src="/assets/pages/code.js?v=12"></script>
+<script src="/assets/pages/code.js?v=28"></script>
 <script src="/assets/pages/testing.js?v=12"></script>
 <script src="/assets/pages/docs.js?v=12"></script>
-<script src="/assets/pages/questions.js?v=12"></script>
+<script src="/assets/pages/questions.js?v=13"></script>
 <script src="/assets/pages/business-case.js?v=12"></script>
 <script src="/assets/pages/wave-execution.js?v=12"></script>
 <script src="/assets/pages/readiness.js?v=12"></script>
 <script src="/assets/pages/data-gaps.js?v=12"></script>
 <script src="/assets/pages/rail.js?v=12"></script>
+<script src="/assets/pages/skills.js?v=10"></script>
 <script src="/assets/main.js?v=12"></script>
 </body>
 </html>

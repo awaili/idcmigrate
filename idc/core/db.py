@@ -33,6 +33,8 @@ from .models import (
     MigrationJob,
     NetworkDesign,
     PostMigRecommendation,
+    Repo,
+    RepoScan,
     TestCase, TestDiff, TestDiffItem, TestRun, TestResult,
     ScanFinding,
     Server,
@@ -67,6 +69,7 @@ class ServerFilter:
     warranty_bucket: Optional[str] = None
     os_eol_bucket: Optional[str] = None
     app_id: Optional[str] = None       # match servers whose app_ids JSON array contains this app
+    hostname_after: Optional[str] = None   # resume cursor: servers.hostname > this (asc order)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +212,13 @@ CREATE TABLE IF NOT EXISTS code_profiles (
 -- F9 — code profile provenance (repo / runtime-derived). ALTER in place.
 ALTER TABLE code_profiles ADD COLUMN IF NOT EXISTS source VARCHAR(24);
 
+-- path A — agent (codex) grounded code pass, run by the executor after the
+-- rule engine. Separate from findings/blockers so the rule set provenance
+-- stays clean. _row_to_profile null-safes pre-ALTER rows. ALTER in place.
+ALTER TABLE code_profiles ADD COLUMN IF NOT EXISTS agent_findings LONGTEXT;
+ALTER TABLE code_profiles ADD COLUMN IF NOT EXISTS agent_blockers JSON;
+ALTER TABLE code_profiles ADD COLUMN IF NOT EXISTS agent_summary TEXT;
+
 CREATE TABLE IF NOT EXISTS app_strategies (
     app_id        VARCHAR(128) PRIMARY KEY,
     strategy      VARCHAR(24),
@@ -225,7 +235,7 @@ CREATE TABLE IF NOT EXISTS app_strategies (
 CREATE TABLE IF NOT EXISTS change_jobs (
     id          VARCHAR(64) PRIMARY KEY,
     app_id      VARCHAR(128),
-    kind        VARCHAR(16),
+    kind        VARCHAR(32),
     repo_url    VARCHAR(512),
     branch      VARCHAR(128),
     status      VARCHAR(32),
@@ -255,6 +265,58 @@ CREATE TABLE IF NOT EXISTS executor_tasks (
     KEY idx_etask_status (status),
     KEY idx_etask_target (executor_id),
     KEY idx_etask_lease (lease_until)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS executor_heartbeats (
+    -- pull-mode connectivity: the last time an executor reached into
+    -- idc-migrate (polled /claim, renewed /lease, or posted /complete).
+    -- idc-migrate never initiates a connection, so liveness is inferred
+    -- from this inbound activity, not from any outbound probe.
+    executor_id   VARCHAR(64) PRIMARY KEY,
+    last_seen_at  VARCHAR(40)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS repos (
+    -- a git url as a first-class object, global and url-unique: the same git
+    -- url is ONE row, scanned once, shared by every host/app that deploys it.
+    -- host:git-url is N:N via host_repos, and app:repo is derived from the
+    -- app's hosts. Phase 1 = entity + N:N host mapping, Phase 2 = code-profile
+    -- re-key to repo_id.
+    repo_id     VARCHAR(64)  PRIMARY KEY,   -- repo-<8>
+    url         VARCHAR(512) NOT NULL,
+    branch      VARCHAR(128),
+    name        VARCHAR(255),               -- derived from the url path, editable
+    created_at  VARCHAR(40),
+    updated_at  VARCHAR(40),
+    UNIQUE KEY uk_repos_url (url)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS host_repos (
+    -- the N:N edge: a host (server) deploys a set of repos, and a repo is
+    -- deployed on a set of hosts. server_id references servers.id (stable,
+    -- hostname-derived) and repo_id references repos.repo_id. Deleting a repo
+    -- cascades its edges (see delete_repo) and a removed server's edges are
+    -- filtered out on read by joining servers.
+    server_id   VARCHAR(64) NOT NULL,
+    repo_id     VARCHAR(64) NOT NULL,
+    PRIMARY KEY (server_id, repo_id),
+    KEY idx_hrep_repo (repo_id)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS repo_scans (
+    -- a discovery scan: the operator pastes a git group/org url, the executor
+    -- enumerates the repositories inside it and pushes the list back here, the
+    -- operator picks which to register as first-class Repo rows. One row per
+    -- scan, and repos_json holds the discovered [{url,name,branch}] list.
+    scan_id      VARCHAR(64) PRIMARY KEY,   -- scn-<8>
+    url          VARCHAR(512),              -- the group/org git url that was scanned
+    status       VARCHAR(16),               -- pending | done | error
+    executor_id  VARCHAR(64),               -- executor that ran it (NULL = pool)
+    repos_json   JSON,                      -- discovered repos list (empty until done)
+    error        TEXT,
+    created_at   VARCHAR(40),
+    finished_at  VARCHAR(40),
+    KEY idx_rscan_status (status)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS questions (
@@ -555,6 +617,7 @@ TASK_KINDS = (
     "scan", "comb", "modify", "db-scan", "runtime-containerize",
     "legacy-disposition", "cutover-playbook", "as-built", "iac-emit",
     "postmig-optimize", "test-gen", "test-run", "test-compare",
+    "discover-repos",
 )
 
 
@@ -897,6 +960,30 @@ class Store:
         rows = self._fetchall("SELECT * FROM servers LIMIT ?", (limit,))
         return [self._row_to_server(r) for r in rows]
 
+    def resolve_server_ids(self, tokens: List[str]) -> Dict[str, Any]:
+        """Map free-text host tokens (each a server_id, hostname, or fqdn,
+        case-insensitive) to existing server_ids. Returns
+        ``{matched: [server_id...], unresolved: [token...]}``. Used by the
+        repo->hosts editor so the operator can type hostnames they know."""
+        toks = [t.strip() for t in tokens if t and t.strip()]
+        if not toks:
+            return {"matched": [], "unresolved": []}
+        # one pass over the estate; index by id/hostname/fqdn (lowercased)
+        idx: Dict[str, str] = {}
+        for s in self.list_all_servers():
+            for k in (s.id, s.hostname, s.fqdn):
+                if k:
+                    idx[str(k).lower()] = s.id
+        matched, unresolved = [], []
+        for t in toks:
+            sid = idx.get(t.lower())
+            if sid:
+                matched.append(sid)
+            else:
+                unresolved.append(t)
+        # de-dup matched, preserve order
+        return {"matched": list(dict.fromkeys(matched)), "unresolved": unresolved}
+
     def query_server_ids(self, f: "ServerFilter") -> List[str]:
         """All server ids matching a filter (no pagination) — for scoping."""
         where, args, join_matches = self._filters_sql(f)
@@ -964,6 +1051,11 @@ class Store:
         if f.app_id:
             where.append("servers.app_ids LIKE ?")
             args.append(f'%"{f.app_id}"%')
+        # resume cursor for the bulk 7R batch (process the estate in ordered
+        # chunks + commit per batch): servers.hostname > cursor, ordered asc.
+        if f.hostname_after:
+            where.append("servers.hostname > ?")
+            args.append(f.hostname_after)
         if join_matches:
             if f.target_product:
                 jq = self._jq("json_extract(matches.target,'$.product')")
@@ -1189,6 +1281,24 @@ class Store:
             out.append(Workload.from_dict(d))
         return out
 
+    def get_workload(self, app_id: str) -> Optional[Workload]:
+        """One workload by app_id (cheap single-row read)."""
+        r = self._fetchone("SELECT * FROM workloads WHERE app_id=?", (app_id,))
+        if not r:
+            return None
+        d = dict(r)
+        d["server_ids"] = loads(d.get("server_ids")) or []
+        d["depends_on"] = loads(d.get("depends_on")) or []
+        return Workload.from_dict(d)
+
+    def app_options(self) -> List[Dict[str, str]]:
+        """Lightweight app catalog for UI dropdowns: just app_id + name + tier
+        + env from ``workloads``, ordered by app_id. Cheaper than
+        ``list_workloads`` (no JSON arrays decoded) and covers every app even
+        if it has no servers yet."""
+        return [dict(r) for r in self._fetchall(
+            "SELECT app_id, name, tier, env FROM workloads ORDER BY app_id")]
+
     # -- matches -----------------------------------------------------------
     def upsert_match(self, m: Match) -> None:
         sql = self._upsert_sql("matches",
@@ -1327,11 +1437,20 @@ class Store:
                 "finished_at=? WHERE id=?"),
                 (status, output, error, finished_at, task_id))
 
-    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+    # NOTE: these are the AGENT-task (Copilot tab `/api/agent`) read methods,
+    # named `get_agent_task` / `list_agent_tasks` (not `get_task`/`list_tasks`)
+    # because the executor pull-dispatch layer below defines its OWN
+    # `get_task` / `list_tasks` over the `executor_tasks` table. When both were
+    # named `get_task`, the executor one (defined later in this class) SILENTLY
+    # shadowed this one — so `/api/tasks/{id}` and the agent WS read
+    # `executor_tasks` instead of `agent_tasks` and the agent task was never
+    # found (404 / "unknown task") even though it existed. Distinct names keep
+    # the two surfaces from colliding again.
+    def get_agent_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         r = self._fetchone("SELECT * FROM agent_tasks WHERE id=?", (task_id,))
         return dict(r) if r else None
 
-    def list_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def list_agent_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(r) for r in self._fetchall(
             "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?", (limit,))]
 
@@ -1340,7 +1459,9 @@ class Store:
                      "scanned_at", "language", "runtime", "framework",
                      "cloud_readiness", "migration_pattern", "refactor_effort",
                      "findings", "code_deps", "network_endpoints",
-                     "required_changes", "blockers", "summary", "source", "updated_at"]
+                     "required_changes", "blockers", "summary", "source",
+                     "agent_findings", "agent_blockers", "agent_summary",
+                     "updated_at"]
 
     def upsert_code_profile(self, p: CodeProfile) -> None:
         sql = self._upsert_sql("code_profiles", self._PROFILE_COLS, "app_id")
@@ -1352,7 +1473,10 @@ class Store:
                 dumps([f.to_dict() for f in p.findings]),
                 dumps(p.code_deps), dumps(p.network_endpoints),
                 dumps(p.required_changes), dumps(p.blockers),
-                p.summary, p.source or "repo", p.updated_at))
+                p.summary, p.source or "repo",
+                dumps([f.to_dict() for f in p.agent_findings]),
+                dumps(p.agent_blockers), p.agent_summary or "",
+                p.updated_at))
 
     def _row_to_profile(self, d: Dict[str, Any]) -> CodeProfile:
         d = dict(d)
@@ -1361,6 +1485,13 @@ class Store:
         d["network_endpoints"] = loads(d.get("network_endpoints")) or []
         d["required_changes"] = loads(d.get("required_changes")) or []
         d["blockers"] = loads(d.get("blockers")) or []
+        # path A — pre-ALTER rows have agent_*=NULL; default to empty (the
+        # executor predates the codex pass). from_dict parses the dict-shaped
+        # agent_findings into ScanFinding; null-safe via `or []`.
+        d["agent_findings"] = [ScanFinding.from_dict(x) for x in
+                               (loads(d.get("agent_findings")) or [])]
+        d["agent_blockers"] = loads(d.get("agent_blockers")) or []
+        d["agent_summary"] = d.get("agent_summary") or ""
         # F9 — pre-ALTER rows have source=NULL; default to "repo"
         if not d.get("source"):
             d["source"] = "repo"
@@ -1377,6 +1508,195 @@ class Store:
     def delete_code_profile(self, app_id: str) -> None:
         with self.tx() as cur:
             cur.execute(self._x("DELETE FROM code_profiles WHERE app_id=?"), (app_id,))
+
+    # -- repos (git urls) — first-class source object, N:N with hosts --------
+    _REPO_COLS = ["repo_id", "url", "branch", "name", "created_at", "updated_at"]
+
+    def upsert_repo(self, r: Repo) -> None:
+        sql = self._upsert_sql("repos", self._REPO_COLS, "repo_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (r.repo_id, r.url, r.branch, r.name,
+                                      r.created_at, r.updated_at))
+
+    def get_repo(self, repo_id: str) -> Optional[Repo]:
+        r = self._fetchone("SELECT * FROM repos WHERE repo_id=?", (repo_id,))
+        return Repo.from_dict(dict(r)) if r else None
+
+    def get_repo_by_url(self, url: str) -> Optional[Repo]:
+        r = self._fetchone("SELECT * FROM repos WHERE url=?", (url,))
+        return Repo.from_dict(dict(r)) if r else None
+
+    def list_repos(self) -> List[Repo]:
+        return [Repo.from_dict(dict(r)) for r in
+                self._fetchall("SELECT * FROM repos ORDER BY url ASC")]
+
+    def delete_repo(self, repo_id: str) -> bool:
+        """Delete a repo AND its host_repos edges (cascade) in one tx. Returns
+        False if the repo didn't exist (caller -> 404)."""
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM host_repos WHERE repo_id=?"), (repo_id,))
+            cur.execute(self._x("DELETE FROM repos WHERE repo_id=?"), (repo_id,))
+            return cur.rowcount > 0
+
+    def set_host_repos(self, server_id: str, repo_ids: List[str]) -> None:
+        """Replace the set of repos a host deploys (the N:N edge from the host
+        side): delete all existing edges for ``server_id`` then insert the new
+        set. Empty list detaches the host from every repo."""
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM host_repos WHERE server_id=?"), (server_id,))
+            if repo_ids:
+                rows = [(server_id, rid) for rid in dict.fromkeys(repo_ids) if rid]
+                cur.executemany(self._x(
+                    "INSERT IGNORE INTO host_repos(server_id, repo_id) VALUES (?, ?)"),
+                    rows)
+
+    def set_repo_hosts(self, repo_id: str, server_ids: List[str]) -> None:
+        """Replace the set of hosts that deploy a repo (the N:N edge from the
+        repo side): delete all existing edges for ``repo_id`` then insert the
+        new set. Empty list detaches the repo from every host."""
+        with self.tx() as cur:
+            cur.execute(self._x("DELETE FROM host_repos WHERE repo_id=?"), (repo_id,))
+            if server_ids:
+                rows = [(sid, repo_id) for sid in dict.fromkeys(server_ids) if sid]
+                cur.executemany(self._x(
+                    "INSERT IGNORE INTO host_repos(server_id, repo_id) VALUES (?, ?)"),
+                    rows)
+
+    def host_repos_for(self, server_id: str) -> List[str]:
+        return [r["repo_id"] for r in self._fetchall(
+            "SELECT repo_id FROM host_repos WHERE server_id=? ORDER BY repo_id",
+            (server_id,))]
+
+    def hosts_for_repo(self, repo_id: str) -> List[str]:
+        """server_ids that deploy this repo, restricted to servers that still
+        exist (a removed server's edge is filtered out here)."""
+        return [r["server_id"] for r in self._fetchall(
+            "SELECT hr.server_id FROM host_repos hr "
+            "JOIN servers s ON s.id = hr.server_id "
+            "WHERE hr.repo_id=? ORDER BY hr.server_id", (repo_id,))]
+
+    def repos_for_app(self, app_id: str) -> List[str]:
+        """Derived app->repos: the DISTINCT repos deployed on the app's hosts
+        (workloads.server_ids -> host_repos). The app->host link already lives
+        in workloads; app->repo is not stored separately (D2: derived)."""
+        w = self.get_workload(app_id)
+        if not w or not w.server_ids:
+            return []
+        ph = ",".join("?" * len(w.server_ids))
+        return [r["repo_id"] for r in self._fetchall(
+            f"SELECT DISTINCT repo_id FROM host_repos "
+            f"WHERE server_id IN ({ph}) ORDER BY repo_id", tuple(w.server_ids))]
+
+    def repo_host_counts(self) -> Dict[str, int]:
+        """repo_id -> count of existing hosts that deploy it (one query)."""
+        return {r["repo_id"]: int(r["n"]) for r in self._fetchall(
+            "SELECT hr.repo_id, COUNT(*) AS n FROM host_repos hr "
+            "JOIN servers s ON s.id = hr.server_id "
+            "GROUP BY hr.repo_id")}
+
+    def repo_hosts_map(self) -> Dict[str, List[str]]:
+        """repo_id -> [server_id...] (existing hosts only), one query. For the
+        enriched /api/repos list (hostnames + derived apps per repo)."""
+        out: Dict[str, List[str]] = {}
+        for r in self._fetchall(
+            "SELECT hr.repo_id, hr.server_id FROM host_repos hr "
+            "JOIN servers s ON s.id = hr.server_id "
+            "ORDER BY hr.repo_id, hr.server_id"):
+            out.setdefault(r["repo_id"], []).append(r["server_id"])
+        return out
+
+    def repo_host_enrichment(self) -> Dict[str, List[Dict[str, Any]]]:
+        """repo_id -> [{server_id, hostname, app_ids}] for the hosts linked to
+        each repo (one JOIN over host_repos x servers). Only touches servers
+        actually linked to a repo — NOT the whole estate — so ``/api/repos``
+        stays fast on a 13K-server estate (the old code called
+        ``list_all_servers()`` which SELECT *'d every server + parsed 6 JSON
+        cols per row just to read a hostname)."""
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in self._fetchall(
+            "SELECT hr.repo_id, s.id AS server_id, s.hostname, s.app_ids "
+            "FROM host_repos hr JOIN servers s ON s.id = hr.server_id "
+            "ORDER BY hr.repo_id, s.hostname"):
+            sid = r["server_id"]
+            out.setdefault(r["repo_id"], []).append({
+                "server_id": sid,
+                "hostname": r["hostname"] or sid,
+                "app_ids": loads(r["app_ids"]) if r["app_ids"] else [],
+            })
+        return out
+
+    def repo_hosts_enriched(self, repo_id: str) -> List[Dict[str, Any]]:
+        """[{server_id, hostname, fqdn}] for one repo's linked hosts (one JOIN).
+        Used by GET /api/repos/{repo_id}/hosts — avoids loading the whole estate
+        just to resolve one repo's hostnames/fqdns."""
+        return [{"server_id": r["id"], "hostname": r["hostname"] or r["id"],
+                 "fqdn": r["fqdn"] or ""}
+                for r in self._fetchall(
+                    "SELECT s.id, s.hostname, s.fqdn FROM host_repos hr "
+                    "JOIN servers s ON s.id = hr.server_id WHERE hr.repo_id=? "
+                    "ORDER BY s.hostname", (repo_id,))]
+
+    def host_labels(self, server_ids: List[str]) -> Dict[str, str]:
+        """server_id -> hostname for the given ids (one chunked IN-query).
+        Missing/stale ids are omitted. For showing hostnames of a known small
+        set (e.g. one app's hosts) WITHOUT loading the whole estate."""
+        out: Dict[str, str] = {}
+        ids = [s for s in server_ids if s]
+        if not ids:
+            return out
+        for i in range(0, len(ids), 1000):
+            chunk = ids[i:i + 1000]
+            ph = ",".join(["?"] * len(chunk))
+            for r in self._fetchall(
+                    f"SELECT id, hostname FROM servers WHERE id IN ({ph})",
+                    tuple(chunk)):
+                out[r["id"]] = r["hostname"] or r["id"]
+        return out
+
+    # -- repo discovery scans (discover-repos executor action) ---------------
+    _RSCAN_COLS = ["scan_id", "url", "status", "executor_id", "repos_json",
+                   "error", "created_at", "finished_at"]
+
+    def upsert_repo_scan(self, s: RepoScan) -> None:
+        sql = self._upsert_sql("repo_scans", self._RSCAN_COLS, "scan_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (
+                s.scan_id, s.url, s.status, (s.executor_id or None),
+                dumps(s.repos) if s.repos is not None else None,
+                (s.error or None), s.created_at, (s.finished_at or None)))
+
+    def _row_to_repo_scan(self, d: Dict[str, Any]) -> RepoScan:
+        d = dict(d)
+        d["repos"] = loads(d.get("repos_json")) if d.get("repos_json") else []
+        d.pop("repos_json", None)
+        if d.get("executor_id") is None:
+            d["executor_id"] = ""
+        if d.get("error") is None:
+            d["error"] = ""
+        if d.get("finished_at") is None:
+            d["finished_at"] = ""
+        return RepoScan.from_dict(d)
+
+    def get_repo_scan(self, scan_id: str) -> Optional[RepoScan]:
+        r = self._fetchone("SELECT * FROM repo_scans WHERE scan_id=?", (scan_id,))
+        return self._row_to_repo_scan(r) if r else None
+
+    def list_repo_scans(self, limit: int = 50) -> List[RepoScan]:
+        return [self._row_to_repo_scan(r) for r in self._fetchall(
+            "SELECT * FROM repo_scans ORDER BY created_at DESC LIMIT ?", (limit,))]
+
+    def complete_repo_scan(self, scan_id: str, status: str, repos, error: str,
+                            executor_id: str, finished_at: str) -> bool:
+        """Mark a discovery scan terminal with the discovered repos (or error).
+        Returns False if the scan row doesn't exist (404 for the callback)."""
+        with self.tx() as cur:
+            cur.execute(self._x(
+                "UPDATE repo_scans SET status=?, repos_json=?, error=?, "
+                "executor_id=COALESCE(?, executor_id), finished_at=? "
+                "WHERE scan_id=?"),
+                (status, dumps(repos) if repos is not None else None,
+                 (error or None), (executor_id or None), finished_at, scan_id))
+            return cur.rowcount > 0
 
     # -- DB conversion profiles (F5 — heterogeneous DB migration assessment) -
     _DBP_COLS = ["db_server_id", "source_engine", "target_engine", "difficulty",
@@ -2075,6 +2395,49 @@ class Store:
         sql += " ORDER BY created_at DESC LIMIT ?"
         args.append(limit)
         return [self._task_row(r) for r in self._fetchall(self._x(sql), tuple(args))]
+
+    # -- executor heartbeats (pull-mode connectivity) -------------------------
+    def touch_executor_seen(self, executor_id: str, now: str) -> None:
+        """Record that ``executor_id`` just reached into idc-migrate — it polled
+        ``/claim`` (even an idle poll with no task to hand over), renewed a
+        ``/lease``, or posted ``/complete``. This is the pull-mode liveness
+        signal: idc-migrate never reaches out, so "is the executor connected"
+        is inferred from this inbound activity, not a probe. Upserts one row."""
+        if not executor_id:
+            return
+        sql = self._upsert_sql("executor_heartbeats",
+                               ["executor_id", "last_seen_at"], "executor_id")
+        with self.tx() as cur:
+            cur.execute(self._x(sql), (executor_id, now))
+
+    def executor_activity(self, executor_id: str) -> Dict[str, Any]:
+        """Inbound-activity summary for one executor (no outbound probe):
+        the last time it touched idc-migrate, plus the counts of tasks it has
+        claimed by terminal/in-flight status. ``last_seen`` is None when the
+        executor has never polled (registered but silent)."""
+        out: Dict[str, Any] = {"last_seen": None, "in_flight": 0,
+                               "done": 0, "error": 0}
+        if not executor_id:
+            return out
+        with self.tx() as cur:
+            cur.execute(self._x(
+                "SELECT last_seen_at FROM executor_heartbeats "
+                "WHERE executor_id=?"), (executor_id,))
+            row = cur.fetchone()
+            if row:
+                out["last_seen"] = row["last_seen_at"]
+            cur.execute(self._x(
+                "SELECT status, COUNT(*) AS n FROM executor_tasks "
+                "WHERE claimed_by=? GROUP BY status"), (executor_id,))
+            for r in cur.fetchall():
+                st, n = r["status"], int(r["n"])
+                if st == "claimed":
+                    out["in_flight"] = n
+                elif st == "done":
+                    out["done"] = n
+                elif st == "error":
+                    out["error"] = n
+        return out
 
     # -- questions (executor ↔ operator) -------------------------------------
     _Q_COLS = ["id", "app_id", "job_id", "kind", "prompt", "options", "context",

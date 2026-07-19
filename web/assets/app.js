@@ -5,7 +5,16 @@ let state = {q:'', filters:{}, page:1, page_size:50, order_by:'hostname', order_
 let ws = null, searchTimer = null;
 
 const $ = id => document.getElementById(id);
-async function api(path, opts){ const r = await fetch(API+path, opts); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+async function api(path, opts){
+  // all /api responses are dynamic (DB/skill state) — never let the browser
+  // serve a stale cached copy, or a save followed by a re-fetch/reload shows
+  // the OLD state (e.g. a just-saved bundled file "disappears" after reload).
+  opts = opts || {};
+  if(opts.cache === undefined) opts.cache = 'no-store';
+  const r = await fetch(API+path, opts);
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
 function fmtUtil(u){ if(!u||(!u.cpu_p95&&!u.mem_p95&&!u.disk_used_pct)) return '-'; return `${u.cpu_p95??'-'}/${u.mem_p95??'-'}/${u.disk_used_pct??'-'}`; }
 function esc(s){ return (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 /* attr() — safe to inline a value into a double-quoted HTML attribute that
@@ -28,6 +37,18 @@ function bucketBadge(bucket, label){
   return `<span class="tag" style="color:${c}" title="${esc(label)}: ${esc(bucket)}">${esc(_BUCKET_SHORT[bucket]||bucket)}</span>`;
 }
 
+/* shared 7R disposition color map. Lives here (not in pages/code.js or
+   pages/server-drawer.js) because BOTH declare it at top level and classic
+   scripts share one global lexical scope — a second `const _7R_COLORS` throws
+   "Identifier already declared", aborting the whole page script (which is what
+   left the Code & DB tab stuck on "loading executors…"). One declaration, in
+   the first-loaded shared file, is the single source of truth. */
+const _7R_COLORS = {
+  'rehost':'var(--green)','rehost-container':'var(--green)','relocate':'var(--green)',
+  'replatform':'#3b8eea','refactor':'var(--amber)','repurchase':'#a06bff',
+  'retain':'#888','retire':'#e5484d'
+};
+
 /* ---------- toast notifications ---------- */
 function toast(msg, type='info', ms=3000){
   let wrap = document.querySelector('.toast-wrap');
@@ -46,6 +67,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.tab==='inventory') fetchInv();
   if(t.dataset.tab==='lz') loadLz();
   if(t.dataset.tab==='waves'){ loadWaves(); loadLzReadiness(); loadLzGate(); }
+  if(t.dataset.tab==='sources') { if(typeof loadSources==='function') loadSources(); }
   if(t.dataset.tab==='code') loadCode();
   if(t.dataset.tab==='business-case') loadLatestBusinessCase();
   if(t.dataset.tab==='execution') loadExecution();
@@ -53,6 +75,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.tab==='docs') loadDocs();
   if(t.dataset.tab==='readiness') loadReadiness();
   if(t.dataset.tab==='data-quality'){ loadDataGaps(); loadDiscovery(); }
+  if(t.dataset.tab==='skills'){ if(typeof loadSkills==='function') loadSkills(); }
 });
 
 /* ---------- header stats ---------- */

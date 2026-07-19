@@ -66,7 +66,7 @@ def test_get_recomputes_stale_snapshot(monkeypatch):
     to empty inputs so the recompute is deterministic + fast."""
     _save_snapshot("bc-stale-test", per_server_n=999, priced=999)
     monkeypatch.setattr(m.STORE, "stats", lambda: {"matches": 10})  # 999 != 10 -> stale
-    monkeypatch.setattr(m, "_portfolio_inputs", lambda: ([], [], {}))
+    monkeypatch.setattr(m, "_portfolio_inputs", lambda: ([], [], {}, {}))
     try:
         r = client.get("/api/business-case")
         assert r.status_code == 200
@@ -91,3 +91,61 @@ def test_get_returns_fresh_snapshot_unchanged(monkeypatch):
         assert len(payload["per_server"]) == 10
     finally:
         _cleanup("bc-fresh-test")
+
+
+def test_get_recomputes_when_7r_policy_changed_after_snapshot(monkeypatch):
+    """A 7R-policy change (app_strategies / legacy_dispositions updated_at)
+    AFTER the snapshot was generated makes the snapshot stale EVEN WHEN the
+    matched-server count is unchanged — so GET recomputes and the Business
+    case 7R matches the live Inventory 7R. Without this, a snapshot saved
+    before a retain/retire / app-strategy change shows stale 7R that differs
+    from the Inventory 7R column (the bug this pins)."""
+    live_n = int(m.STORE.stats().get("matches") or 0)
+    # snapshot: count matches live (count check passes) but generated_at is in
+    # the past, BEFORE the 7R change we make below.
+    payload = {
+        "currency": "USD", "pricing_source": "fixture",
+        "generated_at": "2020-01-01T00:00:00Z",
+        "cloud_yearly": 0.0, "cloud_monthly": 0.0,
+        "priced_servers": live_n, "unpriced_servers": 0,
+        "per_server": [{"server_id": f"srv-{i}"} for i in range(live_n)],
+        "per_product": {}, "per_region": {}, "per_strategy": {},
+    }
+    m.STORE.save_business_case("bc-7r-drift-test", payload, created_at=_FUTURE)
+    # a host disposition written AFTER the snapshot (updated_at = now) -> 7R drift
+    from idc.core.models import LegacyDisposition
+    m.STORE.upsert_legacy_disposition(LegacyDisposition(
+        server_id="bc-7r-drift-test-host", disposition="retain",
+        rationale="t", confidence=1.0, summary="t"))
+    monkeypatch.setattr(m, "_portfolio_inputs", lambda: ([], [], {}, {}))
+    try:
+        r = client.get("/api/business-case")
+        assert r.status_code == 200
+        p = r.json()["payload"]
+        assert p.get("recomputed") is True   # stale by 7R drift -> recompute
+    finally:
+        m.STORE.delete_legacy_disposition("bc-7r-drift-test-host")
+        _cleanup("bc-7r-drift-test")
+
+
+def test_get_fresh_when_no_7r_change_after_snapshot(monkeypatch):
+    """A snapshot whose generated_at is AFTER the newest 7R-policy write is
+    NOT stale by 7R drift — GET serves it as-is (no recompute)."""
+    live_n = int(m.STORE.stats().get("matches") or 0)
+    payload = {
+        "currency": "USD", "pricing_source": "fixture",
+        "generated_at": "2099-12-31T23:59:59Z",   # far future -> newer than any 7R write
+        "cloud_yearly": 0.0, "cloud_monthly": 0.0,
+        "priced_servers": live_n, "unpriced_servers": 0,
+        "per_server": [{"server_id": f"srv-{i}"} for i in range(live_n)],
+        "per_product": {}, "per_region": {}, "per_strategy": {},
+    }
+    m.STORE.save_business_case("bc-7r-fresh-test", payload, created_at=_FUTURE)
+    monkeypatch.setattr(m, "_portfolio_inputs", lambda: ([], [], {}, {}))
+    try:
+        r = client.get("/api/business-case")
+        assert r.status_code == 200
+        p = r.json()["payload"]
+        assert "recomputed" not in p   # generated_at newer than any 7R write -> fresh
+    finally:
+        _cleanup("bc-7r-fresh-test")

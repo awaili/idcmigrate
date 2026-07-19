@@ -219,6 +219,55 @@ class Workload:
 
 
 # ---------------------------------------------------------------------------
+# repo (git url) — first-class source object, N:N with hosts (servers).
+# An app's repos are DERIVED from its hosts (app->hosts via workloads, then
+# hosts->repos via host_repos). Global + url-unique: one repo per distinct
+# git url, scanned once, shared across every host/app that deploys it.
+# ---------------------------------------------------------------------------
+@dataclass
+class Repo:
+    repo_id: str
+    url: str = ""
+    branch: str = ""
+    name: str = ""                  # derived from the url path; operator-editable
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Repo":
+        return cls(**{k: d.get(k) for k in cls.__dataclass_fields__})  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# repo scan (discovery) — the operator pastes a git group/org url, the executor
+# enumerates the repositories inside it and pushes the list back here, the
+# operator picks which to register as first-class Repo rows. Heavy lift (git /
+# SCM API access) is the executor's, never idc-migrate's (see the repo-access
+# contract in docs/agent-executor.md). One row per scan.
+# ---------------------------------------------------------------------------
+@dataclass
+class RepoScan:
+    scan_id: str
+    url: str = ""                       # the group/org git url that was scanned
+    status: str = "pending"             # pending | done | error
+    executor_id: str = ""               # executor that ran it ("" = pool)
+    repos: List[Dict[str, Any]] = field(default_factory=list)  # discovered
+    error: str = ""
+    created_at: str = ""
+    finished_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "RepoScan":
+        return cls(**{k: d.get(k) for k in cls.__dataclass_fields__})  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
 # cost estimate (F2 — TCO / business case)
 # ---------------------------------------------------------------------------
 @dataclass
@@ -504,6 +553,12 @@ FINDING_CATEGORIES = (
     "plsql_compat",          # Oracle PL/SQL constructs with no MySQL equivalent
     "db_feature_gap",        # engine-specific feature gap (sequences, partitioning, ...)
     "db_size_complexity",    # schema size / object count driving conversion cost
+    # path A — agent (codex) grounded findings: a code-level issue the rule
+    # engine's regexes can't catch (semantic blocker, cross-file dependency,
+    # pattern nuance), read from the actual repo by the executor's optional
+    # codex pass. Carried in CodeProfile.agent_findings (separate from the
+    # rule findings so the contract's 11-category rule set stays clean).
+    "agent_insight",
 )
 
 
@@ -558,6 +613,14 @@ class CodeProfile:
     required_changes: List[Dict[str, Any]] = field(default_factory=list)
     blockers: List[str] = field(default_factory=list)
     summary: str = ""
+    # path A — agent (codex) grounded code pass, run by the executor AFTER the
+    # rule engine. Separate from ``findings``/``blockers`` so the rule set's
+    # provenance stays clean and downstream prompts can weight agent-grounded
+    # signal (read from the actual repo) above the lossy rule summary. Empty
+    # when the executor's codex pass is off / unavailable / produced nothing.
+    agent_findings: List[ScanFinding] = field(default_factory=list)
+    agent_blockers: List[str] = field(default_factory=list)
+    agent_summary: str = ""
     # F9 — provenance of this profile: "repo" (executor scanned source) or
     # "runtime-derived" (no repo — inferred from Zabbix/Prometheus process+port+
     # software inventory; confidence is capped lower + a Question gates modify).
@@ -576,7 +639,12 @@ class CodeProfile:
         # only from_dict the dict-shaped ones.
         findings = [x if isinstance(x, ScanFinding) else ScanFinding.from_dict(x)
                     for x in d.pop("findings", []) or []]
-        return cls(**d, findings=findings)  # type: ignore[arg-type]
+        # path A — agent_findings are ScanFinding-shaped (the executor's codex
+        # pass emits the same shape as the rule findings). Parse dicts →
+        # ScanFinding the same way; pre-deserialized rows stay as-is.
+        agent_findings = [x if isinstance(x, ScanFinding) else ScanFinding.from_dict(x)
+                         for x in d.pop("agent_findings", []) or []]
+        return cls(**d, findings=findings, agent_findings=agent_findings)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

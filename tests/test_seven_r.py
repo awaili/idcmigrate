@@ -184,6 +184,72 @@ def test_seven_r_strategy_llm_exception_degrades():
 
 
 # ---------------------------------------------------------------------------
+# LLM seven_r_host — per-host 7R analysis (sibling of seven_r_strategy)
+# ---------------------------------------------------------------------------
+from idc.core.models import Target
+
+
+def _host_match(s):
+    return Match(server_id=s.id, confidence=0.9, rationale="rule",
+                 target=Target(product="CVM", spec="SA2.LARGE4", region="ap-bangkok"))
+
+
+def test_seven_r_host_parses_valid():
+    s, _wls, prof = _estate()
+    c = LLMClient(Settings(llm_enabled=True))
+    with patch.object(c, "chat", return_value=_resp("rehost-container")):
+        r = c.seven_r_host(s, _host_match(s), prof, current="rehost",
+                          host_disposition="")
+    assert r["ok"] is True
+    assert r["strategy"] == "rehost-container"
+    assert r["target"] == "TKE"
+    assert r["confidence"] == pytest.approx(0.7)
+    assert r["key_changes"] == ["add Dockerfile"]
+
+
+def test_seven_r_host_context_carries_current_and_disposition():
+    """The per-host context sent to the LLM includes the host's current 7R +
+    any operator retain/retire override, so the LLM can respect an operator
+    call (it sees the host is already marked retain)."""
+    s, _wls, _prof = _estate()
+    c = LLMClient(Settings(llm_enabled=True))
+    sent = {}
+    def fake_chat(messages, stream=False, timeout=None):
+        sent["user"] = messages[-1]["content"]
+        return _resp("retain")
+    with patch.object(c, "chat", side_effect=fake_chat):
+        c.seven_r_host(s, _host_match(s), None, current="rehost",
+                       host_disposition="retain")
+    assert '"current_7r": "rehost"' in sent["user"]
+    assert '"host_disposition": "retain"' in sent["user"]
+
+
+def test_seven_r_host_rejects_invalid_strategy():
+    s, _wls, prof = _estate()
+    c = LLMClient(Settings(llm_enabled=True))
+    with patch.object(c, "chat", return_value=_resp("lift-n-shift")):
+        r = c.seven_r_host(s, _host_match(s), prof)
+    assert r["ok"] is False
+    assert "invalid strategy" in r["error"]
+
+
+def test_seven_r_host_llm_disabled():
+    s, _wls, prof = _estate()
+    c = LLMClient(Settings(llm_enabled=False))
+    r = c.seven_r_host(s, _host_match(s), prof)
+    assert r["ok"] is False and r["strategy"] == ""
+
+
+def test_seven_r_host_llm_exception_degrades():
+    s, _wls, prof = _estate()
+    c = LLMClient(Settings(llm_enabled=True))
+    with patch.object(c, "chat", side_effect=RuntimeError("gateway down")):
+        r = c.seven_r_host(s, _host_match(s), prof)
+    assert r["ok"] is False
+    assert "MigraQ error" in r["error"]
+
+
+# ---------------------------------------------------------------------------
 # F2 — deterministic 7R confidence ceiling (clamps the LLM value)
 # ---------------------------------------------------------------------------
 from idc.core.codeintel import seven_r_confidence

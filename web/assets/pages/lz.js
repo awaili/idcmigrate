@@ -603,8 +603,8 @@ async function lzGateCheck(){
 }
 
 /* Section D — emit LZ IaC (scope=landing_zone, id=lz:<arch>) + show guardrails.
-   Mirrors code.js doIacEmit/showIac but self-contained so the operator can stand
-   up the LZ Terraform without leaving the tab. */
+   Mirrors code.js showIac but self-contained so the operator can stand up the LZ
+   Terraform without leaving the tab. */
 async function lzEmitIac(a){
   try{
     await api('/iac-emit', {method:'POST', headers:{'content-type':'application/json'},

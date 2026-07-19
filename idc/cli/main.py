@@ -588,11 +588,15 @@ def cost(format: str = typer.Option("table", "--format", help="table | json | cs
     servers = st.list_all_servers()
     matches = st.list_matches()
     strategies = {s.app_id: s for s in st.list_app_strategies()}
-    from ..core.cost import strategies_from_tags
+    from ..core.cost import strategies_from_tags, host_disposition_for
     for app_id, strat in strategies_from_tags(servers).items():
         strategies[app_id] = strat
+    # per-host retain/retire override (Inventory drawer "set disposition") so
+    # the CLI's per-server strategy matches the Inventory's 7R policy too.
+    host_dispositions = {s.id: d for s in servers if (d := host_disposition_for(s, st.get_legacy_disposition))}
     book = load_pricebook(get_settings())
-    bc = estimate_portfolio(servers, matches, book, strategies=strategies)
+    bc = estimate_portfolio(servers, matches, book, strategies=strategies,
+                            host_dispositions=host_dispositions)
     st.close()
     if format == "json":
         console.print_json(json.dumps(bc, ensure_ascii=False)); return
@@ -621,11 +625,13 @@ def business_case(save: bool = typer.Option(True, "--save/--no-save"),
     servers = st.list_all_servers()
     matches = st.list_matches()
     strategies = {s.app_id: s for s in st.list_app_strategies()}
-    from ..core.cost import strategies_from_tags
+    from ..core.cost import strategies_from_tags, host_disposition_for
     for app_id, strat in strategies_from_tags(servers).items():
         strategies[app_id] = strat
+    host_dispositions = {s.id: d for s in servers if (d := host_disposition_for(s, st.get_legacy_disposition))}
     book = load_pricebook(get_settings())
-    bc = estimate_portfolio(servers, matches, book, strategies=strategies)
+    bc = estimate_portfolio(servers, matches, book, strategies=strategies,
+                            host_dispositions=host_dispositions)
     sid = ""
     if save:
         sid = _new_id("bc")

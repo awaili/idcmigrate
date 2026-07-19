@@ -37,7 +37,12 @@ from ..core.models import (ALL_QUESTION_KINDS, ChangeJob, CodeProfile, DBConvers
                            Question, ScanFinding, _now)
 from ..llm import get_client
 from ..agent import build_context, get_executor_client, run_agent
+from ..agent import registry as _registry
 from ..core.codeintel import app_targets, build_change_spec, resolve_value
+
+# the single operator-managed executor id (registry.DEFAULT_ID) — referenced by
+# the default-executor status/config views that report pull-mode connectivity.
+DEFAULT_EXECUTOR_ID = _registry.DEFAULT_ID
 from ..core.match import warranty_bucket
 from ..core.eol import os_eol_bucket
 
@@ -128,7 +133,13 @@ def _ws_session_authed(ws: WebSocket) -> bool:
 
 # paths that stay open when auth is on
 _PUBLIC_PREFIXES = ("/assets/",)
-_PUBLIC_PATHS = {"/login", "/logout", "/executor", "/favicon.ico"}
+# /api/executors/register is public on purpose: an executor self-enrolls
+# before it has a bearer or a browser session. It is gated by the optional
+# IDC_ENROLL_SECRET (checked in the endpoint), and every enrollment lands
+# pending + inert until an operator approves — so open registration can only
+# add pending rows, never claim work or push.
+_PUBLIC_PATHS = {"/login", "/logout", "/executor", "/favicon.ico",
+                 "/api/executors/register"}
 # Paths where the executor bearer token is honored (the executor contract
 # surface: push callbacks, read-only context pulls, and pull-dispatch). Everywhere
 # else under /api/ requires a browser session — so a leaked bearer can't change
@@ -217,10 +228,16 @@ def _executor_settings(executor_id: Optional[str] = None):
 
 def _resolve_executor(executor_id: Optional[str]):
     """Same as _executor_settings but maps a missing named executor to a 404
-    (used by every trigger endpoint)."""
+    and a still-PENDING self-enrollment to a 409 'pending approval' (used by
+    every trigger endpoint — a pending executor can't be targeted)."""
     try:
         return _executor_settings(executor_id)
     except KeyError:
+        from ..agent import registry
+        eid = (executor_id or "").strip()
+        if eid and any(e["id"] == eid and e.get("status") == registry.STATUS_PENDING
+                       for e in registry.list_executors(STORE, settings)):
+            raise HTTPException(409, f"executor {executor_id!r} pending approval")
         raise HTTPException(404, f"no such executor: {executor_id!r}")
 
 
@@ -310,7 +327,8 @@ class AgentReq(BaseModel):
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-def _server_out(s, profiles_by_app=None, strategies_by_app=None):
+def _server_out(s, profiles_by_app=None, strategies_by_app=None,
+                dispositions_by_key=None, book=None):
     d = s.to_dict()
     m = STORE.get_match(s.id)
     d["match"] = m.to_dict() if m else None
@@ -320,18 +338,52 @@ def _server_out(s, profiles_by_app=None, strategies_by_app=None):
     # for stale rows that predate the column.
     d["warranty_bucket"] = s.warranty_bucket or warranty_bucket(s)
     d["os_eol_bucket"] = s.os_eol_bucket or os_eol_bucket(s)
-    # code-scan enrichment: only when a profile map is supplied (single-server
-    # detail). The paginated list endpoint does NOT pass one, so it stays fast
-    # and does not load all profiles per row.
-    if profiles_by_app is not None:
-        d["code"] = _server_code_summary(s, profiles_by_app, strategies_by_app)
-        # operator / executor host disposition (retain / retire / "") — only on
-        # the detail path (the drawer shows + edits it); a legacy_disposition
-        # lookup is a DB round-trip, so skip it for the paginated list. Keyed by
-        # the host's stable identity (hostname lowercased), survives a Rebuild.
-        d["disposition"] = _host_disposition(s)
+    # 7R policy for this host — single source of truth shared with the Business
+    # case + CLI (cost.seven_r_for): host-level retain/retire override wins over
+    # the app-level AI strategy, else rehost. Only computed when the caller
+    # preloaded the (small) strategies map; the paginated list preloads it once
+    # so this is O(1) per row, not a DB round-trip per host.
+    if strategies_by_app is not None:
+        from ..core.cost import seven_r_for, host_disposition_for
+        dk = dispositions_by_key or {}
+        # operator / executor host disposition (retain / retire / "") — the raw
+        # override the drawer's Disposition row shows + edits. Keyed by the
+        # host's stable identity (hostname lowercased), survives a Rebuild.
+        d["disposition"] = host_disposition_for(s, dk.get)
+        d["seven_r"] = seven_r_for(s, strategies_by_app, dk.get)
+        # the source of the 7R policy, so the drawer can show WHY (host override
+        # / which app's AI strategy / the rehost default). Mirrors the precedence
+        # in seven_r_for exactly.
+        if d["disposition"]:
+            d["seven_r_source"] = "host override"
+        else:
+            src_app = next((a for a in (s.app_ids or []) if a in strategies_by_app), None)
+            d["seven_r_source"] = (f"app AI · {src_app}" if src_app else "default (rehost)")
+        # code-scan enrichment: only when a profile map is supplied (single-
+        # server detail). The paginated list endpoint does NOT pass one, so it
+        # stays fast and does not load all profiles per row.
+        if profiles_by_app is not None:
+            d["code"] = _server_code_summary(s, profiles_by_app, strategies_by_app)
+            # host-level extras for the drawer (detail path only): the waves the
+            # host belongs to (scan list_waves — 643 waves is fine for one host)
+            # + the run-cost estimate (when a pricebook is passed in). The list
+            # path skips both — waves is a scan, cost needs the book.
+            d["waves"] = [{"id": w.id, "name": w.name, "stage": w.stage}
+                          for w in STORE.list_waves() if s.id in (w.server_ids or [])]
+            if book is not None and m is not None:
+                from ..core.cost import estimate_server
+                est = estimate_server(s, m, book)
+                d["cost"] = {"monthly": round(est.monthly_usd, 2),
+                             "yearly": round(est.yearly_usd, 2),
+                             "product": est.target_product, "spec": est.spec,
+                             "region": est.region, "basis": est.basis,
+                             "pricing_source": est.pricing_source}
+            else:
+                d["cost"] = None
     else:
         d["disposition"] = ""
+        d["seven_r"] = ""
+        d["seven_r_source"] = ""
     return d
 
 
@@ -393,6 +445,13 @@ def _server_code_summary(s, profiles_by_app, strategies_by_app=None):
             "finding_categories": cats,
             "findings_count": len(p.findings or []),
             "required_changes_count": len(p.required_changes or []),
+            # path A — optional codex pass output (agent (codex) grounded). Kept
+            # compact for the drawer summary: a count + the blockers (capped) +
+            # a short summary. The full agent_findings list is on the Scan &
+            # Migrate page; the drawer just flags that the agent found something.
+            "agent_findings_count": len(p.agent_findings or []),
+            "agent_blockers": list(p.agent_blockers or [])[:5],
+            "agent_summary": (p.agent_summary or "")[:200],
             "summary": p.summary, "scanned_at": p.scanned_at,
         }
         st = strategies_by_app.get(app_id) if strategies_by_app else None
@@ -445,7 +504,15 @@ def list_servers(role: Optional[str] = None, env: Optional[str] = None,
     res = STORE.query_servers(f, page=page, page_size=min(page_size, 500),
                               order_by=order_by, order_dir=order_dir,
                               with_facets=facets)
-    items = [_server_out(s) for s in res["items"]]
+    # preload the small strategy + disposition maps ONCE (not per row) so each
+    # row's 7R policy is an O(1) lookup — the Inventory "7R" column reads the
+    # same source of truth as the Business case + drawer.
+    strategies_by_app = {s2.app_id: s2 for s2 in STORE.list_app_strategies()}
+    dispositions_by_key = {d.server_id: d.disposition
+                            for d in STORE.list_legacy_dispositions()}
+    items = [_server_out(s, strategies_by_app=strategies_by_app,
+                         dispositions_by_key=dispositions_by_key)
+             for s in res["items"]]
     return {"items": items, "total": res["total"], "page": res["page"],
             "page_size": res["page_size"], "facets": res["facets"]}
 
@@ -485,7 +552,11 @@ def get_server(sid: str):
     # attach code-scan enrichment (one profile + strategy load, not per-row)
     pmap = {p.app_id: p for p in STORE.list_code_profiles()}
     smap = {s2.app_id: s2 for s2 in STORE.list_app_strategies()}
-    return _server_out(s, profiles_by_app=pmap, strategies_by_app=smap)
+    dk = {d.server_id: d.disposition for d in STORE.list_legacy_dispositions()}
+    from ..core.cost import load_pricebook
+    book = load_pricebook(settings)
+    return _server_out(s, profiles_by_app=pmap, strategies_by_app=smap,
+                       dispositions_by_key=dk, book=book)
 
 
 @app.put("/api/servers/{sid}/warranty")
@@ -778,6 +849,408 @@ def get_workload(app_id: str):
     return w.to_dict()
 
 
+@app.get("/api/apps")
+def list_apps():
+    """The full app catalog (app_id + name + tier + env) for UI dropdowns —
+    every ``app_id`` input on the Code & DB page picks from this list instead
+    of being typed freehand. Backed by ``workloads`` (covers apps even with no
+    servers yet); ordered by app_id."""
+    return STORE.app_options()
+
+
+# ---------------------------------------------------------------------------
+# Repos (git urls) — first-class source object, N:N with hosts. An app's repos
+# are DERIVED from its hosts (app->hosts via workloads, then hosts->repos via
+# host_repos); the repo->apps reverse mapping is derived here from servers'
+# app_ids. Phase 1: entity + N:N host mapping + management UI. The code-profile
+# re-key to repo_id (so a repo is scanned once, profile per repo) is Phase 2.
+# ---------------------------------------------------------------------------
+def _repo_name_from_url(url: str) -> str:
+    """Best-effort human label from a git url: last path segment, .git stripped."""
+    u = (url or "").strip().rstrip("/")
+    if u.endswith(".git"):
+        u = u[:-4]
+    if "://" in u:
+        u = u.split("://", 1)[1]
+    seg = u.rsplit("/", 1)[-1] if "/" in u else u
+    seg = seg.split("@", 1)[-1]  # strip any user@ prefix
+    return seg or (url or "").strip()
+
+
+@app.get("/api/repos")
+def list_repos_endpoint():
+    """All repos, enriched with the hostnames that deploy each and the apps
+    derived from those hosts' app_ids. Ordered by url.
+
+    Only the hosts actually linked to a repo are read (one JOIN over
+    host_repos x servers) — NOT the whole estate. The old code called
+    list_all_servers() (SELECT * FROM servers + 6 JSON parses per row) just to
+    look up hostnames, which made this endpoint crawl on a 13K-server estate."""
+    from ..core.models import Repo  # noqa: F401 (clarifies the row shape)
+    repos = STORE.list_repos()
+    enrich = STORE.repo_host_enrichment()   # repo_id -> [{server_id,hostname,app_ids}]
+    out = []
+    for r in repos:
+        hs = enrich.get(r.repo_id, [])
+        hostnames = [h["hostname"] for h in hs]
+        apps = sorted({a for h in hs for a in h["app_ids"]})
+        out.append({
+            "repo_id": r.repo_id, "url": r.url, "branch": r.branch or "",
+            "name": r.name or _repo_name_from_url(r.url),
+            "hosts": hostnames, "host_count": len(hostnames),
+            "apps": apps, "created_at": r.created_at, "updated_at": r.updated_at,
+        })
+    return out
+
+
+class RepoReq(BaseModel):
+    url: str
+    branch: str = ""
+    name: Optional[str] = None
+
+
+@app.post("/api/repos")
+def create_repo(req: RepoReq):
+    """Register a git url as a first-class repo. url is UNIQUE — a second add
+    of the same url 409s (the existing row is the shared repo). mints repo_id."""
+    from ..core.models import Repo, _new_id, _now
+    url = (req.url or "").strip()
+    if not url or not (url.startswith("http://") or url.startswith("https://")
+                       or url.startswith("git@") or url.startswith("ssh://")):
+        raise HTTPException(400, "url must be a git http(s)/ssh url")
+    if STORE.get_repo_by_url(url):
+        raise HTTPException(409, "a repo with that url already exists (it is shared — link it to hosts instead)")
+    repo = Repo(repo_id=_new_id("repo"), url=url, branch=(req.branch or "").strip(),
+                name=(req.name or "").strip() or _repo_name_from_url(url),
+                created_at=_now(), updated_at=_now())
+    STORE.upsert_repo(repo)
+    return {"repo_id": repo.repo_id, "url": repo.url, "branch": repo.branch,
+            "name": repo.name, "created_at": repo.created_at}
+
+
+@app.put("/api/repos/{repo_id}")
+def update_repo(repo_id: str, req: RepoReq):
+    """Edit a repo's url/branch/name. A url change to one already used by
+    another repo 409s."""
+    from ..core.models import _now
+    r = STORE.get_repo(repo_id)
+    if not r:
+        raise HTTPException(404, f"no such repo: {repo_id!r}")
+    url = (req.url or r.url).strip()
+    if not url:
+        raise HTTPException(400, "url must not be empty")
+    other = STORE.get_repo_by_url(url)
+    if other and other.repo_id != repo_id:
+        raise HTTPException(409, "another repo already uses that url")
+    r.url = url
+    r.branch = (req.branch or r.branch).strip()
+    r.name = (req.name or r.name or _repo_name_from_url(url)).strip()
+    r.updated_at = _now()
+    STORE.upsert_repo(r)
+    return {"repo_id": r.repo_id, "url": r.url, "branch": r.branch, "name": r.name,
+            "updated_at": r.updated_at}
+
+
+@app.delete("/api/repos/{repo_id}")
+def delete_repo_endpoint(repo_id: str):
+    """Delete a repo and cascade its host_repos edges."""
+    if not STORE.delete_repo(repo_id):
+        raise HTTPException(404, f"no such repo: {repo_id!r}")
+    return {"repo_id": repo_id, "deleted": True}
+
+
+@app.get("/api/repos/{repo_id}/hosts")
+def repo_hosts(repo_id: str):
+    """The hosts (server_id + hostname + fqdn) that deploy this repo. One JOIN
+    over host_repos x servers — does NOT load the whole estate (the old code did
+    list_all_servers() just to resolve one repo's hostnames)."""
+    if not STORE.get_repo(repo_id):
+        raise HTTPException(404, f"no such repo: {repo_id!r}")
+    return STORE.repo_hosts_enriched(repo_id)
+
+
+class RepoHostsReq(BaseModel):
+    hosts: List[str] = []   # free-text: server_id, hostname, or fqdn (case-insensitive)
+
+
+@app.put("/api/repos/{repo_id}/hosts")
+def set_repo_hosts_endpoint(repo_id: str, req: RepoHostsReq):
+    """Replace the set of hosts that deploy a repo (the N:N edge, repo side).
+    Accepts free-text tokens (server_id / hostname / fqdn); unmatched tokens
+    are reported back so the operator can fix typos."""
+    if not STORE.get_repo(repo_id):
+        raise HTTPException(404, f"no such repo: {repo_id!r}")
+    res = STORE.resolve_server_ids(req.hosts)
+    STORE.set_repo_hosts(repo_id, res["matched"])
+    return {"repo_id": repo_id, "matched": len(res["matched"]),
+            "unresolved": res["unresolved"]}
+
+
+@app.get("/api/hosts/{server_id}/repos")
+def host_repos_endpoint(server_id: str):
+    """The repos deployed on a host (the N:N edge, host side). The path token
+    may be a server_id, hostname, or fqdn (case-insensitive) — resolved to a
+    server_id so the operator can type a hostname. 404 if it matches no host."""
+    from ..core.models import Repo  # noqa: F401
+    sid = _resolve_host_token(server_id)
+    rids = STORE.host_repos_for(sid)
+    if not rids:
+        return []
+    by_id = {r.repo_id: r for r in STORE.list_repos()}
+    return [{"repo_id": r.repo_id, "url": r.url, "branch": r.branch,
+             "name": r.name or _repo_name_from_url(r.url)}
+            for r in (by_id[rid] for rid in rids if rid in by_id)]
+
+
+@app.get("/api/hosts/suggest")
+def suggest_hosts(q: str = "", limit: int = 20):
+    """Lightweight hostname typeahead for the repo chips editor and any host
+    picker: ``[{server_id, hostname, fqdn, role}]`` matching a substring on
+    hostname/fqdn/ips/tags/app_ids. Deliberately returns NO per-row match/EOL
+    enrichment (unlike ``/api/servers``, which does a get_match per item) so it
+    stays fast keystroke-by-keystroke. Empty ``q`` -> the first ``limit`` hosts
+    by hostname. ``limit`` capped at 50."""
+    f = ServerFilter(q=(q or None))
+    res = STORE.query_servers(f, page=1, page_size=min(limit, 50),
+                              order_by="hostname", order_dir="asc",
+                              with_facets=False)
+    return [{"server_id": s.id, "hostname": s.hostname or s.id,
+             "fqdn": s.fqdn or "", "role": s.role or ""}
+            for s in res["items"]]
+
+
+class HostReposReq(BaseModel):
+    repo_ids: List[str] = []   # repos to deploy on this host (replaces the set)
+
+
+@app.put("/api/hosts/{server_id}/repos")
+def set_host_repos_endpoint(server_id: str, req: HostReposReq):
+    """Replace the set of repos a host deploys (the N:N edge, host side). The
+    path token may be a server_id / hostname / fqdn (resolved). repo_ids that
+    don't exist are reported as unresolved (the link isn't created for them)."""
+    sid = _resolve_host_token(server_id)
+    known = {r.repo_id for r in STORE.list_repos()}
+    valid = [rid for rid in dict.fromkeys(req.repo_ids) if rid in known]
+    unresolved = [rid for rid in req.repo_ids if rid not in known]
+    STORE.set_host_repos(sid, valid)
+    return {"server_id": sid, "linked": len(valid), "unresolved": unresolved}
+
+
+def _resolve_host_token(token: str) -> str:
+    """Resolve a free-text host token (server_id / hostname / fqdn) to a
+    server_id. 404 if it matches no existing host."""
+    if not token:
+        raise HTTPException(404, "no such host")
+    # fast path: it's already a real server_id
+    if STORE.get_server(token):
+        return token
+    res = STORE.resolve_server_ids([token])
+    if res["matched"]:
+        return res["matched"][0]
+    raise HTTPException(404, f"no such host: {token!r}")
+
+
+@app.get("/api/apps/{app_id}/repos")
+def app_repos_endpoint(app_id: str):
+    """An app's repos, DERIVED from its hosts (app->hosts via workloads, then
+    hosts->repos via host_repos). Not stored — recomputed on read."""
+    from ..core.models import Repo  # noqa: F401
+    rids = STORE.repos_for_app(app_id)
+    if not rids:
+        return []
+    by_id = {r.repo_id: r for r in STORE.list_repos()}
+    return [{"repo_id": r.repo_id, "url": r.url, "branch": r.branch,
+             "name": r.name or _repo_name_from_url(r.url)}
+            for r in (by_id[rid] for rid in rids if rid in by_id)]
+
+
+@app.get("/api/apps/{app_id}/sources")
+def app_sources_endpoint(app_id: str):
+    """An app's sources, enriched with WHICH of the app's hosts carry each — the
+    app-centric primary view of the Code tab. app↔repo is derived from hosts, so
+    this walks only the app's hosts (NOT the whole estate): for each host in the
+    app's workload, collect its repos, then label the carrying hostnames via a
+    targeted IN-query. 404 if the app has no workload. Returns
+    ``[{repo_id, url, name, branch, hostnames, host_count}]`` + ``host_total``."""
+    from ..core.models import Repo  # noqa: F401
+    w = next((x for x in STORE.list_workloads() if x.app_id == app_id), None)
+    if not w:
+        raise HTTPException(404, f"no such app: {app_id!r}")
+    sids = w.server_ids or []
+    carry: Dict[str, List[str]] = {}        # repo_id -> [server_id] (app hosts)
+    for sid in sids:
+        for rid in STORE.host_repos_for(sid):
+            carry.setdefault(rid, []).append(sid)
+    labels = STORE.host_labels([s for hs in carry.values() for s in hs])
+    by_id = {r.repo_id: r for r in STORE.list_repos()}
+    out = []
+    for rid, hsids in carry.items():
+        r = by_id.get(rid)
+        if not r:
+            continue
+        hostnames = [labels.get(s, s) for s in hsids]
+        out.append({
+            "repo_id": r.repo_id, "url": r.url, "branch": r.branch or "",
+            "name": r.name or _repo_name_from_url(r.url),
+            "hostnames": hostnames, "host_count": len(hostnames),
+        })
+    out.sort(key=lambda x: x["name"].lower())
+    return {"app_id": app_id, "host_total": len(sids), "sources": out}
+
+
+class AppRepoReq(BaseModel):
+    repo_id: str
+    action: Literal["add", "remove"] = "add"
+
+
+@app.put("/api/apps/{app_id}/repos")
+def set_app_repos(app_id: str, req: AppRepoReq):
+    """Link/unlink a source to an app. app↔repo is DERIVED from hosts, so this
+    adds (or removes) the repo to/from EVERY host in the app's workload — a
+    per-host union/diff, NOT a replace (each host's other repos are preserved).
+    Idempotent: a host that already has/doesn't-have the repo is skipped.
+    Returns ``{app_id, repo_id, action, hosts_changed, hosts_skipped}``."""
+    w = next((x for x in STORE.list_workloads() if x.app_id == app_id), None)
+    if not w:
+        raise HTTPException(404, f"no such app: {app_id!r}")
+    if not STORE.get_repo(req.repo_id):
+        raise HTTPException(404, f"no such repo: {req.repo_id!r}")
+    changed = 0
+    skipped = 0
+    for sid in w.server_ids or []:
+        cur = STORE.host_repos_for(sid)
+        if req.action == "add":
+            if req.repo_id in cur:
+                skipped += 1
+                continue
+            STORE.set_host_repos(sid, list(cur) + [req.repo_id])
+        else:
+            if req.repo_id not in cur:
+                skipped += 1
+                continue
+            STORE.set_host_repos(sid, [x for x in cur if x != req.repo_id])
+        changed += 1
+    return {"app_id": app_id, "repo_id": req.repo_id, "action": req.action,
+            "hosts_changed": changed, "hosts_skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Repo discovery — the operator pastes a git GROUP/ORG url, the executor
+# enumerates the repositories inside it and pushes the list back here, the
+# operator picks which to register. idc-migrate never touches git itself (the
+# repo-access contract, docs/agent-executor.md §2.0②): the executor does the
+# SCM API / ls-remote work with its own credentials. One RepoScan row per scan.
+# ---------------------------------------------------------------------------
+class RepoDiscoverReq(BaseModel):
+    url: str
+    executor_id: Optional[str] = None
+
+
+@app.post("/api/repos/discover")
+def discover_repos(req: RepoDiscoverReq):
+    """Enqueue a ``discover-repos`` task: an executor pulls it, enumerates the
+    repositories inside the git group/org url, and pushes the list back to
+    ``PUT /api/repos/discover/{scan_id}/result``. Returns
+    ``{scan_id, task_id, status:"pending"}``. Async — poll the scan to read it."""
+    from ..core.models import RepoScan, _new_id, _now
+    url = (req.url or "").strip()
+    if not url or not (url.startswith("http://") or url.startswith("https://")
+                       or url.startswith("git@") or url.startswith("ssh://")):
+        raise HTTPException(400, "url must be a git http(s)/ssh url")
+    s = _resolve_executor(req.executor_id)
+    if not s.executor_enabled:
+        raise HTTPException(409, "executor disabled (IDC_EXECUTOR_ENABLED=false)")
+    ec = get_executor_client(s)
+    scan_id = _new_id("scn")
+    now = _now()
+    STORE.upsert_repo_scan(RepoScan(
+        scan_id=scan_id, url=url, status="pending",
+        executor_id=(req.executor_id or "").strip(), created_at=now))
+    payload = {"scan_id": scan_id, "url": url,
+               "callback": ec.cb(f"/api/repos/discover/{scan_id}/result")}
+    res = _enqueue("discover-repos", payload, req.executor_id)
+    res["scan_id"] = scan_id
+    res["url"] = url
+    return res
+
+
+@app.get("/api/repos/discover")
+def list_repo_scans_endpoint():
+    """Recent discovery scans (newest-first) — the UI's scan history."""
+    return [s.to_dict() for s in STORE.list_repo_scans(limit=50)]
+
+
+@app.get("/api/repos/discover/{scan_id}")
+def get_repo_scan_endpoint(scan_id: str):
+    """One discovery scan: status + the discovered repos (empty until done).
+    The UI polls this until ``status`` flips to ``done``/``error``."""
+    sc = STORE.get_repo_scan(scan_id)
+    if not sc:
+        raise HTTPException(404, f"no such scan: {scan_id!r}")
+    return sc.to_dict()
+
+
+class RepoDiscoverResultReq(BaseModel):
+    # the discovered repositories: each {url, name, branch, description, web_url}
+    repos: List[Dict[str, Any]] = []
+    error: Optional[str] = None
+
+
+@app.put("/api/repos/discover/{scan_id}/result")
+def discover_repos_result(scan_id: str, req: RepoDiscoverResultReq,
+                          authorization: Optional[str] = Header(None)):
+    """Executor callback: store the discovered repos (or an error) and flip the
+    scan to ``done``/``error``. Bearer auth — only a registered executor may
+    push results back. 404 if the scan row doesn't exist."""
+    _check_executor_auth(authorization)
+    if not STORE.get_repo_scan(scan_id):
+        raise HTTPException(404, f"no such scan: {scan_id!r}")
+    eid = _caller_executor_id(authorization)
+    status = "error" if (req.error and not req.repos) else "done"
+    err = (req.error or "") if status == "error" else ""
+    ok = STORE.complete_repo_scan(scan_id, status, req.repos, err, eid, _now_iso())
+    if not ok:
+        raise HTTPException(404, f"no such scan: {scan_id!r}")
+    return {"scan_id": scan_id, "status": status, "count": len(req.repos)}
+
+
+class RepoBulkReq(BaseModel):
+    # repos to register: each {url, branch?, name?}. url must be present + git-shaped.
+    repos: List[Dict[str, Any]] = []
+
+
+@app.post("/api/repos/bulk")
+def bulk_create_repos(req: RepoBulkReq):
+    """Register many repos at once (idempotent): a url that already exists is
+    skipped (it is the shared repo — link it to hosts instead). Used by the
+    discovery UI's "register selected" after a scan. Returns
+    ``{created: [...], skipped: [...], invalid: [...]}`` (urls)."""
+    from ..core.models import Repo, _new_id, _now
+    created: List[str] = []
+    skipped: List[str] = []
+    invalid: List[str] = []
+    seen: set = set()
+    for item in req.repos or []:
+        url = (item.get("url") or "").strip()
+        if not url or not (url.startswith("http://") or url.startswith("https://")
+                           or url.startswith("git@") or url.startswith("ssh://")):
+            invalid.append(url or "(empty)")
+            continue
+        if url in seen or STORE.get_repo_by_url(url):
+            seen.add(url)
+            skipped.append(url)
+            continue
+        seen.add(url)
+        repo = Repo(repo_id=_new_id("repo"), url=url,
+                    branch=(item.get("branch") or "").strip(),
+                    name=(item.get("name") or "").strip() or _repo_name_from_url(url),
+                    created_at=_now(), updated_at=_now())
+        STORE.upsert_repo(repo)
+        created.append(url)
+    return {"created": created, "skipped": skipped, "invalid": invalid,
+            "created_count": len(created)}
+
+
 @app.get("/api/apps/{app_id}/targets")
 def get_app_targets(app_id: str):
     """Matched migration targets for an app's servers (CDB? CVM? which region?).
@@ -935,6 +1408,143 @@ def delete_code_profile(app_id: str, authorization: Optional[str] = Header(None)
     _check_executor_auth(authorization)
     STORE.delete_code_profile(app_id)
     return {"app_id": app_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Skill management — browse / edit / reset the idc-migrate LLM skills (7R /
+# audit / assess / review / lz / network / waveplan). Editing writes a markdown
+# file to the IDC_SKILLS_DIR overlay (never to the repo's idc/skills/); the
+# loader re-scans on write so the change takes effect immediately, no restart.
+# Operator-only: these are under /api/ and NOT in the public/bearer lists, so
+# _auth_dispatch requires a browser session (web_password gate) — a leaked
+# executor bearer can't rewrite LLM behavior. See idc/llm/skills.py.
+# ---------------------------------------------------------------------------
+@app.get("/api/skills")
+def list_skills_api():
+    from ..llm.skills import list_skill_infos
+    return list_skill_infos(get_settings())
+
+
+@app.get("/api/skills/{name}")
+def get_skill_api(name: str):
+    from ..llm.skills import skill_view
+    s = skill_view(name, get_settings())
+    if s is None:
+        raise HTTPException(404, "no such skill")
+    return s
+
+
+@app.put("/api/skills/{name}")
+def put_skill_api(name: str, body: dict):
+    """Create or overwrite a skill's markdown in the IDC_SKILLS_DIR overlay.
+    The body's ``markdown`` is the full file (--- frontmatter --- + body)."""
+    from ..llm.skills import write_skill
+    md = str(body.get("markdown") or "")
+    if not md.strip():
+        raise HTTPException(400, "markdown empty")
+    try:
+        path = write_skill(name, md, get_settings())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"name": name, "saved": True, "file_path": path}
+
+
+@app.delete("/api/skills/{name}")
+def delete_skill_api(name: str):
+    """Remove the overlay file (reverts to the built-in file or the _FALLBACK
+    constant). No-op (removed=False) if no overlay file exists."""
+    from ..llm.skills import delete_skill
+    removed = delete_skill(name, get_settings())
+    return {"name": name, "removed": removed}
+
+
+@app.get("/api/skills/{name}/files/{file_path:path}")
+def get_skill_file_api(name: str, file_path: str):
+    """Read one bundled reference/script file of a directory-form skill (round 1).
+    Returns content/kind/size. 404 if the skill has no directory form or the path
+    isn't a bundled file (the loader's file list is the allowlist — no traversal).
+    Operator-only (same session gate as the rest of /api/skills)."""
+    from ..llm.skills import read_skill_file
+    res = read_skill_file(name, file_path, get_settings())
+    if res is None:
+        raise HTTPException(404, "no such skill file")
+    content, kind, size = res
+    return {"name": name, "path": file_path, "kind": kind,
+            "size": size, "content": content}
+
+
+@app.put("/api/skills/{name}/files/{file_path:path}")
+def put_skill_file_api(name: str, file_path: str, body: dict):
+    """Create or overwrite one bundled reference/script file (round 2). Promotes
+    a single-file / builtin / fallback skill to directory-form overlay if needed.
+    ``body.content`` is the file text. 400 if no overlay dir / invalid path /
+    script not .py. Operator-only (same session gate as /api/skills)."""
+    from ..llm.skills import write_skill_file
+    content = str(body.get("content") or "")
+    try:
+        path = write_skill_file(name, file_path, content, get_settings())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"name": name, "path": file_path, "saved": True, "file_path": path}
+
+
+@app.delete("/api/skills/{name}/files/{file_path:path}")
+def delete_skill_file_api(name: str, file_path: str):
+    """Remove one bundled file from a directory-form overlay skill (round 2).
+    No-op (removed=False) if no overlay skill dir / the path isn't bundled.
+    Operator-only (same session gate as /api/skills)."""
+    from ..llm.skills import delete_skill_file
+    removed = delete_skill_file(name, file_path, get_settings())
+    return {"name": name, "path": file_path, "removed": removed}
+
+
+@app.post("/api/skills/{name}/try")
+def try_skill_api(name: str, body: dict):
+    """Run a skill WITHOUT saving — the Skills-page Try panel. ``body.input`` is
+    the free-text user message; optional ``body.markdown`` is an unsaved edit to
+    try (parsed as a transient skill). Returns {ok, kind, output, error,
+    resources_touched}. Structured-input skills (seven_r/audit/assess/review)
+    reject with kind='wired'. Operator-only (same session gate as /api/skills)."""
+    from ..llm.runner import try_skill
+    user_input = str(body.get("input") or "")
+    markdown = body.get("markdown") or None
+    if markdown is not None:
+        markdown = str(markdown)
+    return try_skill(name, user_input, get_settings(), markdown=markdown)
+
+
+@app.get("/api/skills/{name}/prev")
+def get_skill_prev_api(name: str):
+    """The previous-saved markdown snapshot for one-step undo (round 3). Returns
+    {has_prev, markdown}. Operator-only (same session gate as /api/skills)."""
+    from ..llm.skills import get_skill_prev
+    md = get_skill_prev(name, get_settings())
+    return {"name": name, "has_prev": md is not None, "markdown": md or ""}
+
+
+@app.post("/api/skills/{name}/undo")
+def undo_skill_api(name: str):
+    """Restore the .prev snapshot as the current overlay (one-step undo, round 3).
+    Returns {restored, markdown}. restored=False if no snapshot. Operator-only."""
+    from ..llm.skills import undo_skill
+    md = undo_skill(name, get_settings())
+    return {"name": name, "restored": md is not None, "markdown": md or ""}
+
+
+@app.post("/api/skills/{name}/run-script")
+def run_skill_script_api(name: str, body: dict):
+    """Run a skill's bundled python script (the editor's CURRENT content,
+    unsaved OK) in a sandbox and return stdout/stderr/exit — the Skills-page
+    Run button. ``body.path`` is ``scripts/<name>.py``; ``body.content`` is the
+    script text to run (the textarea's current value, so you can debug before
+    saving). Operator-only (same session gate as /api/skills — a leaked
+    executor bearer can't run code on the box)."""
+    from ..llm.runner import run_skill_script
+    path = str(body.get("path") or "")
+    content = str(body.get("content") or "")
+    if not path:
+        raise HTTPException(400, "path required (scripts/<name>.py)")
+    return run_skill_script(name, path, content, get_settings())
 
 
 # ---------------------------------------------------------------------------
@@ -1575,15 +2185,28 @@ class ExecutorScanReq(BaseModel):
 
 @app.get("/api/executor/status")
 def executor_status_endpoint():
-    """Connectivity probe for the external code-modifying executor — powers the
-    web status indicator + the `doctor` CLI check. Never raises."""
+    """Pull-mode status for the default executor — powers the web status
+    indicator + the `doctor` CLI check. idc-migrate never probes, so
+    `reachable` is None; the live signal is `connected`/`last_seen` from the
+    executor's inbound poll activity on the queue. Never raises."""
     from ..agent import executor_status
-    return executor_status(_executor_settings())
+    return _merge_activity(executor_status(_executor_settings()), DEFAULT_EXECUTOR_ID)
+
+
+def _merge_activity(status: Dict[str, Any], executor_id: str) -> Dict[str, Any]:
+    """Overlay pull-mode connectivity (inbound activity) onto a static
+    ``executor_status()`` dict. idc-migrate never probes, so ``reachable``
+    stays None and the live signal is ``connected``/``last_seen`` from the
+    queue heartbeats. Used by /api/executor/status + /api/executor/config
+    (the default executor); named executors get the same shape via
+    _executor_with_status."""
+    status.update(_activity_status(executor_id))
+    return status
 
 
 class ExecutorConfigReq(BaseModel):
-    # All optional — only provided fields are updated on PUT; /test probes a
-    # candidate {url, token} without persisting.
+    # All optional — only provided fields are updated on PUT; /test reports a
+    # candidate {url, token} pull-mode status without persisting.
     url: Optional[str] = None
     token: Optional[str] = None
     enabled: Optional[bool] = None
@@ -1593,10 +2216,10 @@ class ExecutorConfigReq(BaseModel):
 
 def _executor_config_out(s=None) -> dict:
     """Public view of the executor config (token NEVER returned — only token_set)
-    plus a live status probe."""
+    plus pull-mode connectivity (inbound activity — no outbound probe)."""
     from ..agent import executor_status
     s = s or _executor_settings()
-    status = executor_status(s)
+    status = _merge_activity(executor_status(s), DEFAULT_EXECUTOR_ID)
     return {
         "url": s.executor_url or "",
         "token_set": bool(s.executor_token),
@@ -1609,8 +2232,8 @@ def _executor_config_out(s=None) -> dict:
 
 @app.get("/api/executor/config")
 def executor_get_config():
-    """Current executor connection (URL / enabled / timeout / token_set) + a
-    live health probe. The token itself is never returned."""
+    """Current executor connection (URL / enabled / timeout / token_set) plus
+    pull-mode connectivity. The token itself is never returned."""
     return _executor_config_out()
 
 
@@ -1644,9 +2267,13 @@ def executor_put_config(req: ExecutorConfigReq):
 
 @app.post("/api/executor/test")
 def executor_test_config(req: ExecutorConfigReq):
-    """Probe a candidate executor connection WITHOUT persisting — the panel's
-    "Test connection" button. Layer the provided url/token over the live config
-    (falling back to live values for fields not supplied) and run the probe."""
+    """Report pull-mode status for a CANDIDATE {url, token} WITHOUT persisting.
+    idc-migrate never reaches out to the executor, so there is no probe — this
+    just layers the provided url/token over the live config (falling back to
+    live values for fields not supplied) and returns the static pull-mode
+    status (``reachable`` is always None). Kept for back-compat; the UI no
+    longer exposes a "Test connection" button (it can't — idc-migrate never
+    initiates a connection)."""
     import dataclasses
     s = _executor_settings()
     overrides: Dict[str, Any] = {}
@@ -1666,21 +2293,72 @@ def executor_test_config(req: ExecutorConfigReq):
 # ones via this surface. All push back to the same idc-migrate public URL and
 # authenticate with their own token (any registered token validates).
 # ---------------------------------------------------------------------------
+# Pull mode: idc-migrate never initiates a connection to any executor, so a
+# row's "connected" dot is NOT a probe result — it is "this executor polled
+# idc-migrate (claim/lease/complete) within the window". An executor that polls
+# continuously touches idc-migrate every few seconds, so 2x the claim lease is
+# a generous freshness threshold; an executor past it shows "idle · last seen".
+EXECUTOR_CONNECTED_WINDOW_S = 1800   # 2x EXECUTOR_LEASE_SECONDS (15min)
+
+
+def _activity_status(executor_id: str) -> Dict[str, Any]:
+    """Pull-mode connectivity for one executor, derived purely from inbound
+    activity (no outbound probe). ``connected`` means the executor touched
+    idc-migrate within EXECUTOR_CONNECTED_WINDOW_S. Never raises — a missing
+    executor_id yields a never-seen status."""
+    from datetime import datetime, timezone
+    act = STORE.executor_activity(executor_id) if executor_id else \
+        {"last_seen": None, "in_flight": 0, "done": 0, "error": 0}
+    last = act.get("last_seen")
+    connected = False
+    age = None
+    if last:
+        try:
+            ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            age = max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
+            connected = age <= EXECUTOR_CONNECTED_WINDOW_S
+        except Exception:
+            connected = False
+    if last and connected:
+        detail = f"connected · last poll {age}s ago"
+    elif last:
+        detail = f"idle · last poll {age}s ago"
+    else:
+        detail = "registered · no poll yet"
+    return {
+        # back-compat: pull mode never probes, so reachable stays None (not
+        # a True/False probe result — the UI keys off `connected` instead).
+        "reachable": None,
+        "connected": connected,
+        "last_seen": last,
+        "in_flight": int(act.get("in_flight", 0)),
+        "done": int(act.get("done", 0)),
+        "error": int(act.get("error", 0)),
+        "detail": detail,
+    }
+
+
 def _executor_with_status(entry: Dict[str, Any]) -> Dict[str, Any]:
-    """Public registry entry: strip the token, attach a live /health probe."""
-    from ..agent import registry, executor_status
+    """Public registry entry: strip the token, attach pull-mode connectivity
+    (inbound activity, not an outbound probe — idc-migrate never reaches out).
+    A PENDING self-enrollment has no token and never polls, so it surfaces
+    'pending approval' with no last_seen."""
+    from ..agent import registry
     out = registry.public_view(entry)
-    try:
-        out["status"] = executor_status(registry.resolve(STORE, settings, entry["id"]))
-    except Exception as e:  # never let a probe error sink the list
-        out["status"] = {"reachable": False, "detail": f"probe error: {e!r}"}
+    if out.get("approval") == registry.STATUS_PENDING:
+        out["status"] = {"reachable": None, "connected": False, "last_seen": None,
+                         "in_flight": 0, "done": 0, "error": 0,
+                         "detail": "pending approval"}
+        return out
+    out["status"] = _activity_status(entry["id"])
     return out
 
 
 @app.get("/api/executors")
 def list_executors_endpoint():
-    """All configured executors (default first) with a per-executor /health
-    probe. Token is never returned (only ``token_set``)."""
+    """All configured executors (default first) with per-executor pull-mode
+    connectivity (inbound poll activity — idc-migrate never probes). Token is
+    never returned (only ``token_set``)."""
     from ..agent import registry
     return [_executor_with_status(e)
             for e in registry.list_executors(STORE, settings)]
@@ -1727,7 +2405,8 @@ def upsert_executor(executor_id: str, req: ExecutorUpsertReq):
 
 @app.delete("/api/executors/{executor_id}")
 def delete_executor(executor_id: str):
-    """Remove a NAMED executor. The default can't be deleted."""
+    """Remove a NAMED executor (the default can't be deleted). Serves both as
+    'remove' for an approved executor and 'reject' for a pending self-enrollment."""
     from ..agent import registry
     try:
         removed = registry.delete(STORE, executor_id)
@@ -1738,9 +2417,86 @@ def delete_executor(executor_id: str):
     return {"id": executor_id, "deleted": True}
 
 
+# ---------------------------------------------------------------------------
+# Self-registration → approval lifecycle. An executor enrolls itself
+# (POST /api/executors/register, public + optional enroll-secret gate); it
+# lands PENDING + inert. An operator approves it (POST /api/executors/{id}/approve),
+# at which point idc-migrate MINTS the bearer token and returns it ONCE so the
+# operator can relay it to the executor out-of-band (Option B: the executor
+# never holds a secret it invented). rotate-token re-issues an approved
+# executor's token (e.g. the one-time token was lost).
+# ---------------------------------------------------------------------------
+class ExecutorRegisterReq(BaseModel):
+    id: str
+    url: Optional[str] = None
+    timeout: Optional[int] = None
+
+
+@app.post("/api/executors/register")
+def register_executor(req: ExecutorRegisterReq,
+                      x_enroll_secret: Optional[str] = Header(None, alias="X-Enroll-Secret")):
+    """Executor self-enrollment (public; no bearer/session — the executor has
+    neither yet). Optional IDC_ENROLL_SECRET gate: when set (env or DB), the
+    request must carry X-Enroll-Secret matching. Always lands the executor
+    PENDING with no token; an operator must approve it before it can claim or
+    push. Idempotent on a pending id; rejected (409) for an already-approved id."""
+    from ..agent import registry
+    sec = registry.enroll_secret(STORE, settings)
+    if sec and not secrets.compare_digest((x_enroll_secret or "").strip(), sec):
+        raise HTTPException(403, "enrollment secret required or mismatched")
+    try:
+        entry = registry.register(STORE, {
+            "id": req.id, "url": req.url, "timeout": req.timeout,
+        })
+    except ValueError as e:
+        # already-approved id → 409; bad id/url → 400
+        status_code = 409 if "already approved" in str(e) else 400
+        raise HTTPException(status_code, str(e))
+    # return the public view (no token) with the pending status probe
+    return _executor_with_status(entry)
+
+
+@app.post("/api/executors/{executor_id}/approve")
+def approve_executor(executor_id: str):
+    """Operator approves a PENDING self-enrollment. Mints the executor's bearer
+    token server-side and returns it ONCE under ``token`` (the operator relays
+    it to the executor out-of-band). The token is never returned again — only
+    ``token_set`` thereafter; use rotate-token to re-issue. Operator-only
+    (browser session)."""
+    from ..agent import registry
+    try:
+        entry = registry.approve(STORE, executor_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # surface the freshly-minted token exactly once
+    out = registry.public_view(entry)
+    out["token"] = entry["token"]
+    out["status"] = {"reachable": None, "detail": "approved — token shown once"}
+    return out
+
+
+@app.post("/api/executors/{executor_id}/rotate-token")
+def rotate_executor_token(executor_id: str):
+    """Operator re-issues an APPROVED named executor's token (the old one is
+    invalidated). Returns the new token ONCE under ``token``. Use when the
+    one-time approval token was lost or a secret is suspected leaked.
+    Operator-only (browser session)."""
+    from ..agent import registry
+    try:
+        entry = registry.rotate_token(STORE, executor_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    out = registry.public_view(entry)
+    out["token"] = entry["token"]
+    out["status"] = {"reachable": None, "detail": "token rotated — shown once"}
+    return out
+
+
 @app.post("/api/executors/{executor_id}/test")
 def test_executor(executor_id: str):
-    """Probe one executor's /health (no persistence)."""
+    """Report pull-mode status for one executor (no persistence, no outbound
+    probe — idc-migrate never reaches out). Kept for back-compat; the UI shows
+    connectivity via the inbound-activity dot, not a Test button."""
     from ..agent import registry, executor_status
     try:
         s = registry.resolve(STORE, settings, executor_id)
@@ -1964,6 +2720,10 @@ def executor_claim_task(req: ClaimReq,
         if not (10 <= req.lease_seconds <= 86400):
             raise HTTPException(400, "lease_seconds must be between 10 and 86400")
         lease = req.lease_seconds
+    # the executor just reached into idc-migrate — record it so the Manage
+    # executors panel can show "connected" from inbound activity (idc-migrate
+    # never probes). An idle poll (no task to hand over) still counts.
+    STORE.touch_executor_seen(eid, _now_iso())
     t = STORE.claim_next_task(eid, lease, _now_iso())
     if not t:
         return {"task_id": None, "status": "idle"}
@@ -1987,6 +2747,7 @@ def executor_complete_task(task_id: str, req: CompleteReq,
     reclaimed by another executor is a no-op here (returns 409 so the caller
     knows its work was taken over). Bearer auth."""
     eid = _caller_executor_id(authorization)
+    STORE.touch_executor_seen(eid, _now_iso())   # inbound activity heartbeat
     ok = STORE.complete_task(task_id, eid, req.status, _now_iso(),
                              error=req.error, result_ref=req.result_ref,
                              summary=req.summary)
@@ -2009,6 +2770,7 @@ def executor_renew_lease(task_id: str, req: LeaseReq,
     """Executor heartbeat — extend the claim's lease while still working. Only
     the owning executor may renew. Bearer auth."""
     eid = _caller_executor_id(authorization)
+    STORE.touch_executor_seen(eid, _now_iso())   # inbound activity heartbeat
     lease = EXECUTOR_LEASE_SECONDS
     if req.lease_seconds is not None:
         if not (10 <= req.lease_seconds <= 86400):
@@ -2217,6 +2979,261 @@ def match_audit(req: ExplainReq):
     return res
 
 
+@app.post("/api/strategy/host")
+def strategy_host(req: ExplainReq):
+    """Per-host 7R analysis (advisory). Asks the MigraQ what 7R strategy fits
+    THIS host, grounded in its full context (per-partition disks, OS-EOL /
+    warranty buckets, utilization, code profile, the rule target, the host's
+    current 7R policy + any operator retain/retire override) — the per-host
+    sibling of ``POST /api/strategy`` (which is per-app).
+
+    Returns ``{ok, server_id, hostname, current_7r, host_disposition, strategy,
+    rationale, target, confidence, effort, key_changes}``. Advisory only —
+    does NOT mutate. The operator acts via "set disposition" (retain/retire) or
+    the per-app "7R strategy" button (a migrating R affects the whole app)."""
+    from ..core.cost import seven_r_for, host_disposition_for
+    s = STORE.get_server(req.server_id)
+    if not s:
+        raise HTTPException(404, "server not found")
+    m = STORE.get_match(req.server_id)
+    if not m:
+        raise HTTPException(404, "no match for server")
+    # preload the small strategy + disposition maps once (not per host) to derive
+    # the host's CURRENT 7R policy (same source of truth as the Inventory column
+    # + Business case) + any operator retain/retire override, both sent to the
+    # LLM so it can recommend per-host without re-litigating an operator call.
+    smap = {x.app_id: x for x in STORE.list_app_strategies()}
+    dk = {d.server_id: d.disposition for d in STORE.list_legacy_dispositions()}
+    current = seven_r_for(s, smap, dk.get)
+    host_disp = host_disposition_for(s, dk.get)
+    res = LLM.seven_r_host(s, m, _first_code_profile(s),
+                          current=current, host_disposition=host_disp)
+    res["server_id"] = req.server_id
+    res["hostname"] = s.hostname
+    res["current_7r"] = current
+    res["host_disposition"] = host_disp
+    return res
+
+
+class StrategyHostBatchReq(BaseModel):
+    apply: bool = False
+    batch_size: int = 50      # hosts per batch — committed before the next batch starts
+    cursor: Optional[str] = None   # resume: hostname to start AFTER (None = from start)
+    limit: int = 0            # max hosts THIS call; 0 = one batch (batch_size hosts)
+
+
+@app.post("/api/strategy/host/batch")
+def strategy_host_batch(req: StrategyHostBatchReq,
+                        role: Optional[str] = None, env: Optional[str] = None,
+                        status: Optional[str] = None, source_type: Optional[str] = None,
+                        os: Optional[str] = None, criticality: Optional[str] = None,
+                        cluster: Optional[str] = None, datacenter: Optional[str] = None,
+                        target_product: Optional[str] = None, wave_id: Optional[str] = None,
+                        q: Optional[str] = None,
+                        util_cpu_min: Optional[float] = None, util_mem_min: Optional[float] = None,
+                        util_disk_min: Optional[float] = None,
+                        conf_min: Optional[float] = None, conf_max: Optional[float] = None,
+                        warranty_bucket: Optional[str] = None,
+                        os_eol_bucket: Optional[str] = None,
+                        app_id: Optional[str] = None):
+    """Bulk per-host 7R analysis over the WHOLE filter, in batches, committed
+    per batch + resumable. NDJSON-streamed.
+
+    Processes every host matching the current inventory filter (the SAME filter
+    params as GET /api/servers) via the MigraQ ``seven_r`` skill, in ordered
+    batches of ``batch_size`` hosts (by hostname asc). The client drives the
+    loop: each call processes one batch (``limit=0``) or up to ``limit`` hosts,
+    commits that batch's mutations, and returns a ``cursor`` (the next hostname)
+    + ``more=true`` when hosts remain — the UI calls again with the cursor to
+    continue. This keeps each HTTP request short (~batch_size × 3s) so a long
+    full-estate run (13,855 hosts × ~3s ≈ 11h) survives a network blip, a backend
+    restart, or a browser-tab close: the committed batches are durable, and the
+    run resumes from the cursor instead of restarting from zero.
+
+    ``apply``: when true, changes each host's 7R policy to match the
+    recommendation —
+      * retain/retire -> ``upsert_legacy_disposition`` (the host-level override
+        the Inventory 7R column + Business case + wave planner all read);
+      * migrating R  -> ``delete_legacy_disposition`` (clear any retain/retire
+        override so the host migrates with its app) + tally per app, and a
+        migrating recommendation fills the app's strategy ONLY when the app has
+        no existing strategy (operator/AI strategies preserved — non-destructive).
+    Each host's mutation is committed immediately (autocommit), and the
+    per-batch app-strategy fill commits with the batch — so a batch is fully
+    durable before the next begins. When ``apply`` is false, dry-run preview
+    only (no mutation). The LLM sees each host's current 7R + any operator
+    retain/retire override, so it respects an explicit operator call.
+
+    ``cursor``: resume point (hostname to start AFTER, by asc order). The UI
+    passes the previous call's returned cursor back. ``batch_size``: hosts per
+    batch (default 50). ``limit``: max hosts this call (0 = one batch).
+
+    Uses the SAME ``seven_r`` skill + ``seven_r_for``/``host_disposition_for``
+    precedence as the per-host Analyze-7R drawer button + the Inventory 7R
+    column, so the bulk result is consistent with everything else.
+    """
+    from ..core.models import AppStrategy, STRATEGY_SOURCE_AI, _now
+    from ..core.cost import seven_r_for, host_disposition_for
+    from ..core.codeintel import pattern_rank
+
+    f = ServerFilter(role=role, env=env, status=status, source_type=source_type,
+                     os=os, criticality=criticality, cluster=cluster, datacenter=datacenter,
+                     target_product=target_product, wave_id=wave_id, q=q,
+                     util_cpu_min=util_cpu_min, util_mem_min=util_mem_min,
+                     util_disk_min=util_disk_min, conf_min=conf_min, conf_max=conf_max,
+                     warranty_bucket=warranty_bucket, os_eol_bucket=os_eol_bucket,
+                     app_id=app_id, hostname_after=req.cursor)
+    batch_size = max(1, min(int(req.batch_size or 50), 500))
+    # hosts to process this call: one batch when limit<=0, else up to limit
+    hosts_target = min(batch_size, 100000) if req.limit <= 0 else max(batch_size, min(int(req.limit), 100000))
+
+    def stream():
+        # preload everything ONCE per call — the small maps + the matches + the
+        # code profiles, so each host is an O(1) lookup + one LLM call. The cursor
+        # (hostname > ?) is in the filter, so query_servers resumes efficiently.
+        page = STORE.query_servers(f, page=1, page_size=hosts_target + 1,
+                                    order_by="hostname", order_dir="asc",
+                                    with_facets=False)
+        rows = page["items"]
+        total_matching = page["total"]
+        more = len(rows) > hosts_target
+        servers = rows[:hosts_target]   # drop the +1 probe row
+        matches = {m.server_id: m for m in STORE.list_matches()}
+        smap = {x.app_id: x for x in STORE.list_app_strategies()}
+        dk = {d.server_id: d.disposition for d in STORE.list_legacy_dispositions()}
+        profiles_by_app = {p.app_id: p for p in STORE.list_code_profiles()}
+
+        yield json.dumps({"type": "start", "total": total_matching,
+                          "batch_size": batch_size, "apply": req.apply,
+                          "cursor": req.cursor, "resumed": req.cursor is not None,
+                          "this_call": len(servers), "more": more},
+                         ensure_ascii=False) + "\n"
+
+        analyzed = errors = applied_host = applied_clear = applied_app = 0
+        batches = 0
+        last_hostname = req.cursor
+
+        existing_apps = {x.app_id for x in STORE.list_app_strategies()}
+
+        batch_tally: Dict[str, List[str]] = {}
+        batch_host_n = 0
+        batch_idx = 0
+
+        for i, s in enumerate(servers, 1):
+            last_hostname = s.hostname
+            m = matches.get(s.id)
+            if not m:
+                yield json.dumps({"type": "host", "server_id": s.id,
+                                  "hostname": s.hostname, "ok": False,
+                                  "note": "no match — skipped", "done": i},
+                                 ensure_ascii=False) + "\n"
+                batch_host_n += 1
+            else:
+                current = seven_r_for(s, smap, dk.get)
+                host_disp = host_disposition_for(s, dk.get)
+                prof = next((profiles_by_app[a] for a in (s.app_ids or [])
+                            if a in profiles_by_app), None)
+                try:
+                    rec = LLM.seven_r_host(s, m, prof, current=current,
+                                          host_disposition=host_disp)
+                except Exception as e:   # never let one host kill the stream
+                    errors += 1
+                    yield json.dumps({"type": "host", "server_id": s.id,
+                                      "hostname": s.hostname, "ok": False,
+                                      "error": f"{e!r}", "done": i},
+                                     ensure_ascii=False) + "\n"
+                    batch_host_n += 1
+                else:
+                    analyzed += 1
+                    applied = "none"
+                    if req.apply and rec.get("ok"):
+                        keys = _host_disposition_keys(s)
+                        key = keys[0] if keys else s.id
+                        strat = rec["strategy"]
+                        if strat in (LD_RETAIN, LD_RETIRE):
+                            # committed immediately (autocommit) — durable per host
+                            STORE.upsert_legacy_disposition(LegacyDisposition(
+                                server_id=key, disposition=strat,
+                                rationale=(rec.get("rationale") or "AI 7R batch").strip(),
+                                confidence=float(rec.get("confidence") or 0.5),
+                                summary=f"AI 7R batch ({strat})"))
+                            dk[key] = strat    # keep the in-mem map fresh
+                            applied_host += 1
+                            applied = strat
+                        else:
+                            if host_disp:
+                                STORE.delete_legacy_disposition(key)
+                                dk.pop(key, None)
+                                applied_clear += 1
+                                applied = "cleared"
+                            for a in (s.app_ids or []):
+                                batch_tally.setdefault(a, []).append(strat)
+                    yield json.dumps({"type": "host", "server_id": s.id,
+                                      "hostname": s.hostname,
+                                      "app_ids": list(s.app_ids or []),
+                                      "current_7r": current,
+                                      "host_disposition": host_disp,
+                                      "ok": rec.get("ok", False),
+                                      "strategy": rec.get("strategy", ""),
+                                      "rationale": rec.get("rationale", ""),
+                                      "confidence": rec.get("confidence"),
+                                      "target": rec.get("target", ""),
+                                      "applied": applied, "done": i},
+                                     ensure_ascii=False) + "\n"
+                    batch_host_n += 1
+
+            # batch boundary: every batch_size hosts, OR the last host of the call
+            is_last_of_call = (i == len(servers))
+            if batch_host_n >= batch_size or is_last_of_call:
+                # commit the batch's app-strategy fills (non-destructive) — this is
+                # the "commit after each batch" checkpoint: every host disposition
+                # is already autocommitted; the app fills commit here, then the
+                # batch frame marks the durable boundary before the next batch.
+                if req.apply and batch_tally:
+                    for app_id, recs in batch_tally.items():
+                        if app_id in existing_apps:
+                            continue
+                        counts: Dict[str, int] = {}
+                        for r in recs:
+                            counts[r] = counts.get(r, 0) + 1
+                        top = sorted(counts.items(),
+                                     key=lambda kv: (-kv[1],
+                                                     pattern_rank(CodeProfile(
+                                                         app_id=app_id,
+                                                         migration_pattern=kv[0]))))
+                        strat = top[0][0]
+                        STORE.upsert_app_strategy(AppStrategy(
+                            app_id=app_id, strategy=strat,
+                            rationale=f"AI 7R batch majority of {len(recs)} host recs",
+                            source=STRATEGY_SOURCE_AI, confidence=0.6,
+                            assigned_at=_now(), updated_at=_now()))
+                        existing_apps.add(app_id)
+                        applied_app += 1
+                        yield json.dumps({"type": "app", "app_id": app_id,
+                                          "strategy": strat, "host_count": len(recs),
+                                          "applied": True}, ensure_ascii=False) + "\n"
+                    batch_tally = {}
+                batches += 1
+                batch_idx += 1
+                batch_host_n = 0
+                # cursor = last processed hostname so the next call resumes AFTER it
+                next_cursor = last_hostname if more else None
+                yield json.dumps({"type": "batch", "index": batch_idx,
+                                  "committed": True, "more": more,
+                                  "cursor": next_cursor,
+                                  "total_done": i, "total": total_matching},
+                                 ensure_ascii=False) + "\n"
+
+        yield json.dumps({"type": "done", "total": total_matching,
+                          "analyzed": analyzed, "errors": errors,
+                          "applied_host": applied_host, "applied_clear": applied_clear,
+                          "applied_app": applied_app, "batches": batches,
+                          "more": more, "cursor": (last_hostname if more else None),
+                          "apply": req.apply}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
 @app.post("/api/plan/review")
 def plan_review():
     """Red-team the current persisted wave plan for semantic issues the
@@ -2354,15 +3371,29 @@ class WhatIfReq(BaseModel):
 
 def _portfolio_inputs():
     """Gather persisted servers + matches + the strategies overlay (AI
-    app_strategies + F2 tag-driven retain/retire) for portfolio costing."""
-    from ..core.cost import strategies_from_tags
+    app_strategies + F2 tag-driven retain/retire) + the per-host disposition
+    overrides (retain/retire set via the Inventory drawer) for portfolio costing.
+
+    The host_dispositions map is what makes the Business case's 7R policy match
+    the Inventory's: a host the operator set to retain/retire in the drawer
+    (legacy_dispositions table) is shown with that same 7R outcome here, instead
+    of its app-level AI strategy."""
+    from ..core.cost import strategies_from_tags, host_disposition_for
     servers = STORE.list_all_servers()
     matches = STORE.list_matches()
     strategies = {s.app_id: s for s in STORE.list_app_strategies()}
     # operator tag-driven retain/retire wins over the AI strategy
     for app_id, strat in strategies_from_tags(servers).items():
         strategies[app_id] = strat
-    return servers, matches, strategies
+    # per-host retain/retire override (Inventory drawer "set disposition") —
+    # keyed by server id, applied on top of the app-level strategy in
+    # estimate_portfolio so the Business case shows the same 7R as the drawer.
+    # Preload the (small) legacy_dispositions table ONCE and probe by stable
+    # key, not a DB round-trip per host (13,855 hosts would otherwise be 13,855
+    # round-trips). Same keys + filter as the Inventory list + drawer.
+    dk = {d.server_id: d.disposition for d in STORE.list_legacy_dispositions()}
+    host_dispositions = {s.id: hd for s in servers if (hd := host_disposition_for(s, dk.get))}
+    return servers, matches, strategies, host_dispositions
 
 
 @app.post("/api/business-case")
@@ -2371,9 +3402,10 @@ def business_case(req: BusinessCaseReq):
     an immutable snapshot to ``business_case_snapshots``."""
     from ..core.cost import estimate_portfolio, load_pricebook
     from ..core.models import _new_id
-    servers, matches, strategies = _portfolio_inputs()
+    servers, matches, strategies, host_dispositions = _portfolio_inputs()
     book = load_pricebook(settings)
-    payload = estimate_portfolio(servers, matches, book, strategies=strategies)
+    payload = estimate_portfolio(servers, matches, book, strategies=strategies,
+                                 host_dispositions=host_dispositions)
     if req.save:
         sid = _new_id("bc")
         STORE.save_business_case(sid, payload)
@@ -2385,11 +3417,19 @@ def _business_case_stale(payload: Dict[str, Any]) -> bool:
     """True when a saved business-case snapshot no longer describes the current
     estate, so serving it would show data from a *previous* estate (e.g. the
     old demo/scale fixture's ``db-``/``app-``/``web-`` hosts after the real
-    ``inventory_draft`` was loaded, or any snapshot left over from before a
-    Rebuild). A snapshot's ``per_server`` list carries one row per matched
+    ``inventory_draft`` was loaded, any snapshot left over from before a
+    Rebuild, OR a snapshot whose per-server 7R strategies predate a 7R-policy
+    change). A snapshot's ``per_server`` list carries one row per matched
     server, so its length is the matched-server count at save time; compare it
     to the live ``matches`` count. A mismatch means the estate changed
-    underneath the snapshot and it must be recomputed before display."""
+    underneath the snapshot and it must be recomputed before display.
+
+    The 7R policy (the Inventory column + Business case row) is host_disposition
+    > app_strategies > rehost; a snapshot saved before an app-strategy /
+    host-disposition change would otherwise show stale 7R values that differ
+    from the live Inventory 7R column even though the matched-server count is
+    unchanged. So also treat the snapshot as stale when any app_strategies /
+    legacy_dispositions row was updated AFTER the snapshot's ``generated_at``."""
     if not isinstance(payload, dict):
         return True
     # one per_server row per matched server -> its length is the matched-server
@@ -2403,6 +3443,21 @@ def _business_case_stale(payload: Dict[str, Any]) -> bool:
     tally = int(payload.get("priced_servers") or 0) + int(payload.get("unpriced_servers") or 0)
     if tally and tally != live_n:
         return True
+    # 7R-policy drift: a strategy / disposition written after the snapshot was
+    # generated means the snapshot's per-server strategies no longer match the
+    # live Inventory 7R column -> recompute. ``generated_at`` is set at compute
+    # time; compare it to the newest updated_at across the two small tables.
+    gen = payload.get("generated_at") or ""
+    if gen:
+        newest = ""
+        for upd in (s.updated_at for s in STORE.list_app_strategies() if s.updated_at):
+            if upd > newest:
+                newest = upd
+        for upd in (d.updated_at for d in STORE.list_legacy_dispositions() if d.updated_at):
+            if upd > newest:
+                newest = upd
+        if newest and newest > gen:
+            return True
     return False
 
 
@@ -2423,9 +3478,10 @@ def latest_business_case():
     payload = snap["payload"]
     if _business_case_stale(payload):
         from ..core.cost import estimate_portfolio, load_pricebook
-        servers, matches, strategies = _portfolio_inputs()
+        servers, matches, strategies, host_dispositions = _portfolio_inputs()
         book = load_pricebook(settings)
-        payload = estimate_portfolio(servers, matches, book, strategies=strategies)
+        payload = estimate_portfolio(servers, matches, book, strategies=strategies,
+                                     host_dispositions=host_dispositions)
         # keep the saved snapshot's id for reference, and flag that this response
         # was recomputed live (not a saved snapshot) so the UI can hint a save.
         payload["snapshot_id"] = snap["id"]
@@ -2451,10 +3507,11 @@ def cost_what_if(req: WhatIfReq):
     right-size from utilization, ``byol`` is the license-mode hint. Returns
     baseline + alternate + delta."""
     from ..core.cost import load_pricebook, what_if
-    servers, matches, strategies = _portfolio_inputs()
+    servers, matches, strategies, host_dispositions = _portfolio_inputs()
     book = load_pricebook(settings)
     return what_if(servers, matches, book, region=req.region,
-                   sizing=req.sizing, byol=req.byol, strategies=strategies)
+                   sizing=req.sizing, byol=req.byol, strategies=strategies,
+                   host_dispositions=host_dispositions)
 
 
 class RightSizeReq(BaseModel):
@@ -3361,12 +4418,17 @@ async def start_agent(req: AgentReq):
 
 @app.get("/api/tasks")
 def list_tasks():
-    return STORE.list_tasks()
+    # AGENT tasks (Copilot tab /api/agent) — NOT executor_tasks. The executor
+    # pull-dispatch has its own /api/executor/tasks surface. (See the
+    # get_agent_task / list_agent_tasks naming note in db.py — the old
+    # STORE.list_tasks collided with the executor one and returned the wrong
+    # table.)
+    return STORE.list_agent_tasks()
 
 
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str):
-    t = STORE.get_task(task_id)
+    t = STORE.get_agent_task(task_id)
     if not t:
         raise HTTPException(404, "task not found")
     return t
@@ -3380,7 +4442,7 @@ async def ws_agent(ws: WebSocket, task_id: str):
         await ws.close(code=1008, reason="authentication required")
         return
     await ws.accept()
-    t = STORE.get_task(task_id)
+    t = STORE.get_agent_task(task_id)
     if not t:
         await ws.send_json({"kind": "error", "text": "unknown task"})
         await ws.close()
@@ -3403,7 +4465,7 @@ async def ws_agent(ws: WebSocket, task_id: str):
                 break
             await ws.send_json(ev)
         # final status
-        t = STORE.get_task(task_id)
+        t = STORE.get_agent_task(task_id)
         await ws.send_json({"kind": "result" if t and t["status"] == "done" else "error",
                             "text": (t["output"] if t else "") or (t["error"] if t else "")})
     except WebSocketDisconnect:

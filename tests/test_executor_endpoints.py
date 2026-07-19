@@ -135,6 +135,281 @@ def test_strategy_batch_streams_ndjson(monkeypatch):
     # no apply -> nothing persisted
     assert m.STORE.get_app_strategy("pytest-batch-a") is None
 
+
+def _seed_bulk_host(app_id, disp=None):
+    """Seed a server + its match for the per-host bulk 7R test. Returns
+    (sid, hostname). ``disp`` optionally pre-sets a legacy_disposition so the
+    migrating-clear branch can be exercised."""
+    from idc.core.models import _new_id, Server, Match, Target, LegacyDisposition
+    st = m.open_store(m.get_settings().db_url)
+    sid = _new_id("srv")
+    host = f"bulkhost-{sid[-6:]}"
+    s = Server(id=sid, hostname=host, fqdn=f"{host}.dc1.corp", ips=["10.0.0.7"],
+               role="app", os="centos", os_version="6", app_ids=[app_id],
+               sizing_basis="estimated")
+    st.upsert_server(s)
+    st.upsert_match(Match(server_id=sid, confidence=0.9, rationale="rule",
+                          target=Target(product="CVM", spec="SA5.MEDIUM4",
+                                         region="ap-bangkok")))
+    if disp:
+        st.upsert_legacy_disposition(LegacyDisposition(
+            server_id=host.lower(), disposition=disp, rationale="pre-set",
+            confidence=1.0, summary="seed"))
+    st.close()
+    return sid, host
+
+
+def _cleanup_bulk_host(sid, host, app_id):
+    st = m.open_store(m.get_settings().db_url)
+    with st.tx() as cur:
+        cur.execute(st._x("DELETE FROM legacy_dispositions WHERE server_id=?"), (host.lower(),))
+        cur.execute(st._x("DELETE FROM matches WHERE server_id=?"), (sid,))
+        cur.execute(st._x("DELETE FROM servers WHERE id=?"), (sid,))
+        cur.execute(st._x("DELETE FROM app_strategies WHERE app_id=?"), (app_id,))
+    st.close()
+
+
+def test_strategy_host_batch_applies_retain_disposition(monkeypatch):
+    """Per-host bulk 7R (NDJSON) sets a retain host disposition when the LLM
+    recommends retain (apply=true), and is a no-op when apply=false."""
+    import json as _json
+    app = "pytest-bulk-app-ret"
+    sid, host = _seed_bulk_host(app)
+    try:
+        calls = []
+        def fake_host(server, match, profile, *, current="", host_disposition=""):
+            calls.append(server.id)
+            return {"ok": True, "strategy": "retain", "rationale": "mock retain",
+                    "target": "on-prem", "confidence": 0.8, "effort": "low",
+                    "key_changes": []}
+        monkeypatch.setattr(m.LLM, "seven_r_host", fake_host)
+        r = client.post(f"/api/strategy/host/batch?app_id={app}",
+                        json={"apply": True, "limit": 10})
+        assert r.status_code == 200
+        frames = [_json.loads(l) for l in r.text.split("\n") if l.strip()]
+        types = [f["type"] for f in frames]
+        assert types[0] == "start" and types[-1] == "done"
+        host_frames = [f for f in frames if f["type"] == "host" and f.get("ok")]
+        assert len(host_frames) == 1
+        assert host_frames[0]["strategy"] == "retain"
+        assert host_frames[0]["applied"] == "retain"
+        assert calls == [sid]   # only the matching host was analyzed
+        done = frames[-1]
+        assert done["analyzed"] == 1 and done["applied_host"] == 1
+        # the host-level retain disposition was persisted (keyed by hostname lower)
+        d = m.STORE.get_legacy_disposition(host.lower())
+        assert d is not None and d.disposition == "retain"
+
+        # apply=false (dry run) on a fresh assertion: re-mock + verify nothing new
+        # is written — the disposition above stays, but no app strategy is created
+        # (retain never goes to the app tally). There's no app_strategies row.
+        assert m.STORE.get_app_strategy(app) is None
+    finally:
+        _cleanup_bulk_host(sid, host, app)
+
+
+def test_strategy_host_batch_migrating_clears_disposition_and_fills_app(monkeypatch):
+    """A migrating recommendation clears any pre-set retain/retire override AND
+    fills the app's strategy when the app has none (non-destructive: an
+    existing app strategy is preserved)."""
+    import json as _json
+    app = "pytest-bulk-app-mig"
+    sid, host = _seed_bulk_host(app, disp="retain")   # host pre-set to retain
+    try:
+        def fake_host(server, match, profile, *, current="", host_disposition=""):
+            return {"ok": True, "strategy": "replatform", "rationale": "mock mig",
+                    "target": "CDB", "confidence": 0.7, "effort": "medium",
+                    "key_changes": ["x"]}
+        monkeypatch.setattr(m.LLM, "seven_r_host", fake_host)
+        r = client.post(f"/api/strategy/host/batch?app_id={app}",
+                        json={"apply": True, "limit": 10})
+        frames = [_json.loads(l) for l in r.text.split("\n") if l.strip()]
+        host_frames = [f for f in frames if f["type"] == "host" and f.get("ok")]
+        assert len(host_frames) == 1
+        assert host_frames[0]["strategy"] == "replatform"
+        assert host_frames[0]["applied"] == "cleared"   # the retain override was cleared
+        app_frames = [f for f in frames if f["type"] == "app"]
+        assert len(app_frames) == 1 and app_frames[0]["strategy"] == "replatform"
+        done = frames[-1]
+        assert done["applied_clear"] == 1 and done["applied_app"] == 1
+        # the retain override is gone; the app strategy is now replatform
+        assert m.STORE.get_legacy_disposition(host.lower()) is None
+        s = m.STORE.get_app_strategy(app)
+        assert s is not None and s.strategy == "replatform"
+    finally:
+        _cleanup_bulk_host(sid, host, app)
+
+
+def test_strategy_host_batch_dry_run_does_not_mutate(monkeypatch):
+    """apply=false is a pure preview: no disposition written, no app strategy."""
+    import json as _json
+    app = "pytest-bulk-app-dry"
+    sid, host = _seed_bulk_host(app)
+    try:
+        def fake_host(server, match, profile, *, current="", host_disposition=""):
+            return {"ok": True, "strategy": "retire", "rationale": "mock",
+                    "target": "decommission", "confidence": 0.6, "effort": "low",
+                    "key_changes": []}
+        monkeypatch.setattr(m.LLM, "seven_r_host", fake_host)
+        r = client.post(f"/api/strategy/host/batch?app_id={app}",
+                        json={"apply": False, "limit": 10})
+        frames = [_json.loads(l) for l in r.text.split("\n") if l.strip()]
+        host_frames = [f for f in frames if f["type"] == "host" and f.get("ok")]
+        assert host_frames[0]["applied"] == "none"   # dry run
+        assert frames[-1]["apply"] is False
+        assert m.STORE.get_legacy_disposition(host.lower()) is None
+        assert m.STORE.get_app_strategy(app) is None
+    finally:
+        _cleanup_bulk_host(sid, host, app)
+
+
+def test_server_detail_exposes_7r_source_waves_cost():
+    """The host drawer's detail endpoint (GET /api/servers/{id}) carries the
+    extra host-level info: the 7R policy + its source (host override / app AI /
+    default), the waves the host belongs to, and the run-cost estimate."""
+    app = "pytest-detail-app"
+    sid, host = _seed_bulk_host(app)
+    try:
+        d = client.get(f"/api/servers/{sid}").json()
+        # 7R policy + source (no app strategy + no disposition -> default rehost)
+        assert d["seven_r"] == "rehost"
+        assert d["seven_r_source"] == "default (rehost)"
+        # waves is a list (likely empty — no plan built around this throwaway host)
+        assert isinstance(d["waves"], list)
+        # cost is computed from the fixture pricebook (CVM SA5.MEDIUM4 ap-bangkok
+        # = 60/mo, 650/yr per test_cost.py)
+        assert d["cost"] is not None
+        assert d["cost"]["yearly"] == 650 and d["cost"]["monthly"] == 60
+        assert d["cost"]["product"] == "CVM" and d["cost"]["basis"]
+        # match carries alternatives (the drawer's Alternatives row reads these)
+        assert "alternatives" in (d["match"] or {})
+
+        # set a retain disposition -> 7R source flips to "host override"
+        client.put(f"/api/servers/{sid}/disposition", json={"disposition": "retain"})
+        d2 = client.get(f"/api/servers/{sid}").json()
+        assert d2["seven_r"] == "retain"
+        assert d2["seven_r_source"] == "host override"
+    finally:
+        _cleanup_bulk_host(sid, host, app)
+
+
+def _seed_bulk_hosts(app, hostnames):
+    """Seed N servers (given hostnames) + a match each for the batch/resume tests."""
+    from idc.core.models import _new_id, Server, Match, Target
+    st = m.open_store(m.get_settings().db_url)
+    sids = []
+    for host in hostnames:
+        sid = _new_id("srv")
+        sids.append(sid)
+        s = Server(id=sid, hostname=host, fqdn=f"{host}.dc1.corp", ips=["10.0.0.7"],
+                   role="app", os="centos", os_version="6", app_ids=[app],
+                   sizing_basis="estimated")
+        st.upsert_server(s)
+        st.upsert_match(Match(server_id=sid, confidence=0.9, rationale="rule",
+                              target=Target(product="CVM", spec="SA5.MEDIUM4",
+                                             region="ap-bangkok")))
+    st.close()
+    return sids
+
+
+def _cleanup_bulk_hosts(sids, app):
+    st = m.open_store(m.get_settings().db_url)
+    with st.tx() as cur:
+        for sid in sids:
+            cur.execute(st._x("DELETE FROM legacy_dispositions WHERE server_id=?"), (sid,))
+        # dispositions are keyed by hostname lowercased too
+        for sid in sids:
+            cur.execute(st._x("DELETE FROM legacy_dispositions WHERE server_id IN "
+                               "(SELECT LOWER(hostname) FROM servers WHERE id=?)"), (sid,))
+        cur.executemany(st._x("DELETE FROM matches WHERE server_id=?"), [(s,) for s in sids])
+        cur.executemany(st._x("DELETE FROM servers WHERE id=?"), [(s,) for s in sids])
+        cur.execute(st._x("DELETE FROM app_strategies WHERE app_id=?"), (app,))
+        # and clear any disposition keyed by the test hostnames
+        for host in ("bulkb-a", "bulkb-b", "bulkb-c", "bulkresume-a", "bulkresume-b", "bulkresume-c"):
+            cur.execute(st._x("DELETE FROM legacy_dispositions WHERE server_id=?"), (host,))
+    st.close()
+
+
+def test_strategy_host_batch_multiple_batches_in_one_call(monkeypatch):
+    """A call with limit > batch_size processes multiple batches, emitting a
+    `batch` checkpoint (commit) after each — every host disposition is durable
+    before the next batch starts."""
+    import json as _json
+    app = "pytest-bulk-batches"
+    hosts = ["bulkb-a", "bulkb-b", "bulkb-c"]
+    sids = _seed_bulk_hosts(app, hosts)
+    try:
+        def fake_host(server, match, profile, *, current="", host_disposition=""):
+            return {"ok": True, "strategy": "retain", "rationale": "mock",
+                    "target": "on-prem", "confidence": 0.8, "effort": "low",
+                    "key_changes": []}
+        monkeypatch.setattr(m.LLM, "seven_r_host", fake_host)
+        r = client.post(f"/api/strategy/host/batch?app_id={app}",
+                        json={"apply": True, "batch_size": 2, "limit": 10})
+        frames = [_json.loads(l) for l in r.text.split("\n") if l.strip()]
+        assert frames[0]["type"] == "start" and frames[-1]["type"] == "done"
+        host_frames = [f for f in frames if f["type"] == "host" and f.get("ok")]
+        batch_frames = [f for f in frames if f["type"] == "batch"]
+        assert len(host_frames) == 3
+        # 3 hosts in batches of 2 -> 2 batch checkpoints (2 + 1)
+        assert len(batch_frames) == 2
+        assert all(f["committed"] for f in batch_frames)
+        assert frames[-1]["applied_host"] == 3 and frames[-1]["more"] is False
+        # all 3 host dispositions persisted (keyed by hostname lowercased)
+        for h in hosts:
+            d = m.STORE.get_legacy_disposition(h)
+            assert d is not None and d.disposition == "retain"
+    finally:
+        _cleanup_bulk_hosts(sids, app)
+
+
+def test_strategy_host_batch_cursor_resume_across_calls(monkeypatch):
+    """The cursor makes a full-estate run resumable: call 1 processes the first
+    batch + returns the cursor + more=true; call 2 with that cursor processes
+    the rest. Committed batches are durable across the two calls."""
+    import json as _json
+    app = "pytest-bulk-resume"
+    hosts = ["bulkresume-a", "bulkresume-b", "bulkresume-c"]   # asc order
+    sids = _seed_bulk_hosts(app, hosts)
+    try:
+        seen = []
+        def fake_host(server, match, profile, *, current="", host_disposition=""):
+            seen.append(server.hostname)
+            return {"ok": True, "strategy": "retain", "rationale": "mock",
+                    "target": "on-prem", "confidence": 0.8, "effort": "low",
+                    "key_changes": []}
+        monkeypatch.setattr(m.LLM, "seven_r_host", fake_host)
+        # call 1: one batch of 2 from the start
+        r1 = client.post(f"/api/strategy/host/batch?app_id={app}",
+                         json={"apply": True, "batch_size": 2, "limit": 0})
+        f1 = [_json.loads(l) for l in r1.text.split("\n") if l.strip()]
+        assert f1[0]["type"] == "start" and f1[0]["resumed"] is False
+        done1 = f1[-1]
+        assert done1["type"] == "done" and done1["more"] is True
+        cursor = done1["cursor"]
+        assert cursor == "bulkresume-b"   # last processed of the first 2
+        assert done1["applied_host"] == 2
+        # the first 2 hosts are already durable
+        assert m.STORE.get_legacy_disposition("bulkresume-a").disposition == "retain"
+        assert m.STORE.get_legacy_disposition("bulkresume-b").disposition == "retain"
+
+        # call 2: resume from the cursor — only the 3rd host remains
+        r2 = client.post(f"/api/strategy/host/batch?app_id={app}",
+                         json={"apply": True, "batch_size": 2, "limit": 0,
+                               "cursor": cursor})
+        f2 = [_json.loads(l) for l in r2.text.split("\n") if l.strip()]
+        assert f2[0]["type"] == "start" and f2[0]["resumed"] is True
+        done2 = f2[-1]
+        assert done2["type"] == "done" and done2["more"] is False
+        assert done2["cursor"] is None
+        assert done2["applied_host"] == 1
+        # all 3 hosts now durable, and the LLM saw each exactly once (no rework)
+        assert seen == ["bulkresume-a", "bulkresume-b", "bulkresume-c"]
+        for h in hosts:
+            assert m.STORE.get_legacy_disposition(h).disposition == "retain"
+    finally:
+        _cleanup_bulk_hosts(sids, app)
+
 # -- executor runtime config (manage-executor panel) ------------------------
 @pytest.fixture
 def _clean_exec_config():
@@ -146,6 +421,8 @@ def _clean_exec_config():
             cur.execute(m.STORE._x("DELETE FROM system_config WHERE k LIKE 'executor_%'"))
             cur.execute(m.STORE._x("DELETE FROM system_config WHERE k = 'public_url'"))
             cur.execute(m.STORE._x("DELETE FROM system_config WHERE k = 'executors'"))
+            cur.execute(m.STORE._x("DELETE FROM system_config WHERE k = 'enroll_secret'"))
+            cur.execute(m.STORE._x("DELETE FROM executor_heartbeats"))
     _reset()
     yield
     _reset()
@@ -271,6 +548,61 @@ def test_executor_test_does_not_probe_or_persist(_clean_exec_config):
     # nothing persisted
     assert client.get("/api/executor/config").json()["url"] == before
     assert m.STORE.get_config("executor_url") is None
+
+
+def test_executor_status_reports_pull_mode_connectivity(_clean_exec_config):
+    """Pull mode: idc-migrate never probes, so /api/executor/status keeps
+    reachable=None but reports connected/last_seen from inbound activity.
+    Before any poll the default executor is 'waiting'; an idle /claim records
+    a heartbeat and it flips to connected. A named executor that never polled
+    stays 'no poll yet' (NOT 'down' — there was no probe)."""
+    s = client.get("/api/executor/status").json()
+    assert s["reachable"] is None                 # still no outbound probe
+    assert s["connected"] is False
+    assert s["last_seen"] is None
+    assert "no" in s["detail"].lower()            # 'no poll yet' / 'no executor polling'
+    # an idle poll (no pending task) still records the heartbeat
+    r = client.post("/api/executor/tasks/claim", json={}, headers=_bearer())
+    assert r.status_code == 200 and r.json()["task_id"] is None   # idle
+    s = client.get("/api/executor/status").json()
+    assert s["connected"] is True
+    assert s["last_seen"] is not None
+    assert isinstance(s["in_flight"], int) and isinstance(s["done"], int)
+    assert isinstance(s["error"], int)
+    assert s["detail"].startswith("connected")
+
+
+def test_registry_lists_connected_from_inbound_activity(_clean_exec_config):
+    """The /api/executors list shows connected/last_seen derived from the
+    executor polling idc-migrate, not a probe. A named executor that has
+    never polled shows 'no poll yet' (never 'down' — idc-migrate never
+    initiated anything to fail)."""
+    # default never polled yet in this fresh fixture
+    d = next(e for e in client.get("/api/executors").json() if e["id"] == "default")
+    assert d["status"]["connected"] is False
+    assert d["status"]["last_seen"] is None
+    assert d["status"]["reachable"] is None
+    # a named executor registered but silent
+    client.put("/api/executors/db-spec",
+               json={"url": "http://x:9", "token": "db-tok", "enabled": True})
+    lst = client.get("/api/executors").json()
+    db = next(e for e in lst if e["id"] == "db-spec")
+    assert db["status"]["connected"] is False
+    assert db["status"]["last_seen"] is None
+    assert "no poll yet" in db["status"]["detail"]
+    assert db["status"]["reachable"] is None     # no probe, so no 'down'
+
+
+def test_store_executor_activity_round_trip(_clean_exec_config):
+    """Store-level: touch_executor_seen + executor_activity round-trip, and a
+    never-seen executor yields last_seen=None with zeroed counts."""
+    m.STORE.touch_executor_seen("db-spec", m._now_iso())
+    act = m.STORE.executor_activity("db-spec")
+    assert act["last_seen"] is not None
+    assert isinstance(act["in_flight"], int)
+    act2 = m.STORE.executor_activity("ghost-executor")
+    assert act2["last_seen"] is None and act2["in_flight"] == 0 \
+        and act2["done"] == 0 and act2["error"] == 0
 
 
 # -- named-executor registry (multiple executors) -------------------------
@@ -557,3 +889,159 @@ def test_list_and_get_task(_wipe_tasks, _clean_exec_config):
     one = client.get(f"/api/executor/tasks/{tid}").json()
     assert one["id"] == tid and one["kind"] == "scan"
     assert client.get("/api/executor/tasks/tsk-nope").status_code == 404
+
+
+# -- self-registration -> approval lifecycle (Option B: server mints token) --
+def test_self_register_lands_pending_without_token(_clean_exec_config):
+    r = client.post("/api/executors/register",
+                   json={"id": "db-spec", "url": "http://127.0.0.1:8091", "timeout": 300})
+    assert r.status_code == 200, r.text
+    e = r.json()
+    assert e["id"] == "db-spec"
+    assert e["approval"] == "pending"
+    assert e["token_set"] is False and "token" not in e   # no token minted yet
+    assert e["enabled"] is False
+    # it shows in the list as pending
+    lst = client.get("/api/executors").json()
+    row = next(x for x in lst if x["id"] == "db-spec")
+    assert row["approval"] == "pending" and row["token_set"] is False
+
+
+def test_pending_executor_cannot_claim(_wipe_tasks, _clean_exec_config):
+    """A pending self-enrollment has no token, so its bearer (if it sent one)
+    can't resolve — and there is no token to send anyway. Claim stays 401."""
+    client.post("/api/executors/register", json={"id": "db-spec"})
+    # the executor has no token; even a fabricated token doesn't resolve
+    r = client.post("/api/executor/tasks/claim", json={}, headers=_bearer("db-spec-fake"))
+    assert r.status_code == 401
+
+
+def test_approve_mints_token_and_enables_claiming(_wipe_tasks, _clean_exec_config):
+    """Approve mints a server-side token, returns it ONCE, and flips the
+    executor to approved+enabled so its token now resolves on claim."""
+    client.post("/api/executors/register", json={"id": "db-spec"})
+    r = client.post("/api/executors/db-spec/approve")
+    assert r.status_code == 200, r.text
+    e = r.json()
+    tok = e["token"]
+    assert tok and tok.startswith("ex-")          # server-minted, returned once
+    assert e["approval"] == "approved" and e["token_set"] is True
+    # the token now validates on the push direction too (valid_tokens)
+    assert m._executor_bearer_ok(f"Bearer {tok}") is True
+    # a second approve is rejected (already approved)
+    assert client.post("/api/executors/db-spec/approve").status_code == 400
+    # and the list no longer returns the token (only token_set)
+    row = next(x for x in client.get("/api/executors").json() if x["id"] == "db-spec")
+    assert "token" not in row and row["token_set"] is True
+    # the minted token now claims pool tasks
+    _enq("scan", executor_id=None)
+    r2 = client.post("/api/executor/tasks/claim", json={}, headers=_bearer(tok))
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "claimed"
+
+
+def test_re_register_approved_rejected_409(_clean_exec_config):
+    """An attacker who knows an approved executor's id can't re-enroll it (that
+    path can't change the token; only the operator can rotate it)."""
+    client.post("/api/executors/register", json={"id": "db-spec"})
+    client.post("/api/executors/db-spec/approve")
+    r = client.post("/api/executors/register", json={"id": "db-spec"})
+    assert r.status_code == 409
+
+
+def test_re_register_pending_is_idempotent(_clean_exec_config):
+    """Re-enrolling the same pending id refreshes its fields and stays pending."""
+    client.post("/api/executors/register", json={"id": "db-spec", "timeout": 120})
+    r = client.post("/api/executors/register",
+                    json={"id": "db-spec", "url": "http://x:9", "timeout": 240})
+    assert r.status_code == 200
+    e = r.json()
+    assert e["approval"] == "pending"
+    row = next(x for x in client.get("/api/executors").json() if x["id"] == "db-spec")
+    assert row["timeout"] == 240 and row["approval"] == "pending"
+
+
+def test_register_rejects_default_and_bad_id(_clean_exec_config):
+    # can't self-register the default
+    assert client.post("/api/executors/register",
+                       json={"id": "default"}).status_code == 400
+    # bad id formats (path-traversal / html injection attempts) rejected
+    for bad in ("", "has space", "<script>", "../../etc", "x;y"):
+        assert client.post("/api/executors/register",
+                           json={"id": bad}).status_code == 400
+
+
+def test_register_enroll_secret_gate(_clean_exec_config, monkeypatch):
+    """When IDC_ENROLL_SECRET is set, register requires X-Enroll-Secret."""
+    m.STORE.set_config("enroll_secret", "s3cret-enroll-key")
+    # missing header -> 403
+    r = client.post("/api/executors/register", json={"id": "db-spec"})
+    assert r.status_code == 403
+    # wrong header -> 403
+    r2 = client.post("/api/executors/register", json={"id": "db-spec"},
+                     headers={"X-Enroll-Secret": "wrong"})
+    assert r2.status_code == 403
+    # correct header -> 200 pending
+    r3 = client.post("/api/executors/register", json={"id": "db-spec"},
+                     headers={"X-Enroll-Secret": "s3cret-enroll-key"})
+    assert r3.status_code == 200 and r3.json()["approval"] == "pending"
+
+
+def test_rotate_token_invalidates_old(_wipe_tasks, _clean_exec_config):
+    client.post("/api/executors/register", json={"id": "db-spec"})
+    old = client.post("/api/executors/db-spec/approve").json()["token"]
+    new = client.post("/api/executors/db-spec/rotate-token").json()["token"]
+    assert new and new != old and new.startswith("ex-")
+    # old token no longer validates
+    assert m._executor_bearer_ok(f"Bearer {old}") is False
+    # new token does
+    assert m._executor_bearer_ok(f"Bearer {new}") is True
+
+
+def test_rotate_rejects_pending(_clean_exec_config):
+    """Can't rotate a pending executor's token — approve it first."""
+    client.post("/api/executors/register", json={"id": "db-spec"})
+    assert client.post("/api/executors/db-spec/rotate-token").status_code == 400
+
+
+def test_reject_pending_deletes_entry(_clean_exec_config):
+    """Reject == DELETE on a pending enrollment removes it."""
+    client.post("/api/executors/register", json={"id": "db-spec"})
+    assert client.delete("/api/executors/db-spec").status_code == 200
+    ids = [e["id"] for e in client.get("/api/executors").json()]
+    assert "db-spec" not in ids
+
+
+def test_trigger_pending_executor_409(_clean_exec_config, monkeypatch):
+    """Targeting a pending executor is rejected with 409 (not 404) so the
+    operator distinguishes 'still awaiting approval' from 'no such id'."""
+    client.post("/api/executors/register", json={"id": "db-spec"})
+    monkeypatch.setattr(m.settings, "executor_enabled", True)
+    r = client.post("/api/db-scan", json={"db_server_id": "db-1",
+                    "source_engine": "mysql", "target_engine": "cdb_mysql",
+                    "executor_id": "db-spec"})
+    assert r.status_code == 409
+    # unknown id stays 404
+    r2 = client.post("/api/db-scan", json={"db_server_id": "db-1",
+                     "source_engine": "mysql", "target_engine": "cdb_mysql",
+                     "executor_id": "ghost"})
+    assert r2.status_code == 404
+
+
+def test_self_register_is_public_without_session(monkeypatch):
+    """register must work with NO auth at all (the executor has no bearer and no
+    browser session yet) — proves the endpoint is on the public path and the
+    enroll-secret gate (unset here) is the only barrier."""
+    # turn the web-password gate ON and clear any session cookie
+    m.STORE.set_config("web_password", "gate-on")
+    try:
+        c = TestClient(m.app)
+        # no session cookie, no bearer — register still succeeds
+        r = c.post("/api/executors/register", json={"id": "pub-exec"})
+        assert r.status_code == 200 and r.json()["approval"] == "pending"
+        # and a session-gated endpoint is still protected (sanity)
+        assert c.get("/api/executors").status_code == 401
+    finally:
+        m.STORE.set_config("web_password", "")
+        with m.STORE.tx() as cur:
+            cur.execute(m.STORE._x("DELETE FROM system_config WHERE k = 'executors'"))

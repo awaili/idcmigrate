@@ -21,103 +21,11 @@ import httpx
 
 from ..config import Settings, get_settings
 from ..core.models import ALL_PATTERNS_7R, STRATEGY_CHOICES, CodeProfile, Match, Server, Wave, Workload
+# Skill runner — lazy-imported by runner.py back into client (chat backend uses
+# LLMClient + _extract_json), so this module-level import does NOT cycle.
+from .runner import run_skill
 
 UNAVAILABLE = "[MigraQ unavailable — rule-based result only]"
-
-
-SEVEN_R_SYSTEM = """You are a cloud-migration strategist for Tencent Cloud. After resources are
-reconsolidated, you assign ONE migration strategy (the 7R model) to an
-application, given its consolidated context (servers, workload/deps, matched
-Tencent targets, code profile).
-
-The 7R strategies (output ``strategy`` MUST be exactly one of these):
-  rehost            lift-and-shift to CVM as-is, NO code change. Use for cloud-
-                    ready, portable apps where speed/low-risk matters.
-  rehost-container  lift-and-shift BUT containerize and run on TKE. Minimal
-                    change (Dockerfile + externalized config), no re-architecture.
-                    Prefer for stateless/elastic apps that fit a container.
-  replatform        minor code changes to use managed services (self-hosted
-                    MySQL->CDB, Consul->service discovery, local cron->TKE cron).
-  refactor          meaningful re-architecture (microservices, serverless, SCF).
-                    High effort; use when the business needs cloud-native scale.
-  repurchase        replace with a SaaS/managed product (self-hosted Kafka->CKafka,
-                    Jenkins->CODING, Gitlab->CODING Repos). Use when a managed
-                    equivalent removes operational burden.
-  retire            decommission — unused, redundant, sunset. NOT a migration
-                    target.
-  relocate          move to a different platform/location (e.g. on-prem hypervisor
-                    -> cloud IaaS) with NO schema or code changes — same app, new
-                    hosting. Use when the app is portable as-is but the hosting
-                    must move (licensing, data-sovereignty, exit a DC).
-  retain            keep on-prem — regulated data, mainframe, hard latency tie to
-                    on-prem, or not worth migrating. NOT a migration target. This
-                    is a keep-on-prem disposition (not one of the seven Rs), but
-                    you may return it when the app genuinely should not migrate.
-
-Decision guidance:
-- Stateless + cloud-ready + low effort -> rehost or rehost-container.
-- Stateless + elastic + container-friendly runtime -> rehost-container (TKE).
-- Stateful DB/cache -> replatform to managed (CDB / TencentDB for Redis).
-- Portable as-is but hosting must move (no code/schema change) -> relocate.
-- Hard blockers / legacy runtime / low cloud readiness -> refactor, repurchase,
-  retire, or retain depending on business value.
-- Never invent a strategy outside the list above.
-
-Output ONLY a JSON object, no prose, no markdown fences:
-  {"strategy": "<one of the 7R>", "rationale": "<1-3 sentences why>",
-   "target": "<Tencent product e.g. CVM/TKE/CDB, or 'on-prem'/'decommission'>",
-   "confidence": <0..1>, "effort": "<low|medium|high>",
-   "key_changes": ["<short change 1>", ...]}"""
-
-
-AUDIT_SYSTEM = """You are a cloud-migration architect auditing a rule-based target mapping
-for Tencent Cloud. Given a source server, the rule engine's chosen target (product
-+ spec + confidence + rationale), and the app's code profile (if any), critique
-whether the rule got it right.
-
-Tencent Cloud targets and when they fit:
-  CVM        generic VM (lift-and-shift). Default for stateless app/web/general roles.
-  TKE        managed Kubernetes. For stateless, container-friendly, elastic apps that
-             fit a pod — NOT for stateful DBs or hard-stateful workloads.
-  CDB        managed MySQL/PostgreSQL/SQL Server. For db-role servers running a
-             supported engine. Self-hosted DB on a CVM is usually wrong if CDB fits.
-  TencentDB for Redis / Memcached  for cache-role. Self-hosted Redis on CVM is usually
-             wrong if the managed product fits.
-  CFS        shared file storage (NFS). For stateful_local / shared-disk workloads.
-  COS        object storage. For static assets / backups / large immutable blobs.
-  EMR        managed big-data (Hadoop/Spark/Hive). For hadoop-role clusters.
-  BM         bare metal. For workloads needing direct hardware access / licensing
-             (specialized HPC, Oracle RAC, appliances) that don't fit a VM.
-  CLB / CDN  load balancing / edge — usually accessories, not a server's primary target.
-
-Audit logic:
-- Read the server's per-partition disk + MOUNT layout (the signal the rule
-  engine used): Oracle OFA mounts (oradata/redolog/fra → Oracle DB → TData/CDB),
-  /zpaas (self-hosted PaaS → TKE), /data + db-engine tags (→ TencentDB), shared
-  NFS mounts (→ CFS), object-store mounts (→ COS), hadoop mounts (→ EMR). Also
-  read the OS-EOL + warranty buckets (an EOL/expired-OS host may need rehost-
-  container or a newer base image regardless of target) and the app's code
-  profile (runtime/framework/blockers).
-- If the rule target matches the server's role + mount layout + workload shape
-  + code profile, verdict = "keep" (don't second-guess a correct call).
-- If a clearly better target exists (e.g. db-role with Oracle/data mounts
-  mapped to CVM should be CDB/TData; stateless container-friendly app mapped to
-  CVM could be TKE; hadoop mounts mapped to CVM should be EMR), verdict =
-  "change" and name alternative_target (+spec).
-- If signals conflict or are too thin to judge (mixed role, no profile, weird
-  appliance), verdict = "review" — flag it for a human, don't guess.
-- Hard blockers (legacy runtime, baremetal-only licensing) should push toward
-  BM or "review", not a naive CVM.
-- Never invent a product outside the list above.
-
-Output ONLY a JSON object, no prose, no markdown fences:
-  {"verdict": "keep" | "change" | "review",
-   "confidence": <0..1>,                  # your confidence in the verdict
-   "critique": "<1-3 sentences: what's right/wrong with the rule target>",
-   "alternative_target": "<Tencent product or null>",
-   "alternative_spec": "<spec hint or null>",
-   "rationale": "<why, esp. if change>",
-   "risks": ["<migration risk 1>", ...]}"""
 
 
 def _audit_context(server: Server, match: Match,
@@ -140,32 +48,6 @@ def _audit_context(server: Server, match: Match,
             f"OS-EOL / warranty buckets, and the code profile):\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
             "Output ONLY the audit JSON object.")
-
-
-ASSESS_WAVE_SYSTEM = """You are a migration wave lead producing a go/no-go + runbook for ONE migration
-wave. You are given the wave (name/stage/depends_on) + a DETERMINISTIC risk
-basis (score/level/factors/signals — computed from the real members; treat it as
-authoritative, do NOT recompute it) + a sample of the wave's members (servers
-with role/target/utilization/criticality).
-
-Produce:
-  go_no_go  : "go" (ready to migrate), "hold" (one or two fixable blockers), or
-              "no-go" (blocking risk — e.g. unresolved code blockers, high
-              criticality + no rollback, dependency not done). Base it on the
-              risk level + factors, not vibes.
-  pre_checks : list of concrete pre-cutover checks for THIS wave (e.g. "confirm
-              CDB HA sync lag < 1s for the {n} db servers", "drain <app> canary
-              traffic before flipping {product}"). Grounded in the members.
-  cutover    : ordered cutover steps for this wave.
-  rollback   : rollback steps if the wave fails.
-  summary    : 2-4 sentence exec brief naming the riskiest aspect.
-
-Keep each list item to one short imperative sentence. No prose outside JSON.
-
-Output ONLY a JSON object, no markdown fences:
-  {"go_no_go": "go"|"hold"|"no-go",
-   "pre_checks": ["...", ...], "cutover": ["...", ...],
-   "rollback": ["...", ...], "summary": "..."}"""
 
 
 def _assess_wave_context(wave: Wave, servers: List[Server], matches: List[Match],
@@ -197,42 +79,6 @@ def _assess_wave_context(wave: Wave, servers: List[Server], matches: List[Match]
     return ("Produce the go/no-go + runbook for this migration wave, given its "
             f"context (JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
             "Output ONLY the assessment JSON object.")
-
-
-REVIEW_SYSTEM = """You are a red-team migration architect reviewing a proposed wave plan for
-SEMANTIC problems. Structural validity (no duplicate servers, no dependency
-cycles, all depends_on resolve) is ALREADY checked — do NOT report those.
-Find the issues rules can't:
-
-  sequencing      : LZ must finish before Data, Data before Apps, Apps before
-                   Cutover. Flag a wave that depends on a later-stage wave, or
-                   a cutover that doesn't depend on its apps.
-  env_mixing     : prod and non-prod (dev/staging) in the SAME wave — risky
-                   (blast radius, change window mismatch). Flag it.
-  criticality     : high-criticality servers buried in a late/large app wave
-                   with no special handling, or a cutover mixing high+low crit.
-  blast_radius    : a single wave carrying far more servers than the others
-                   (e.g. >3x the median) — too big to roll back cleanly.
-  dep_order       : an app wave that doesn't depend on the data wave its DB
-                   belongs to, or a frontend cutover that doesn't depend on its
-                   backend app wave.
-  retain_leak     : an app marked retain/retire that is still depended on by a
-                   migrating app (the migrating app will break) — flag the edge.
-  coverage        : servers in no wave (the context lists member_count per wave
-                   vs the estate total).
-
-Be concrete: name the wave(s) and the specific server/app/env involved. Do NOT
-invent issues to seem thorough — if the plan is sound, say so (overall=sound,
-findings=[]).
-
-Output ONLY a JSON object, no markdown fences:
-  {"overall": "sound" | "needs-work" | "risky",
-   "findings": [
-     {"severity": "high" | "medium" | "low",
-      "wave": "<wave name or id>",
-      "issue": "<what's wrong>",
-      "suggestion": "<concrete fix>"}, ...],
-   "summary": "<2-3 sentences>"}"""
 
 
 ASK_CLASSIFY_SYSTEM = """You classify a migration operator's natural-language question into ONE intent + its
@@ -352,12 +198,21 @@ def _review_context(waves: List[Wave], servers: List[Server],
     if not strategies:
         retain_apps = sorted({p.app_id for p in profiles
                               if p.migration_pattern in ("retain", "retire")})
+    # path A — per-app agent (codex) blockers, read from each app's actual repo
+    # by the executor. Lets the red-team flag a code-level risk in a wave the
+    # structural plan can't see (e.g. an agent found a hard blocker on an app
+    # buried in a late/large wave). Capped per app to bound the prompt.
+    app_agent_blockers: Dict[str, List[str]] = {}
+    for p in (profiles or []):
+        if p.agent_blockers:
+            app_agent_blockers[p.app_id] = list(p.agent_blockers)[:10]
     payload = {
         "waves": wave_rows, "wave_count": len(waves),
         "estate_total": len(servers), "placed_total": len(placed),
         "unplaced_total": len(servers) - len(placed),
         "app_dependency_edges": dep_edges[:200],
         "retain_retire_apps": retain_apps[:200],
+        "app_agent_blockers": app_agent_blockers,
     }
     return ("Red-team this migration wave plan for semantic issues. "
             f"Context (JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
@@ -599,18 +454,18 @@ class LLMClient:
         if not self.settings.llm_enabled:
             result["error"] = "MigraQ disabled (risk score still returned)"
             return result
-        try:
-            raw = self.chat([
-                {"role": "system", "content": ASSESS_WAVE_SYSTEM},
-                {"role": "user", "content": _assess_wave_context(wave, servers, matches, basis)},
-            ])
-        except Exception as e:
-            result["error"] = f"MigraQ error: {e!r}"
-            return result
-        obj = _extract_json(raw)
-        if not obj:
-            result["error"] = "MigraQ output not valid JSON"
-            result["raw"] = raw[:800]
+        # Skill-driven: system prompt + parse from the "assess_wave" skill
+        # (idc/skills/<name>/SKILL.md, override via IDC_SKILLS_DIR). The
+        # deterministic risk basis above is unchanged (computed locally, NOT
+        # from the LLM).
+        obj = run_skill("assess_wave",
+                        _assess_wave_context(wave, servers, matches, basis),
+                        settings=self.settings,
+                        output="json", llm=self)
+        if not isinstance(obj, dict) or "_error" in obj:
+            result["error"] = (obj.get("_error") if isinstance(obj, dict) else None) \
+                              or "MigraQ output not valid JSON"
+            result["raw"] = (obj.get("_raw", "") if isinstance(obj, dict) else "")[:800]
             return result
         gng = str(obj.get("go_no_go", "")).strip().lower()
         if gng not in ("go", "hold", "no-go"):
@@ -623,7 +478,7 @@ class LLMClient:
                 "rollback": [str(x) for x in (obj.get("rollback") or [])][:30],
             },
             "summary": str(obj.get("summary", "")).strip(),
-            "raw": raw,
+            "raw": "",
         })
         return result
 
@@ -648,19 +503,19 @@ class LLMClient:
         if not self.settings.llm_enabled:
             return {"ok": False, "overall": None, "findings": [],
                     "error": "MigraQ disabled"}
-        try:
-            raw = self.chat([
-                {"role": "system", "content": REVIEW_SYSTEM},
-                {"role": "user", "content": _review_context(
-                    waves, servers, workloads, matches, profiles or [], strategies)},
-            ])
-        except Exception as e:
+        # Skill-driven: system prompt + parse from the "review_plan" skill
+        # (idc/skills/<name>/SKILL.md, override via IDC_SKILLS_DIR). run_skill
+        # does the chat + JSON parse; the normalization below is unchanged.
+        obj = run_skill("review_plan", _review_context(
+                    waves, servers, workloads, matches, profiles or [], strategies),
+                        settings=self.settings,
+                        output="json", llm=self)
+        if not isinstance(obj, dict) or "_error" in obj:
+            err = (obj.get("_error") if isinstance(obj, dict) else None) \
+                  or "MigraQ output not valid JSON"
+            raw = (obj.get("_raw", "") if isinstance(obj, dict) else "")[:800]
             return {"ok": False, "overall": None, "findings": [],
-                    "error": f"MigraQ error: {e!r}"}
-        obj = _extract_json(raw)
-        if not obj:
-            return {"ok": False, "overall": None, "findings": [],
-                    "error": "MigraQ output not valid JSON", "raw": raw[:800]}
+                    "error": err, "raw": raw}
         overall = str(obj.get("overall", "")).strip().lower()
         if overall not in ("sound", "needs-work", "risky"):
             overall = "needs-work"
@@ -673,7 +528,7 @@ class LLMClient:
                 "suggestion": str(f.get("suggestion", "")).strip(),
             })
         return {"ok": True, "overall": overall, "findings": findings[:50],
-                "summary": str(obj.get("summary", "")).strip(), "raw": raw}
+                "summary": str(obj.get("summary", "")).strip(), "raw": ""}
 
     def right_size(self, server: Server, match: Match,
                    profile: Optional["CodeProfile"] = None) -> str:
@@ -714,21 +569,22 @@ class LLMClient:
         """
         if not self.settings.llm_enabled:
             return {"ok": False, "verdict": "", "error": "MigraQ disabled"}
-        try:
-            raw = self.chat([
-                {"role": "system", "content": AUDIT_SYSTEM},
-                {"role": "user", "content": _audit_context(server, match, profile)},
-            ])
-        except Exception as e:
-            return {"ok": False, "verdict": "", "error": f"MigraQ error: {e!r}", "raw": ""}
-        obj = _extract_json(raw)
-        if not obj:
-            return {"ok": False, "verdict": "", "error": "MigraQ output not valid JSON",
-                    "raw": raw[:800]}
+        # Skill-driven: system prompt + parse come from the "audit_match" skill
+        # (idc/skills/<name>/SKILL.md, override via IDC_SKILLS_DIR). run_skill
+        # does the chat + JSON parse; the verdict validation below is unchanged.
+        # Pass llm=self so a caller-patched chat is honored.
+        obj = run_skill("audit_match", _audit_context(server, match, profile),
+                        settings=self.settings,
+                        output="json", llm=self)
+        if not isinstance(obj, dict) or "_error" in obj:
+            err = (obj.get("_error") if isinstance(obj, dict) else None) \
+                  or "MigraQ output not valid JSON"
+            raw = (obj.get("_raw", "") if isinstance(obj, dict) else "")[:800]
+            return {"ok": False, "verdict": "", "error": err, "raw": raw}
         v = str(obj.get("verdict", "")).strip().lower()
         if v not in ("keep", "change", "review"):
             return {"ok": False, "verdict": "", "error": f"invalid verdict {v!r}",
-                    "raw": raw[:800]}
+                    "raw": ""}
         return {
             "ok": True, "verdict": v,
             "confidence": float(obj.get("confidence", 0.5) or 0.5),
@@ -737,7 +593,7 @@ class LLMClient:
             "alternative_spec": str(obj.get("alternative_spec", "") or "").strip() or None,
             "rationale": str(obj.get("rationale", "")).strip(),
             "risks": [str(x) for x in (obj.get("risks") or [])][:20],
-            "raw": raw,
+            "raw": "",
         }
 
     # -- 7R strategy (after reconsolidate) -------------------------------
@@ -756,16 +612,24 @@ class LLMClient:
             return {"ok": False, "app_id": app_id, "strategy": "",
                     "error": "MigraQ disabled"}
         ctx = _seven_r_context(app_id, servers, workloads, matches, profiles or [])
-        try:
-            raw = self.chat([{"role": "system", "content": SEVEN_R_SYSTEM},
-                             {"role": "user", "content": ctx}])
-        except Exception as e:
+        # Skill-driven: the system prompt + parse come from the "seven_r" skill
+        # (idc/skills/seven_r/SKILL.md, override via IDC_SKILLS_DIR). run_skill
+        # does the chat + JSON parse; everything below (STRATEGY_CHOICES check +
+        # confidence clamp) is unchanged. Pass `self` as the llm so a
+        # caller-patched chat (tests) is honored.
+        obj = run_skill("seven_r", ctx, settings=self.settings,
+                        output="json", llm=self)
+        if not isinstance(obj, dict) or "strategy" not in obj or "_error" in obj:
+            # run_skill returns _error with the right wording already
+            # ("MigraQ error: ..." for a chat failure, "MigraQ output was not
+            # valid JSON" for unparseable output) — pass it through so the
+            # existing error contracts are preserved.
+            err = (obj.get("_error") if isinstance(obj, dict) else None) \
+                  or "MigraQ output was not valid JSON"
+            raw = (obj.get("_raw", "") if isinstance(obj, dict) else "")[:800]
             return {"ok": False, "app_id": app_id, "strategy": "",
-                    "error": f"MigraQ error: {e!r}", "raw": ""}
-        obj = _extract_json(raw)
-        if not obj:
-            return {"ok": False, "app_id": app_id, "strategy": "",
-                    "error": "MigraQ output was not valid JSON", "raw": raw[:800]}
+                    "error": err, "raw": raw}
+        raw = ""  # raw isn't carried through the skill path; the parsed obj is the truth
         strat = str(obj.get("strategy", "")).strip().lower()
         if strat not in STRATEGY_CHOICES:
             return {"ok": False, "app_id": app_id, "strategy": "",
@@ -811,6 +675,56 @@ class LLMClient:
             "effort": str(obj.get("effort", "medium")).strip().lower() or "medium",
             "key_changes": [str(x) for x in (obj.get("key_changes") or [])][:20],
             "raw": raw,
+        }
+
+    # -- 7R analysis for ONE host (per-host sibling of seven_r_strategy) -------
+    def seven_r_host(self, server: Server, match: Match,
+                     profile: Optional[CodeProfile] = None, *,
+                     current: str = "", host_disposition: str = ""
+                     ) -> Dict[str, Any]:
+        """Per-host 7R recommendation from the LLM (advisory — does NOT mutate).
+
+        Sibling of ``audit_match``: asks the MigraQ what 7R strategy fits THIS
+        host, grounded in the host's full context (per-partition disks, OS-EOL /
+        warranty buckets, utilization, code profile, the rule target) — the
+        per-host analogue of ``seven_r_strategy`` (which is per-app and
+        aggregates the app's servers). Reuses the ``seven_r`` skill (same 7R
+        vocabulary + JSON output shape); only the context is host-scoped.
+
+        ``current`` is the host's current 7R policy (``cost.seven_r_for``) and
+        ``host_disposition`` any operator retain/retire override, surfaced so the
+        UI can show current-vs-recommended and the LLM respects an operator
+        override (it sees the host is already marked retain/retire).
+
+        Returns ``{ok, strategy, rationale, target, confidence, effort,
+        key_changes}`` (no confidence clamp — a single host's data coverage is
+        a host-level fact, not the app-level aggregate the ceiling formula
+        expects). ``ok`` False + ``strategy`` "" on LLM-disabled / unparseable /
+        invalid. Advisory only; never changes the stored Match / disposition.
+        """
+        if not self.settings.llm_enabled:
+            return {"ok": False, "strategy": "", "error": "MigraQ disabled"}
+        ctx = _seven_r_host_context(server, match, profile, current,
+                                    host_disposition)
+        obj = run_skill("seven_r", ctx, settings=self.settings,
+                        output="json", llm=self)
+        if not isinstance(obj, dict) or "strategy" not in obj or "_error" in obj:
+            err = (obj.get("_error") if isinstance(obj, dict) else None) \
+                  or "MigraQ output was not valid JSON"
+            raw = (obj.get("_raw", "") if isinstance(obj, dict) else "")[:800]
+            return {"ok": False, "strategy": "", "error": err, "raw": raw}
+        strat = str(obj.get("strategy", "")).strip().lower()
+        if strat not in STRATEGY_CHOICES:
+            return {"ok": False, "strategy": "",
+                    "error": f"invalid strategy {strat!r} (not one of the 7R / retain)",
+                    "raw": ""}
+        return {
+            "ok": True, "strategy": strat,
+            "rationale": str(obj.get("rationale", "")).strip(),
+            "target": str(obj.get("target", "")).strip(),
+            "confidence": float(obj.get("confidence", 0.5) or 0.5),
+            "effort": str(obj.get("effort", "medium")).strip().lower() or "medium",
+            "key_changes": [str(x) for x in (obj.get("key_changes") or [])][:20],
         }
 
     # -- LLM-driven LZ design interview (Phase B) -----------------------------
@@ -1179,7 +1093,15 @@ def _server_brief(s: Server) -> Dict[str, Any]:
 def _code_profile_brief(p: Optional["CodeProfile"]) -> Optional[Dict[str, Any]]:
     """Compact code-profile snippet shared by the drawer's LLM actions so they
     see the app's runtime / framework / blockers / executor pattern, not just
-    the host. None → omitted entirely (no fake placeholder)."""
+    the host. None → omitted entirely (no fake placeholder).
+
+    Carries BOTH blocker sets so the audit / 7R / review prompts can weight
+    them by provenance: ``blockers`` = the executor's deterministic rule
+    engine (regex-grounded); ``agent_blockers`` + ``agent_summary`` = the
+    executor's OPTIONAL codex pass, read from the actual repo (grounded in real
+    source, catches what regexes miss). Agent findings are summarized by count
+    + the blockers list + the summary — the full agent_findings list stays in
+    the profile for the audit trail, not dumped into every prompt."""
     if p is None:
         return None
     return {
@@ -1188,6 +1110,11 @@ def _code_profile_brief(p: Optional["CodeProfile"]) -> Optional[Dict[str, Any]]:
         "executor_pattern": p.migration_pattern,
         "blockers": list(p.blockers or []),
         "summary": p.summary,
+        # path A — agent (codex) grounded, read from the actual repo by the
+        # executor. Empty when the codex pass is off / produced nothing.
+        "agent_findings_count": len(p.agent_findings or []),
+        "agent_blockers": list(p.agent_blockers or []),
+        "agent_summary": p.agent_summary or "",
     }
 
 
@@ -1238,6 +1165,12 @@ def _seven_r_context(app_id: str, servers: List[Server], workloads: List[Workloa
             "code_deps": prof.code_deps,
             "finding_categories": cats,
             "summary": prof.summary,
+            # path A — agent (codex) grounded, read from the actual repo.
+            # Empty when the executor's codex pass is off / produced nothing;
+            # when present, weight HIGHER than the regex ``blockers`` above.
+            "agent_findings_count": len(prof.agent_findings or []),
+            "agent_blockers": list(prof.agent_blockers or []),
+            "agent_summary": prof.agent_summary or "",
         }
     payload = {"app_id": app_id, "workload": workload,
                "servers_sample": rows, "server_count": len(srvs),
@@ -1246,6 +1179,44 @@ def _seven_r_context(app_id: str, servers: List[Server], workloads: List[Workloa
             f"reconsolidated context (JSON):\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
             f"Output ONLY the strategy JSON object.")
+
+
+def _seven_r_host_context(server: Server, match: Match,
+                          profile: Optional[CodeProfile], current: str,
+                          host_disposition: str) -> str:
+    """Compact per-HOST context for the 7R strategist (JSON string).
+
+    The per-host sibling of ``_seven_r_context``: instead of an app's aggregated
+    servers + workload edge, it sends this one host's full brief (OS-EOL /
+    warranty, per-partition disks, utilization, network), its rule match, its
+    code profile (if any), and its CURRENT 7R policy + any operator retain/
+    retire override — so the LLM can recommend a 7R for THIS host and respect an
+    operator override (it sees the host is already marked retain/retire).
+    Mirrors ``_audit_context``'s shape.
+    """
+    tgt = match.target
+    payload: Dict[str, Any] = {
+        "server": _server_brief(server),
+        "rule_match": {
+            "product": tgt.product, "spec": tgt.spec, "region": tgt.region,
+            "confidence": match.confidence, "rationale": match.rationale,
+            "alternatives": list(match.alternatives or []),
+        },
+        # the host's current 7R policy (host override > app AI strategy > rehost)
+        # + any operator retain/retire override already set on this host, so the
+        # LLM doesn't recommend a migrating R for a host the operator kept on-prem.
+        "current_7r": current or "rehost",
+        "host_disposition": host_disposition or "",
+    }
+    if profile is not None:
+        payload["code_profile"] = _code_profile_brief(profile)
+    return ("Recommend the 7R migration strategy for THIS host (not its whole "
+            f"app), given its context (JSON — note the per-partition disk + "
+            f"mount layout, the OS-EOL / warranty buckets, utilization, the code "
+            f"profile, the rule target, and the host's current 7R policy / any "
+            f"operator disposition override):\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+            "Output ONLY the strategy JSON object.")
 
 
 def _retrieve(question: str, servers: List[Server],
