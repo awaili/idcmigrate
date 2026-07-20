@@ -2,6 +2,20 @@
 
 idc-migrate outsources "code scan / comb / modify" to an **external agent executor** (hereafter *executor*). The executor scans application source repos, produces migration assessments, and modifies code on demand; assessment results are pushed back to idc-migrate as an extra signal for **reconsolidate, wave planning, and migration strategy**.
 
+> **Terminology** — the executor's action `kind` is the wire-protocol token stored in `ChangeJob.kind` and sent on the trigger payload. The user-facing UI and this doc use the standard term; the `kind` token is unchanged for back-compat with deployed executors.
+>
+> | protocol `kind` | standard term | 中文 | what it does |
+> |---|---|---|---|
+> | `discover-repos` | **discover** | 发现 | enumerate the repos inside a git group/org url (SCM REST API / `git ls-remote`); never reads code |
+> | `scan` | **scan** | 扫描 | detect findings in source via the rule engine (+ optional codex read-only pass); output: `ScanFinding[]` |
+> | `db-scan` | **scan (DB)** | 扫描(DB) | scan + assess a DB schema/SQL; output: `DBConversionProfile` |
+> | `comb` | **analyze** | 分析 | combine scan findings into a migration assessment: 7R, cloud-readiness, blockers, refactor effort; output: `CodeProfile` |
+> | `legacy-disposition` | **analyze (legacy)** | 分析(遗留) | analyze an EOL workload → containerize / replatform / rewrite / retain |
+> | `modify` | **modify** | 改造 | apply code changes (dry-run by default; `mode=execute` writes); output: `patch_ref` |
+> | `runtime-containerize` | **runtime-containerize** | 运行时容器化 | infer a Dockerfile from runtime inventory |
+>
+> Rule of thumb: **scan = detection (what's there / what's wrong), analyze = assessment (what to do about it)**. `scan` and `db-scan` are read-only detection; `comb` and `legacy-disposition` are read-only analysis; only `modify` has side effects.
+
 This document defines two things:
 
 1. **Requirements for the executor** — what it must be able to do, the scan categories, output obligations, and quality bar.

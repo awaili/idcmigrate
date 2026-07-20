@@ -381,7 +381,7 @@
     <li>For <code>kind=modify</code>: apply the payload's <code>changes[]</code> (literal replace by <code>file</code>+<code>line</code>), produce a <code>patch_ref</code>; <code>mode=plan</code> dry-run only.</li>
     <li>Always finish with <code>POST /api/executor/tasks/{task_id}/complete</code> <code>{"status":"done"|"error",...}</code> (renew via <code>/lease</code> if the work is long). On any worker error, complete with <code>status=error</code> — never leave a task claimed.</li>
   </ol>
-  <p>db-scan (F5), runtime-containerize (F9), and discover-repos are optional until you need them (discover-repos only matters if the operator uses the Code tab's "Scan a git group" — it enumerates repos inside a group/org url via the SCM API with the executor's own creds).</p>
+  <p>db-scan (F5), runtime-containerize (F9), and discover-repos are optional until you need them (discover-repos only matters if the operator uses the Code tab's "Discover repos in a git group" — it enumerates repos inside a group/org url via the SCM API with the executor's own creds).</p>
   <div class="card"><b>Reference implementation:</b> <code>idc/executor_mock/app.py</code> — a pull poller that claims tasks, runs the canned scan/comb/modify/… logic, pushes results back, and completes. Run it with <code>idc executor-mock</code> (set <code>IDC_MOCK_CALLBACK</code> to idc-migrate's base + <code>IDC_EXECUTOR_TOKEN</code> to the shared secret, both registered in the <b>Manage executors</b> panel). A production executor swaps the mock's canned answers for a real scanner (AST/regex rules + optional MigraQ for semantic calls) and a real repo writer (commit/PR for <code>modify</code>).</div>
 
   <hr/>

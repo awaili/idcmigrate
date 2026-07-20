@@ -1,4 +1,4 @@
-"""Tests for repo discovery (the "Scan a git group" feature on the Code tab).
+"""Tests for repo discovery (the "Discover repos in a git group" feature on the Code tab).
 
 The operator pastes a git GROUP/ORG url; idc-migrate enqueues a ``discover-repos``
 task; an executor pulls it, enumerates the repositories inside the url (with its
